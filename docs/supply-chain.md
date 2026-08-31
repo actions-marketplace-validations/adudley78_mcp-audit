@@ -298,7 +298,9 @@ MCP servers as components and any known VULN findings as CycloneDX
 fields. Compatible with SBOM tooling such as `grype`, `trivy`, and GitHub
 Dependency Review.
 
-`mcp-audit sbom` is **free for all tiers**.
+`mcp-audit sbom` is **free for all tiers**. Requires `pip install 'mcp-audit-scanner[sbom]'`
+(the `cyclonedx-python-lib` dependency is optional and not included in the default install
+or the PyInstaller binary).
 
 ### Finding IDs
 
@@ -309,11 +311,100 @@ Dependency Review.
 
 ### The `--offline` contract
 
-`--check-vulns` and `mcp-audit sbom` (with transitive dep resolution) both
-require network access and exit with code 2 if `--offline` is also supplied.
-In offline mode, `mcp-audit sbom --offline` still produces a valid SBOM but
-lists only top-level packages (no transitive deps fetched from deps.dev) and
-includes no vulnerability entries.
+`--offline` is accepted for future compatibility. It enforces mutual exclusion
+with network-touching opt-in flags: `--verify-hashes`, `--verify-signatures`,
+`--check-vulns`, and `--connect` will all produce an error (exit code 2) if
+combined with `--offline`. A plain scan makes no network calls regardless of
+this flag, so `--offline` is currently a no-op for the default configuration.
+
+---
+
+## Typosquatting Detection
+
+The supply chain analyzer checks every MCP server that is invoked via a
+package-manager command against the known-server registry.  A server whose
+package name is suspiciously close to a known-good package — but not an exact
+match — is flagged as a possible typosquat.
+
+### Supported package managers
+
+| Command pattern | Example | Ecosystem |
+|---|---|---|
+| `npx <pkg>`, `bunx <pkg>`, `pnpx <pkg>` | `npx @modelcontextprotocol/server-filesystem` | npm |
+| `yarn dlx <pkg>` | `yarn dlx @modelcontextprotocol/server-filesystem` | npm |
+| `uvx <pkg>[@ver]` | `uvx mcp-server-filesystem` | PyPI |
+| `uvx --from <pkg> <exe>` | `uvx --from mcp-server-filesystem mcp-fs` | PyPI |
+| `uvx --python 3.x <pkg>` | `uvx --python 3.11 mcp-server-git` | PyPI |
+| `pipx run <pkg>` | `pipx run mcp-server-filesystem` | PyPI |
+| `python -m <module>` | `python -m mcp_server_filesystem` | PyPI |
+
+### Python name normalisation (PEP 503)
+
+Before comparing Python package names, mcp-audit applies PEP 503 normalisation:
+collapses runs of `-`, `_`, and `.` into a single `-` and lowercases the result.
+This means `mcp_server_filesystem`, `mcp-server-filesystem`, and
+`MCP.Server.Filesystem` are all treated as the same name.
+
+### Finding IDs and severity
+
+| Finding ID | Severity | Edit distance | Meaning |
+|---|---|---|---|
+| `SC-001` | CRITICAL | 1 | One character away from a known-good package |
+| `SC-002` | HIGH | 2 | Two edits away — classic transposition typosquat |
+| `SC-003` | MEDIUM | 3 | Three edits away |
+
+**Short-name guard:** Package names ≤ 5 characters use a tighter threshold of 1
+(not 3) to suppress false positives — short names are inherently close to many
+other short names.
+
+### Registry entries
+
+The known-server registry (`registry/known-servers.json`) now carries a
+`package_ecosystem` field per entry:
+
+| Value | Meaning |
+|---|---|
+| `"npm"` | Entry is an npm package; used only for npm comparison pool (default) |
+| `"pypi"` | Entry is a PyPI package; used only for PyPI comparison pool |
+| `"any"` | Entry appears in both comparison pools |
+
+Python packages in the registry (at time of writing): `mcp`, `mcp-server-fetch`,
+`mcp-server-filesystem`, `mcp-server-git`, `mcp-server-postgres`,
+`mcp-server-qdrant`, `mcp-atlassian`, `langchain-mcp-adapters`.
+
+### Remediation
+
+If a typosquat finding fires, verify the package name in the MCP config is
+intentional.  If it is a typo, correct the name to the known-good package listed
+in the finding's remediation text.  Before trusting any unexpected package, check
+its PyPI or npm page and source repository for legitimacy signals (publication
+date, download count, publisher history).
+
+---
+
+## SC-004: Offline CVE advisory check
+
+`SC-004` (HIGH, `CWE-1104`, OWASP MCP04) fires when an exact-match registry entry
+carries one or more CVE IDs in `RegistryEntry.known_vulnerabilities`.  No network
+access is required — the check runs purely against the bundled registry.
+
+```
+FINDING SC-004: Known CVE advisory: @mcpjam/inspector (CVE-2026-23744)
+  Severity: HIGH  Analyzer: supply_chain
+  Package '@mcpjam/inspector' has a public CVE advisory (CVE-2026-23744) recorded
+  in the mcp-audit known-server registry.  Verify whether the version pinned in
+  your config falls within the affected range and upgrade to the patched version.
+  Check NVD: https://nvd.nist.gov/vuln/detail/CVE-2026-23744
+```
+
+**Important limitation:** `SC-004` does not compare the installed version against
+the CVE's affected version range — it fires whenever the package name matches
+regardless of version.  Use `scan --check-vulns` for version-aware scanning via
+OSV.dev.  See `GAPS.md` for details.
+
+CVE IDs seeded at v0.12.0: CVE-2026-23744 (`@mcpjam/inspector`),
+CVE-2026-0755 (`gemini-mcp-tool`), CVE-2025-59528 (`flowise`),
+CVE-2026-26118 (`@azure/mcp`), CVE-2026-33032 (`nginx-ui`).
 
 ---
 
@@ -321,6 +412,8 @@ includes no vulnerability entries.
 
 | Layer | Description | Status |
 |---|---|---|
+| Layer 0 | Typosquatting detection via Levenshtein distance (npm + PyPI) | **Shipped** |
+| Layer 0b | Offline CVE advisory (`SC-004`) against bundled registry | **Shipped v0.12.0** |
 | Layer 1 | SHA-256 hash verification against registry pins | **Shipped** |
 | Layer 2 | Sigstore signature verification (cosign / sigstore-python) | **Shipped** |
 | Layer 3 | Known-CVE scanning via deps.dev + OSV.dev; CycloneDX SBOM | **Shipped** |

@@ -13,13 +13,40 @@ updates:
       # sigstore has breaking changes between minors — pin manually
       - dependency-name: sigstore
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+    # Version updates only bump packages named in pyproject.toml. Transitives
+    # that exist only in uv.lock (pillow via reportlab, pyasn1 via sigstore)
+    # generate Dependabot *alerts* but no version-update PRs. Repo-level
+    # security updates do open PRs for lockfile CVEs, but without grouping
+    # each CVE is its own PR and they stall behind the open-PR limit — that
+    # is how 33 alerts accumulated while version-update PRs kept merging.
+    # Group them; do not raise the limit.
+    groups:
+      python-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # GitHub Actions
+  # `/` covers `.github/workflows/` and a root `action.yml` only — not
+  # composites. #60's setup-uv bump inside `.github/actions/build-binary/`
+  # had to be applied by hand because of that. `/.github/actions/*` is a
+  # single-level glob (not `**`; that duplicates PRs). `/setup-action` is
+  # the other composite; it pins `actions/cache`, which no workflow uses.
+  # `group-by: dependency-name` keeps one PR per action across directories
+  # instead of a workflow PR and a composite PR for the same SHA.
   - package-ecosystem: github-actions
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
+      - "/setup-action"
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
     labels:
       - dependencies
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        group-by: dependency-name

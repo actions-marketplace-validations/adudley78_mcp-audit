@@ -102,6 +102,30 @@ extensions_app = typer.Typer(
 )
 app.add_typer(extensions_app, name="extensions")
 
+# ── agent-files sub-app ───────────────────────────────────────────────────────
+
+agent_files_app = typer.Typer(
+    name="agent-files",
+    help=(
+        "Discover and scan agent instruction files (skills, memory, hooks)"
+        " across supported AI coding clients."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(agent_files_app, name="agent-files")
+
+# ── feed sub-app ──────────────────────────────────────────────────────────────
+
+feed_app = typer.Typer(
+    name="feed",
+    help=(
+        "Work with the signed MCP advisory feed produced by `mcp-audit advise`. "
+        "EXPERIMENTAL: the record format may change before signing ships."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(feed_app, name="feed")
+
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
@@ -116,18 +140,28 @@ def main() -> None:
 # via Typer decorators, so we import them after ``app`` and the sub-apps are
 # defined.  Ordering among submodules does not matter.
 from mcp_audit.cli import (  # noqa: E402, F401  — side-effect imports register commands
+    advise,
+    agent_files,
     baseline,
+    check,
     dashboard,
+    diff,
     extensions,
+    fix,
     fleet,
+    killchain,
     policy,
     push_nucleus,
+    register,
     registry,
     rules,
     sast,
     sbom,
     scan,
+    shadow,
+    snapshot,
     version,
+    vet,
 )
 
 if __name__ == "__main__":
@@ -139,14 +173,25 @@ __all__ = [
     "_REGISTRY_CACHE_PATH",
     "_UPDATE_REGISTRY_URL",
     "_USER_CONFIG_DIR",
+    "advise",
+    "agent_files_app",
     "app",
     "baseline_app",
+    "check",
     "console",
+    "diff",
     "discover_configs",
     "extensions_app",
+    "feed_app",
+    "fix",
+    "killchain",
     "main",
     "parse_config",
     "policy_app",
+    "register",
     "rule_app",
     "run_scan",
+    "shadow",
+    "snapshot",
+    "vet",
 ]

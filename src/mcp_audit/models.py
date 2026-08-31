@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -88,7 +89,20 @@ class ServerConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     url: str | None = None
+    # HTTP headers explicitly configured for this server (e.g. Authorization,
+    # x-api-key).  Populated by the parser from the "headers" key in the raw
+    # server entry.  Present across all supported clients — the MCP config
+    # format is identical for Claude Desktop, Cursor, VS Code, and others.
+    headers: dict[str, str] = Field(default_factory=dict)
     raw: dict = Field(default_factory=dict)
+    # MCP capability declarations from the server config entry.
+    # e.g. {"sampling": {}, "resources": {"subscribe": True}}
+    # None means the config entry has no 'capabilities' key.
+    capabilities: dict | None = None
+    # True when this server was discovered via --project (repo-level config file).
+    # Used by _apply_project_scan() to emit TRUST-001.  Never set by the normal
+    # user-level discovery path so default-scan behaviour is unchanged.
+    is_project_scoped: bool = False
 
 
 class ToolInfo(BaseModel):
@@ -119,12 +133,15 @@ class ServerEnumeration(BaseModel):
 
     Populated by :func:`~mcp_audit.mcp_client.connect_and_enumerate`.
     When ``error`` is set, the other fields are empty.
+    ``server_stderr`` carries any text the server process wrote to stderr
+    during startup; ``None`` when no output was captured (e.g. SSE servers).
     """
 
     tools: list[ToolInfo] = Field(default_factory=list)
     resources: list[ResourceInfo] = Field(default_factory=list)
     prompts: list[PromptInfo] = Field(default_factory=list)
     error: str | None = None
+    server_stderr: str | None = None
 
 
 class Finding(BaseModel):
@@ -185,6 +202,9 @@ class ScanScore(BaseModel):
     grade: str
     positive_signals: list[str]
     deductions: list[str]
+    # Audit field: "default" when hardcoded weights are used; "policy:<path>"
+    # when a governance policy supplied custom weights for this scan.
+    weights_source: str = "default"
 
 
 class RegistryStats(BaseModel):
@@ -193,6 +213,20 @@ class RegistryStats(BaseModel):
     entry_count: int
     schema_version: str
     last_updated: str
+
+
+class FeedStatus(BaseModel):
+    """Freshness of an optional advisory feed consulted during a scan.
+
+    ``absent`` means no feed was supplied, or the feed could not be used
+    (unreadable, rollback, integrity failure). ``scan`` never fails the run
+    because a feed expired — that is ``expired``, matching skipped.
+    """
+
+    state: Literal["fresh", "expired", "absent"] = "absent"
+    published_at: str | None = None
+    expires: str | None = None
+    age_days: int | None = None
 
 
 class ScanResult(BaseModel):
@@ -214,8 +248,13 @@ class ScanResult(BaseModel):
     attack_path_summary: AttackPathSummary | None = None
     score: ScanScore | None = None
     registry_stats: RegistryStats | None = None
+    feed_status: FeedStatus = Field(default_factory=FeedStatus)
     findings_below_threshold: int = 0
     active_severity_threshold: str | None = None
+    # Captured stderr from stdio MCP server subprocesses launched during --connect.
+    # Populated only when --connect is used; empty for static-only scans.
+    # Surfaced in terminal output via --verbose; always present in JSON output.
+    server_logs: list[str] = Field(default_factory=list)
 
     @property
     def critical_count(self) -> int:

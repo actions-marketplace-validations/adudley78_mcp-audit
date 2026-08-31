@@ -16,6 +16,7 @@ from mcp_audit.registry.loader import (
     RegistryEntry,
     levenshtein,
     load_registry,
+    normalize_pypi_name,
 )
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -118,6 +119,397 @@ class TestBundledRegistryLoad:
         data = json.loads(raw)
         reg = load_registry()
         assert len(reg.entries) == data["entry_count"]
+
+    def test_no_duplicate_names_across_ecosystems(self) -> None:
+        """No two entries may share a case-insensitive name.
+
+        get()/is_known() are ecosystem-agnostic lookups consulted by
+        toxic_flow, the rule engine, governance, attestation, and shadow-risk
+        with no way to disambiguate a same-named npm vs. pip entry — a
+        collision here previously let an unrelated, unverified npm entry for
+        "mcp-server-git" silently shadow the real, verified PyPI entry
+        depending on JSON array order. This test is a regression guard for
+        that class of bug; ``load_registry()`` itself now also raises
+        ``ValueError`` at load time if it ever recurs (see
+        ``TestNameCollisionDetection``).
+        """
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        names = [e["name"].lower() for e in data["entries"]]
+        seen: set[str] = set()
+        dupes = {n for n in names if n in seen or seen.add(n)}  # type: ignore[func-returns-value]
+        assert not dupes, f"Duplicate registry entry name(s): {sorted(dupes)}"
+
+
+# ── repo=null grandfathering guard ──────────────────────────────────────────────
+
+
+class TestRepoNullRequiresDeliberateAcknowledgement:
+    """Guard against silently re-growing the unverified ``repo: null`` batch.
+
+    Context (see ``registry-audit-2026-08-18.md`` for the full investigation): a
+    batch of 26 ``maintainer: "community"``, ``repo: null`` entries was added to
+    ``registry/known-servers.json`` without ever being checked against the real
+    npm/PyPI registries. Three turned out to be a single security researcher's
+    canary package published under three different vendor names
+    (``mcp-server-notion``/``redis``/``supabase``), seven were v0.0.1 stub
+    packages from one unrelated npm account squatting on major vendor names
+    (``mcp-server-aws``/``gcp``/``azure``/``heroku``/``vercel``/``stripe``,
+    ``mcp-perplexity``), and several more simply do not exist at all and are
+    free for anyone — including an attacker — to register today.
+
+    Grandfathering (original state, 2026-08-18 audit): 26 of 85 entries (31%)
+    had ``repo: null``. The 2026-08-20 remediation pass (see
+    ``CHANGELOG.md`` and the registry audit corrections PR) deleted the
+    entries that turned out not to exist at all or to be an unrelated
+    squat-farm/security-canary account, and repaired the ones that were real
+    packages with stale/wrong metadata by attaching a verified real ``repo``.
+    That shrank the ``repo: null`` set from 26 down to exactly the 3 entries
+    below, each of which legitimately still has no confirmable repo:
+
+    - ``mcp-server-mysql`` / ``mcp-server-terraform`` — real, existing
+      packages (OK bucket) whose own npm metadata declares no repository
+      field at all; there is nothing to attach.
+    - ``mcp-server-postgres`` (PyPI) — previously `verified: true`,
+      `maintainer: "Anthropic"`, `repo` pointing at Anthropic's real
+      ``modelcontextprotocol/servers`` monorepo. The audit found the real
+      PyPI author is an unrelated personal account with a placeholder
+      ("Add your description here") package description — i.e. the old repo
+      pointer was a false attribution, not a legitimate-but-stale one. The
+      repo field was deliberately nulled out (rather than left pointing at
+      Anthropic's repo) alongside demoting ``verified`` to ``false``, since
+      keeping the old repo value would still misleadingly imply an Anthropic
+      connection this package doesn't have.
+
+    This test freezes the *current* set of ``repo: null`` names in an
+    explicit, reviewable allowlist below. Any *new* entry added with
+    ``repo: null`` must also be added here — a one-line addition to a list
+    named exactly for what it is, which a reviewer sees in the diff and can
+    push back on, unlike a silent JSON-only addition that passed CI without
+    comment the first time around.
+
+    A stronger long-term fix — an explicit, deliberately-set schema field like
+    ``repo_unavailable_confirmed: true`` that a submitter must affirmatively
+    set (instead of ``repo: null`` silently defaulting to "we didn't check") —
+    remains a recommendation for a future schema change, not implemented here.
+    """
+
+    # Exactly the entries with repo=null as of the 2026-08-20 remediation.
+    # Do not add new names here without discussing in code review — see the
+    # class docstring, registry-audit-2026-08-18.md, and CHANGELOG.md.
+    # Removing a name (because the entry was given a real repo, or removed
+    # entirely) is always safe and expected as entries get remediated.
+    _LEGACY_REPO_NULL_ALLOWLIST: frozenset[str] = frozenset(
+        {
+            "mcp-server-mysql",
+            "mcp-server-postgres",
+            "mcp-server-terraform",
+        }
+    )
+
+    def test_new_repo_null_entries_must_join_the_allowlist(self) -> None:
+        """A new ``repo: null`` entry not in the allowlist fails the build.
+
+        This is the part that would have caught the original batch at review
+        time: adding 26 names to a hardcoded allowlist in a test file is a
+        conspicuous, must-explain diff, unlike a silent JSON-only addition.
+        """
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        repo_null_names = {e["name"] for e in data["entries"] if e.get("repo") is None}
+        unexpected = repo_null_names - self._LEGACY_REPO_NULL_ALLOWLIST
+        assert not unexpected, (
+            "New registry entr(y/ies) added with repo=null, not checked against "
+            f"the real package registry: {sorted(unexpected)}. Run "
+            "`python scripts/audit_registry.py` and either add a real, "
+            "verified `repo` URL, or add the name to "
+            "_LEGACY_REPO_NULL_ALLOWLIST in this test *only* after confirming "
+            "in code review that the gap is deliberate and acknowledged "
+            "(see registry-audit-2026-08-18.md for the kind of findings a "
+            "null repo can hide)."
+        )
+
+    def test_allowlist_does_not_contain_stale_names(self) -> None:
+        """Names should be removed from the allowlist once remediated.
+
+        Keeps the allowlist from silently rotting into "already-fixed names"
+        that no longer do any protective work.
+        """
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        repo_null_names = {e["name"] for e in data["entries"] if e.get("repo") is None}
+        stale = self._LEGACY_REPO_NULL_ALLOWLIST - repo_null_names
+        assert not stale, (
+            f"Allowlist entr(y/ies) no longer have repo=null: {sorted(stale)}. "
+            "Remove them from _LEGACY_REPO_NULL_ALLOWLIST — they were fixed "
+            "(or removed), so keeping them here just weakens the guard."
+        )
+
+
+# ── Demoted entries must not keep verified-only signals ────────────────────────
+
+
+class TestDemotedEntriesDoNotCarryVerifiedSignals:
+    """A ``verified: false`` entry must not still look verified to a reader.
+
+    Context: the 2026-08-20 audit correction demoted ``mcp-server-postgres``
+    to ``verified: false`` (its ``maintainer``/``repo`` were false Anthropic
+    attribution) but initially left three verified-only signals in place:
+    ``tags: ["official", ...]`` (the public verdict page would render
+    "official" right next to a maintainer field saying the attribution is
+    false), ``attestation_expected: true`` (per the field's own docstring in
+    ``registry/loader.py``, this guarantees a false MEDIUM finding for a
+    package with no established Sigstore-provenance pipeline), and a
+    ``publisher_history`` still pointing at Anthropic's real accounts (an
+    account-takeover baseline that would misfire the moment the real
+    publisher appears). This is the general-case guard: it would have caught
+    that regression on its own, without a human re-reading every field.
+    """
+
+    def _entries(self) -> list[dict]:
+        raw = BUNDLED_REGISTRY_PATH.read_text(encoding="utf-8")
+        return json.loads(raw)["entries"]
+
+    def test_unverified_entries_do_not_carry_official_tag(self) -> None:
+        offenders = [
+            e["name"]
+            for e in self._entries()
+            if not e.get("verified", False) and "official" in e.get("tags", [])
+        ]
+        assert not offenders, (
+            f"verified: false entr(y/ies) still tagged 'official': "
+            f"{sorted(offenders)}. The 'official' tag renders on the public "
+            "mcp-audit.dev verdict page — it must not coexist with a "
+            "false-attribution demotion."
+        )
+
+    def test_unverified_entries_do_not_expect_attestation(self) -> None:
+        offenders = [
+            e["name"]
+            for e in self._entries()
+            if not e.get("verified", False) and e.get("attestation_expected", False)
+        ]
+        assert not offenders, (
+            f"verified: false entr(y/ies) still have attestation_expected=true: "
+            f"{sorted(offenders)}. Per its docstring in registry/loader.py, this "
+            "guarantees a false MEDIUM finding on a package we no longer trust "
+            "enough to verify."
+        )
+
+
+# ── Name collision detection ──────────────────────────────────────────────────
+
+
+class TestNameCollisionDetection:
+    """KnownServerRegistry must refuse to load data with duplicate names."""
+
+    def test_duplicate_name_raises_value_error(self, tmp_path: Path) -> None:
+        """Two entries sharing a case-insensitive name raise ValueError."""
+        data = {
+            "schema_version": "1.0",
+            "last_updated": "2026-08-18",
+            "entry_count": 2,
+            "entries": [
+                {
+                    "name": "mcp-server-git",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["vcs", "local"],
+                },
+                {
+                    "name": "mcp-server-git",
+                    "source": "pip",
+                    "package_ecosystem": "pypi",
+                    "repo": "https://github.com/modelcontextprotocol/servers",
+                    "maintainer": "Anthropic",
+                    "verified": True,
+                    "last_verified": "2026-05-17",
+                    "known_versions": [],
+                    "tags": ["official", "git", "local"],
+                },
+            ],
+        }
+        p = tmp_path / "dup-registry.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Duplicate registry entry name"):
+            KnownServerRegistry(path=p)
+
+    def test_duplicate_name_is_case_insensitive(self, tmp_path: Path) -> None:
+        """Names differing only by case still collide."""
+        data = {
+            "schema_version": "1.0",
+            "last_updated": "2026-08-18",
+            "entry_count": 2,
+            "entries": [
+                {
+                    "name": "Some-Package",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["local"],
+                },
+                {
+                    "name": "some-package",
+                    "source": "pip",
+                    "package_ecosystem": "pypi",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-04-15",
+                    "known_versions": [],
+                    "tags": ["local"],
+                },
+            ],
+        }
+        p = tmp_path / "dup-case-registry.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Duplicate registry entry name"):
+            KnownServerRegistry(path=p)
+
+
+# ── npm-scoped lookups (is_known_npm / get_npm / find_closest_npm) ────────────
+
+
+class TestNpmEcosystemScoping:
+    """Regression coverage for the ecosystem-blind npm lookup bug.
+
+    Before ``is_known_npm``/``get_npm``/``find_closest_npm`` existed, an
+    npx-launched server named after a package published ONLY to PyPI would be
+    silently treated as a known/verified npm package by the ecosystem-blind
+    ``get()``/``is_known()`` pair. The bundled registry's "mcp-server-git"
+    entry is exactly such a case: it is ``package_ecosystem: "pypi"`` and has
+    no npm counterpart (the previous, unrelated npm "mcp-server-git" entry —
+    a security-research canary, not a real MCP server — was removed as part
+    of this fix).
+    """
+
+    def test_pypi_only_entry_not_known_on_npm_path(self) -> None:
+        reg = load_registry()
+        assert reg.is_known_npm("mcp-server-git") is False
+        assert reg.get_npm("mcp-server-git") is None
+
+    def test_pypi_only_entry_still_resolves_generically(self) -> None:
+        """get()/is_known() remain the intentional ecosystem-agnostic fallback.
+
+        toxic_flow, the rule engine, governance, attestation, and shadow-risk
+        have no ecosystem context and legitimately want name-only lookup —
+        that behaviour is unchanged by this fix.
+        """
+        reg = load_registry()
+        assert reg.is_known("mcp-server-git") is True
+        entry = reg.get("mcp-server-git")
+        assert entry is not None
+        assert entry.package_ecosystem == "pypi"
+
+    def test_pypi_only_entry_resolves_on_pypi_path(self) -> None:
+        reg = load_registry()
+        assert reg.is_known_pypi("mcp-server-git") is True
+        entry = reg.get_pypi("mcp-server-git")
+        assert entry is not None
+        assert entry.verified is True
+
+
+class TestNpmPypiSameNameDisambiguation:
+    """Same package name legitimately present in both ecosystems.
+
+    ``KnownServerRegistry``'s global duplicate-name guard
+    (``_build_name_index``, see ``TestNameCollisionDetection`` above) rejects
+    two entries sharing a name regardless of ecosystem, so this scenario can
+    never reach ``KnownServerRegistry(path=...)`` through the public
+    constructor today — that guard is a deliberate, separate invariant from
+    this fix and is out of scope to change here. This test instead builds the
+    ecosystem-scoped sub-indices directly (bypassing ``__init__``) to prove
+    the disambiguation logic in ``is_known_npm``/``get_npm``/``is_known_pypi``/
+    ``get_pypi`` is correct in isolation.
+    """
+
+    def setup_method(self) -> None:
+        npm_entry = RegistryEntry(
+            name="shared-name-mcp",
+            source="npm",
+            package_ecosystem="npm",
+            repo=None,
+            maintainer="npm-org",
+            verified=False,
+            last_verified="2026-08-18",
+            known_versions=[],
+            tags=["community"],
+        )
+        pypi_entry = RegistryEntry(
+            name="shared-name-mcp",
+            source="pip",
+            package_ecosystem="pypi",
+            repo=None,
+            maintainer="pypi-org",
+            verified=True,
+            last_verified="2026-08-18",
+            known_versions=[],
+            tags=["community"],
+        )
+        reg = KnownServerRegistry.__new__(KnownServerRegistry)
+        reg.entries = [npm_entry, pypi_entry]
+        reg._npm_entries = [npm_entry]
+        reg._npm_name_index = {npm_entry.name.lower(): npm_entry}
+        reg._pypi_entries = [pypi_entry]
+        reg._pypi_norm_index = {normalize_pypi_name(pypi_entry.name): pypi_entry}
+        self.registry = reg
+
+    def test_is_known_npm_returns_npm_row(self) -> None:
+        assert self.registry.is_known_npm("shared-name-mcp") is True
+
+    def test_get_npm_returns_npm_row(self) -> None:
+        entry = self.registry.get_npm("shared-name-mcp")
+        assert entry is not None
+        assert entry.package_ecosystem == "npm"
+        assert entry.verified is False
+
+    def test_is_known_pypi_returns_pypi_row(self) -> None:
+        assert self.registry.is_known_pypi("shared-name-mcp") is True
+
+    def test_get_pypi_returns_pypi_row(self) -> None:
+        entry = self.registry.get_pypi("shared-name-mcp")
+        assert entry is not None
+        assert entry.package_ecosystem == "pypi"
+        assert entry.verified is True
+
+    def test_find_closest_npm_excludes_pypi_only_entries(self) -> None:
+        """A pypi-only entry must never be an npm typosquat comparison target.
+
+        Uses an isolated registry with an empty npm pool and a single
+        pypi-only entry one edit away from the query — a pre-fix,
+        ecosystem-blind ``find_closest()`` would have matched it.
+        """
+        only_pypi_entry = RegistryEntry(
+            name="close-typo-target",
+            source="pip",
+            package_ecosystem="pypi",
+            repo=None,
+            maintainer="pypi-org",
+            verified=True,
+            last_verified="2026-08-18",
+            known_versions=[],
+            tags=["community"],
+        )
+        reg = KnownServerRegistry.__new__(KnownServerRegistry)
+        reg.entries = [only_pypi_entry]
+        reg._npm_entries = []
+        reg._npm_name_index = {}
+        reg._pypi_entries = [only_pypi_entry]
+        reg._pypi_norm_index = {
+            normalize_pypi_name(only_pypi_entry.name): only_pypi_entry
+        }
+
+        result = reg.find_closest_npm("close-typo-targe", threshold=3)
+        assert result is None
 
 
 # ── is_known ──────────────────────────────────────────────────────────────────
@@ -299,27 +691,29 @@ class TestSupplyChainAnalyzerUsesRegistry:
     """Confirm SupplyChainAnalyzer calls the registry instead of the old YAML."""
 
     def test_analyzer_calls_is_known(self) -> None:
+        # The npm branch (npx args) is scoped via is_known_npm/get_npm since
+        # the ecosystem-blind lookup fix — see TestNpmEcosystemScoping.
         mock_reg = MagicMock(spec=KnownServerRegistry)
-        mock_reg.is_known.return_value = True
+        mock_reg.is_known_npm.return_value = True
 
         analyzer = SupplyChainAnalyzer(registry=mock_reg)
         server = _make_server(args=["-y", "@modelcontextprotocol/server-filesystem"])
         analyzer.analyze(server)
 
-        mock_reg.is_known.assert_called_once_with(
+        mock_reg.is_known_npm.assert_called_once_with(
             "@modelcontextprotocol/server-filesystem"
         )
 
     def test_analyzer_calls_find_closest_when_unknown(self) -> None:
         mock_reg = MagicMock(spec=KnownServerRegistry)
-        mock_reg.is_known.return_value = False
-        mock_reg.find_closest.return_value = None
+        mock_reg.is_known_npm.return_value = False
+        mock_reg.find_closest_npm.return_value = None
 
         analyzer = SupplyChainAnalyzer(registry=mock_reg)
         server = _make_server(args=["-y", "unknown-package"])
         analyzer.analyze(server)
 
-        mock_reg.find_closest.assert_called_once()
+        mock_reg.find_closest_npm.assert_called_once()
 
     def test_analyzer_emits_finding_with_maintainer(self) -> None:
         """Finding description and evidence must include maintainer and verified."""
@@ -334,8 +728,8 @@ class TestSupplyChainAnalyzerUsesRegistry:
             tags=["official"],
         )
         mock_reg = MagicMock(spec=KnownServerRegistry)
-        mock_reg.is_known.return_value = False
-        mock_reg.find_closest.return_value = mock_entry
+        mock_reg.is_known_npm.return_value = False
+        mock_reg.find_closest_npm.return_value = mock_entry
 
         analyzer = SupplyChainAnalyzer(registry=mock_reg)
         server = _make_server(args=["-y", "@modelcontextprotocol/server-filesyste"])
@@ -630,13 +1024,78 @@ class TestRegistryEntryMetadataFields:
         assert entry.publisher_history is None
 
     def test_bundled_registry_loads_without_error(self) -> None:
-        """Bundled registry loads cleanly with the new optional fields present."""
+        """Bundled registry loads cleanly with the new optional fields present.
+
+        The lower bound here is a loose sanity check, not a growth target —
+        the 2026-08-20 audit correction (see registry-audit-2026-08-18.md and
+        CHANGELOG.md) legitimately shrank the registry from 85 to 50 entries
+        by removing entries for packages that do not exist or were
+        misattributed. A registry entry count going down is not itself a
+        regression; this assertion just guards against the file failing to
+        load at all or losing the bulk of its content.
+        """
         registry = KnownServerRegistry()
-        assert len(registry.entries) >= 60
+        assert len(registry.entries) >= 40
         # Entries with metadata should deserialise correctly.
         enriched = [e for e in registry.entries if e.first_published is not None]
         for e in enriched:
             assert len(e.first_published) == 10  # YYYY-MM-DD
+
+    def test_known_vulnerabilities_field_populated_when_present(
+        self, tmp_path: Path
+    ) -> None:
+        """known_vulnerabilities deserialises correctly when present in JSON."""
+        registry_json = {
+            "schema_version": "1.0",
+            "last_updated": "2026-05-16",
+            "entries": [
+                {
+                    "name": "vuln-package",
+                    "source": "pip",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": False,
+                    "last_verified": "2026-05-16",
+                    "known_versions": [],
+                    "tags": [],
+                    "known_vulnerabilities": ["CVE-2026-27826", "GHSA-xxxx-yyyy-zzzz"],
+                }
+            ],
+        }
+        reg_path = tmp_path / "registry.json"
+        reg_path.write_text(__import__("json").dumps(registry_json))
+        registry = KnownServerRegistry(path=reg_path)
+
+        assert len(registry.entries) == 1
+        entry = registry.entries[0]
+        assert entry.known_vulnerabilities == ["CVE-2026-27826", "GHSA-xxxx-yyyy-zzzz"]
+
+    def test_known_vulnerabilities_defaults_to_none_when_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """known_vulnerabilities is None (not an error) when the field is absent."""
+        registry_json = {
+            "schema_version": "1.0",
+            "last_updated": "2026-05-16",
+            "entries": [
+                {
+                    "name": "legacy-package",
+                    "source": "npm",
+                    "repo": None,
+                    "maintainer": "community",
+                    "verified": True,
+                    "last_verified": "2026-05-16",
+                    "known_versions": [],
+                    "tags": [],
+                }
+            ],
+        }
+        reg_path = tmp_path / "registry.json"
+        reg_path.write_text(__import__("json").dumps(registry_json))
+        registry = KnownServerRegistry(path=reg_path)
+
+        assert len(registry.entries) == 1
+        assert registry.entries[0].known_vulnerabilities is None
 
 
 class TestUpdateRegistryURL:

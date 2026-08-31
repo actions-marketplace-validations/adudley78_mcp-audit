@@ -14,8 +14,8 @@ errors) so callers can catch a single exception type.
     20 MB (darwin) and 22 MB (linux).  Adding ``sigstore>=3.0`` pulls in
     ``betterproto``, ``tuf``, ``rfc3161-client``, ``securesystemslib``,
     ``sigstore-protobuf-specs``, and related deps, which are expected to push
-    the rebuilt binary above 22 MB.  Run ``python build.py`` after merging
-    this change, measure the output of ``ls -lh dist/mcp-audit-*``, and decide
+    the rebuilt binary above 22 MB.  Measure a CI ``binary-smoke`` artifact
+    (not a local ad-hoc build), and decide
     whether to (a) accept the larger binary, (b) move ``sigstore`` to an
     optional install group (e.g. ``pip install mcp-audit[sigstore]``), or
     (c) replace the sigstore library with a minimal custom TUF + Rekor client.
@@ -323,6 +323,9 @@ def verify_attestation(
             # verify_dsse validates: Fulcio cert chain, Rekor inclusion proof,
             # and DSSE envelope signature.  UnsafeNoOp defers identity checking
             # to our own repo comparison below — the crypto proof is still full.
+            # Reachability: UnsafeNoOp never calls pyasn1.codec.der.decoder;
+            # swapping in Identity / _SingleX509ExtPolicyV2 invalidates the
+            # pyasn1 Dependabot dismissals. See docs/dependency-reachability.md.
             verifier.verify_dsse(bundle, UnsafeNoOp())
         except Exception as exc:  # sigstore VerificationError or parse error
             return AttestationResult(

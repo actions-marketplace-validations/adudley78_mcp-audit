@@ -278,6 +278,39 @@ class TestBuildScanData:
         assert data["version"]  # non-empty
 
 
+# ── Local paths are NOT redacted in the dashboard ────────────────────────────
+
+
+class TestDashboardKeepsAbsolutePaths:
+    """The dashboard is opened locally by the user who ran the scan — unlike
+    SARIF, Nucleus, and the snapshot export (all "leaves the machine" sinks
+    that redact this host's own scanned-config path), the absolute path in a
+    finding's remediation text is the useful part here. This pins that a
+    later change to the shared redaction helper cannot silently reach the
+    dashboard formatter too.
+    """
+
+    def test_remediation_absolute_path_survives_in_scan_data(self) -> None:
+        finding = Finding(
+            id="CFHYG-001",
+            severity=Severity.MEDIUM,
+            analyzer="config_hygiene",
+            client="claude_desktop",
+            server="filesystem",
+            title="Config file permissions too permissive",
+            description="Config file is readable by other users.",
+            evidence="Config file permissions: 0o100644",
+            remediation="Run: chmod 600 /Users/alice/.config/claude/config.json",
+            finding_path="/Users/alice/.config/claude/config.json",
+        )
+        result = ScanResult(clients_scanned=1, servers_found=0, findings=[finding])
+        data = _build_scan_data(result)
+        assert (
+            "/Users/alice/.config/claude/config.json"
+            in data["findings"][0]["remediation"]
+        )
+
+
 # ── generate_html ─────────────────────────────────────────────────────────────
 
 
@@ -682,6 +715,171 @@ class TestDashboardPassesRulesDir:
         assert rules_dir in extra, (
             f"Expected {rules_dir!r} in extra_rules_dirs, got {extra!r}"
         )
+
+
+class TestDashboardPathValidation:
+    """--path must be validated before use (security hardening)."""
+
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        pass
+
+    def test_missing_path_exits_2(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        missing = tmp_path / "does_not_exist.json"
+        result = runner.invoke(app, ["dashboard", "--path", str(missing), "--no-open"])
+        assert result.exit_code == 2
+        assert "not found" in result.output.lower() or "Config path" in result.output
+
+    def test_valid_path_passes_to_run_scan(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / "configs"
+        config_dir.mkdir()
+
+        with (
+            patch("mcp_audit.cli.run_scan", return_value=_rich_result()) as mock_scan,
+            patch("mcp_audit.output.dashboard._load_d3", return_value="/* d3 */"),
+            patch("http.server.HTTPServer") as mock_srv_cls,
+            patch("threading.Timer"),
+        ):
+            srv = MagicMock()
+            srv.serve_forever.side_effect = KeyboardInterrupt
+            mock_srv_cls.return_value = srv
+            runner = CliRunner()
+            runner.invoke(app, ["dashboard", "--path", str(config_dir), "--no-open"])
+
+        mock_scan.assert_called_once()
+        call_kwargs = mock_scan.call_args[1]
+        extra = call_kwargs.get("extra_paths") or []
+        assert config_dir in extra, (
+            f"Expected {config_dir!r} in extra_paths, got {extra!r}"
+        )
+
+    def test_path_and_from_json_mutually_exclusive(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / "configs"
+        config_dir.mkdir()
+        json_file = tmp_path / "results.json"
+        json_file.write_text("{}")
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "dashboard",
+                "--path",
+                str(config_dir),
+                "--from-json",
+                str(json_file),
+                "--no-open",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+
+class TestDashboardFromJson:
+    """--from-json loads saved scan output instead of running a new scan."""
+
+    @pytest.fixture(autouse=True)
+    def _pro(self, pro_enabled: None) -> None:
+        pass
+
+    def _write_result_json(self, path: Path, result: ScanResult) -> Path:
+        json_path = path / "results.json"
+        json_path.write_text(result.model_dump_json(indent=2, by_alias=True))
+        return json_path
+
+    def test_from_json_exits_cleanly(self, tmp_path: Path) -> None:
+        json_path = self._write_result_json(tmp_path, _rich_result())
+
+        with (
+            patch("mcp_audit.output.dashboard._load_d3", return_value="/* d3 */"),
+            patch("http.server.HTTPServer") as mock_srv_cls,
+            patch("threading.Timer"),
+        ):
+            srv = MagicMock()
+            srv.serve_forever.side_effect = KeyboardInterrupt
+            mock_srv_cls.return_value = srv
+            runner = CliRunner()
+            result = runner.invoke(
+                app, ["dashboard", "--from-json", str(json_path), "--no-open"]
+            )
+
+        assert result.exit_code == 0
+
+    def test_from_json_does_not_call_run_scan(self, tmp_path: Path) -> None:
+        json_path = self._write_result_json(tmp_path, _rich_result())
+
+        with (
+            patch("mcp_audit.cli.run_scan") as mock_scan,
+            patch("mcp_audit.output.dashboard._load_d3", return_value="/* d3 */"),
+            patch("http.server.HTTPServer") as mock_srv_cls,
+            patch("threading.Timer"),
+        ):
+            srv = MagicMock()
+            srv.serve_forever.side_effect = KeyboardInterrupt
+            mock_srv_cls.return_value = srv
+            runner = CliRunner()
+            runner.invoke(
+                app, ["dashboard", "--from-json", str(json_path), "--no-open"]
+            )
+
+        mock_scan.assert_not_called()
+
+    def test_missing_from_json_exits_2(self, tmp_path: Path) -> None:
+        missing = tmp_path / "no_such_file.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["dashboard", "--from-json", str(missing), "--no-open"]
+        )
+        assert result.exit_code == 2
+        assert "not found" in result.output.lower() or "JSON results" in result.output
+
+    def test_malformed_json_exits_2(self, tmp_path: Path) -> None:
+        bad_json = tmp_path / "bad.json"
+        bad_json.write_text("not valid json {{{{")
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["dashboard", "--from-json", str(bad_json), "--no-open"]
+        )
+        assert result.exit_code == 2
+        assert "parse" in result.output.lower() or "Error" in result.output
+
+    def test_from_json_output_confirms_load(self, tmp_path: Path) -> None:
+        json_path = self._write_result_json(tmp_path, _rich_result())
+
+        with (
+            patch("mcp_audit.output.dashboard._load_d3", return_value="/* d3 */"),
+            patch("http.server.HTTPServer") as mock_srv_cls,
+            patch("threading.Timer"),
+        ):
+            srv = MagicMock()
+            srv.serve_forever.side_effect = KeyboardInterrupt
+            mock_srv_cls.return_value = srv
+            runner = CliRunner()
+            result = runner.invoke(
+                app, ["dashboard", "--from-json", str(json_path), "--no-open"]
+            )
+
+        assert "Loaded scan results" in result.output
+
+    def test_from_json_serves_html_with_findings(self, tmp_path: Path) -> None:
+        """HTML served from --from-json contains findings from the loaded result."""
+        json_path = self._write_result_json(tmp_path, _rich_result())
+
+        with (
+            patch("mcp_audit.output.dashboard._load_d3", return_value="/* d3 */"),
+            patch("http.server.HTTPServer") as mock_srv_cls,
+            patch("threading.Timer"),
+        ):
+            srv = MagicMock()
+            srv.serve_forever.side_effect = KeyboardInterrupt
+            mock_srv_cls.return_value = srv
+            runner = CliRunner()
+            result = runner.invoke(
+                app, ["dashboard", "--from-json", str(json_path), "--no-open"]
+            )
+
+        assert result.exit_code == 0
+        assert "localhost:8088" in result.output
 
 
 class TestWatchPassesRulesDir:

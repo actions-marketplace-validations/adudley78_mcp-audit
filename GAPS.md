@@ -2,7 +2,18 @@
 
 This document catalogs the known limitations of mcp-audit in its current prototype state. These are areas that need work before the tool is ready for production use by security practitioners. Contributions and feedback welcome.
 
+## Known-acceptable security advisories
+
+Tracked here when: (a) the vulnerability is transitive-only, (b) no patched version is available upstream, or (c) attack surface is narrow enough to accept pending a fix. Promoted to CHANGELOG Security section when a patch lands.
+
+| Advisory | Package | Severity | Via | Exposure | Status |
+|---|---|---|---|---|---|
+
+---
+
 ## Recently resolved
+
+- **CVE-2026-45409 — `idna` quadratic DoS bypass resolved** (2026-05-19): Surfaced `idna` as a direct dependency with `>=3.15` floor. `idna 3.15` was available on PyPI; lockfile now resolves to 3.15. Transitive path: `mcp` extra → `httpx` → `anyio` → `idna`. Dependabot alert #7 closed.
 
 - **Paid-license infrastructure removed** (v0.2.0): Ed25519 key verification (`licensing.py`), license cache (`_license_cache.py`), feature-gate shim (`_gate.py`), key-issuance script (`scripts/generate_license.py`), bundled revocation list (`data/revoked.json`), and the `activate` / `license` CLI commands are all gone. mcp-audit is fully open source (Apache 2.0); every feature ships in every build. `cryptography` moved to the `[attestation]` optional extra because attestation's X.509 parser is its only remaining consumer.
 
@@ -32,6 +43,90 @@ This document catalogs the known limitations of mcp-audit in its current prototy
 
 - **Stale doc counts and claims** (fixed 2026-04-16): README test counts (546/517 → 845), registry count (43 → 57), CLAUDE.md test/command counts, and multiple docs inaccuracies corrected. SARIF score documentation in `docs/scoring.md` updated. Stale proxy-gate note in `docs/registry.md` removed. `docs/github-action.md` drift severity table and nonexistent `baseline import` command corrected. OSV.dev references in `docs/enterprise-deployment.md` removed (feature not implemented).
 
+## Project-level config scan (TRUST-001)
+
+~~**No check for MCP servers hidden in repository-level config files (TrustFall risk).**~~ **Resolved v0.12.0.**
+`mcp-audit scan --project <dir>` walks the repository tree for project-level
+MCP config files and emits `TRUST-001` (HIGH) for every server found.  The
+full analyzer pipeline (credentials, poisoning, transport, supply-chain, auth)
+runs on those servers too.
+
+**Project scan coverage limits (v0.12.0).**
+
+- **Confirmed project-level config paths** (6 patterns shipped; see `discovery.py`):
+  `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json`,
+  `.cursor/mcp.json`, `.cursor/settings.json`, `.vscode/mcp.json`.
+- **Windsurf:** no project-level MCP config support (global-only
+  `~/.codeium/windsurf/mcp_config.json`). Omitted intentionally.
+- **Zed:** uses `"context_servers"` root key in `settings.json`. Different
+  schema; omitted pending dedicated parser.
+- **Continue.dev:** YAML-based `.continue/config.yaml`; JSON parser does not
+  apply. Omitted.
+- **`.cursor/settings.json` coverage uncertain:** Cursor's official docs
+  confirm `.cursor/mcp.json` as the canonical project-level MCP file.
+  `.cursor/settings.json` is included conservatively because some third-party
+  documentation shows `mcpServers` under cursor settings. If confirmed
+  false-positive-prone, the spec can be removed from `_PROJECT_CONFIG_SPECS`.
+- **No pre-clone (remote URL) mode:** `--project` requires a local path. To
+  scan a repo before cloning, checkout the relevant config paths manually.
+- **Watcher integration out of scope:** `mcp-audit watch` does not watch
+  project-level configs automatically; use `--project` in a manual step.
+
+---
+
+## Tool-name collision detection (COLLIDE-001)
+
+**Static collision detection is not possible.**  MCP config files (`mcp.json`,
+`claude_desktop_config.json`, etc.) record how to *launch* or *connect to* a
+server (command, args, URL) but do not declare the tool names the server
+exposes.  Tool names are returned dynamically by the server at runtime via the
+MCP `tools/list` response.  Without running the servers, there is no data to
+compare.
+
+As a result, `COLLIDE-001` requires `--connect`.  When `mcp-audit scan
+--connect` successfully enumerates at least two servers, their live tool lists
+are compared and any shared tool name is flagged.  A plain static scan produces
+no COLLIDE-001 findings — this is correct behaviour, not a gap in the
+detection logic.
+
+**Known coverage limits:**
+
+- **Only successfully connected servers are compared.**  If a server times out
+  or returns an enumeration error, it is excluded from the collision index.
+  A malicious server could refuse connections to avoid detection.
+- **No Levenshtein / near-miss detection.**  Tool-name comparison is exact and
+  case-sensitive.  `read_file` and `Read_File` are treated as distinct names.
+  Near-miss shadowing (e.g. `readFile` vs `read_file`) is out of scope for v1.
+- **No runtime enforcement or pinning.**  COLLIDE-001 is a detection-only
+  finding; it does not prevent the agent from calling the wrong tool.
+
+---
+
+## Authentication checks (AUTH-001 / AUTH-002)
+
+~~**No check for unauthenticated remote MCP servers.**~~ **Resolved v0.12.0.**
+`AUTH-001` in `analyzers/auth.py` flags remote (HTTP/SSE/Streamable-HTTP)
+servers with no authentication material in their config. Severity is HIGH for
+public hosts and MEDIUM for private (RFC 1918 / `*.local`) hosts. Localhost is
+exempt. Fires for all supported clients: suppressed by any Authorization /
+x-api-key / api-key header, token/apiKey/auth/bearer raw field, OAuth settings,
+or URL userinfo. Research basis: arXiv 2605.22333 (40.55% of 7,973 live remote
+MCP servers unauthenticated); Censys (12,520 internet-exposed MCP services).
+
+**AUTH-002 coverage limits (v0.12.0).**
+`AUTH-002` checks OAuth-configured servers for RFC 8707 audience/resource
+binding, but OAuth config shapes vary significantly across MCP clients. The
+check covers: `oauth`/`oauth2` dict blocks, `auth.type: oauth2` nested blocks,
+and flat top-level `client_id` + `authorization_endpoint` co-occurrence. Formats
+not matching these three patterns produce no finding (false negative tolerance is
+intentional — prefer silence over noise for auth checks). Clients that store
+OAuth config under non-standard root keys (e.g. `authorization` or a
+vendor-specific key) will not be covered. Expand `_OAUTH_FIELD_NAMES` in
+`analyzers/auth.py` as new patterns are confirmed by practitioner review.
+Dynamic-client-registration flaws found in 96.6% of OAuth-enabled MCP servers
+by arXiv 2605.22333 are out of scope for static analysis (require live
+`/.well-known/oauth-authorization-server` fetch).
+
 ## Detection quality
 
 **False positive rate benchmarked at 0% across 22 servers (2026-04-23).** The poisoning analyzer was validated against 12 official `@modelcontextprotocol/*` servers and 10 popular community servers. Zero poisoning false positives were found. See `tests/test_false_positive_benchmark.py` for the full benchmark — this is now a regression test. Acceptable non-FP findings on legitimate servers: TRANSPORT-003 (runtime package fetch, expected for all npx/uvx servers), COMM-010 (npx without pinned version). Note: the "base64 encode" false positive from the filesystem server's runtime tool descriptions (fetched via `--connect`) is not covered by static analysis and remains a known limitation of the live connection path.
@@ -40,7 +135,141 @@ This document catalogs the known limitations of mcp-audit in its current prototy
 
 **Pattern coverage is thin.** The poisoning analyzer has 11 patterns (authoritative count: `len(PATTERNS)` in `analyzers/poisoning.py`, not the highest ID number). The credential analyzer has 9. Production secret scanners like truffleHog and detect-secrets use 700+ credential patterns. The poisoning patterns cover the most-cited attack techniques but will miss novel or obfuscated injection methods. Pattern count should grow based on practitioner feedback and new published research.
 
+Partially confirmed closed (2026-05-17) via community rules seed pack (STORY-0044):
+- Role-claim poisoning in server args → confirmed closed — see COMM-016
+- Authority-claim / AI identity impersonation → confirmed closed — see COMM-017
+- Output-format hijack instruction → confirmed closed — see COMM-018
+- Side-channel data exfiltration instruction → confirmed closed — see COMM-019
+- Confabulation / hallucination trigger → confirmed closed — see COMM-020
+- Credential env key-name patterns (private key, token, password) → confirmed closed — see COMM-021, COMM-022, COMM-023
+- Unencrypted WebSocket in server args → confirmed closed — see COMM-026
+- Temp/volatile directory in command or args → confirmed closed — see COMM-029 (HIGH)
+- Absolute-path command (sideloading signal) → confirmed closed — see COMM-028
+- Generic/unnamed server governance gap → confirmed closed — see COMM-027, COMM-030
+
 **POISON-050 checks statically available description fields only.** The oversized-payload rule (POISON-050) is scoped to `name` and `description` keys in the raw server config — the fields an AI model reads when deciding whether to invoke a tool. Fields such as `command`, `args`, and environment variable values are intentionally excluded because they are not model-visible and do not constitute an attack surface for tool description padding. Additionally, tool manifests fetched at runtime via the MCP protocol (i.e., `ToolInfo.description` returned by a live `tools/list` call) are not checked by the static analyzer; connecting with `--connect` enumerates live tools and runs the poisoning patterns against their descriptions, but this requires a running server and an optional SDK dependency. As a result, POISON-050 will not fire for servers whose tool descriptions are only visible after protocol negotiation.
+
+## Known detection evasions
+
+Catalogued during the adversarial-probe pass (2026-06-14). An attacker who has
+read mcp-audit's source can craft inputs that evade individual patterns. The
+items below were confirmed by probing the compiled patterns directly.
+
+### Fixed in the 2026-06-14 adversarial pass
+
+These were confirmed-exploitable false negatives (the "`nc -e`" class — a
+pattern that looked correct, passed its tests, but missed the most dangerous
+real-world form) and are now closed with regression tests:
+
+| Finding ID | Evasion that worked | Fix |
+|---|---|---|
+| HOOK-001 | `python3` / `python3.11` reverse-shell or exfil one-liners — a bare `\bpython\b` matched `python` but not `python3` (no word boundary before the digit), and the module list omitted `socket` | Clause broadened to `python[0-9.]*` and the network-module list extended to `socket`/`socketserver`/`http.server`/`httpx`/`smtplib`/`ftplib`; PowerShell `iwr`/`irm` aliases added |
+| SC-001/002/003 | `python3 -m <typosquat>` and `/usr/bin/python3 -m <typosquat>` — the supply-chain gate matched only the exact string `python`, so every non-`python` interpreter spelling skipped typosquat detection entirely | `_is_python_interpreter()` now matches `python`, `python3`, `python3.N`, `py`, and absolute paths to them |
+| POISON-012 | `ignore all previous instructions` — the single most common injection phrase — evaded because the regex demanded the literal `instructions` after exactly **one** adjective | Pattern now accepts 1–4 stacked adjectives and the verbs `ignore`/`disregard`/`forget` |
+| POISON-060 | Fullwidth-ASCII (`ＩＧＮＯＲＥ`) and Mathematical-Alphanumeric (`𝐢𝐠𝐧𝐨𝐫𝐞`) homoglyphs — neither decomposes to Cyrillic/Greek, so the original two-range class missed them | Character class extended to `U+FF01–FF5E` and `U+1D400–1D7FF`; further hardened in the normalization pass below (Armenian/Cherokee/Coptic) |
+| AUTH-002 | A dummy env var whose name merely *contained* `aud` (e.g. `AUDIO_PATH`, `FRAUD_FLAG`) silenced the finding, because the audience-env check used a raw substring test | Audience env-key fragments now matched as delimited tokens |
+| HOOK-002 | `~/.augment/settings.json` (one of the 8 supported clients) was absent from the config-path list | `.augment/settings.json` added to `_HOOK_CONFIG_WRITE_RE` |
+
+### Closed in the 2026-06-14 normalization pass
+
+These items were open after the adversarial probe and were closed by adding a
+Unicode normalization pass plus targeted pattern work. All carry regression
+tests.
+
+- **POISON-010..060 — homoglyph / compatibility / accent obfuscation
+  (architecture-level).** `normalize_for_detection()` in `analyzers/poisoning.py`
+  now folds text to ASCII *for matching only* before the literal patterns run:
+  NFKD decomposition (fullwidth, math-alphanumeric, compatibility forms) → strip
+  combining marks (category `Mn`, e.g. `cürl` → `curl`) → strip format chars
+  (category `Cf`, i.e. zero-width spaces/joiners and soft hyphen) → a minimal
+  hardcoded UTS #39 confusables map (Cyrillic / Greek / Armenian / Cherokee /
+  Coptic look-alikes). This is wired into `PoisoningAnalyzer.analyze()`, the
+  agent-file analyzer, and HOOK-001/002 matching, so a homoglyph-obfuscated
+  `ignore previous instructions` or Cherokee `curl` now fires the literal
+  pattern. POISON-060 itself is now driven by the union of the broad confusable
+  ranges and the confusables-map code points, so Armenian/Cherokee/Coptic
+  single-character substitutions fire it. Evidence always shows the attacker's
+  original (un-normalized) bytes — the normalized form is never stored. The full
+  4 MB UTS #39 dataset is intentionally not shipped; extending the minimal map to
+  the complete confusables table is a separate research task.
+
+- **POISON-020 — encoding-exfil evasion, closed with co-occurrence scoring.**
+  `DetectionPattern.requires_cooccurrence` gates POISON-020 so an encoding verb
+  only fires when an exfil-context term (`http`/`url`/`send`/`post`/`upload`/
+  `webhook`/`endpoint`/…) appears within 200 characters. The encoding vocabulary
+  was broadened to URL-safe base64 (`base64url`) and hex (`hex encode`,
+  `binascii.hexlify`, `.encode('hex')`, …) without re-introducing the benign
+  `base64 encode the image` false positive on the official filesystem server,
+  which carries no destination term. Co-occurrence is matched on word boundaries
+  so the `url` inside `base64url` cannot self-satisfy the gate.
+
+- **SKILL-003 — non-`http(s)` schemes.** The agent-file URL detector now matches
+  `ftp(s)://`, `ws(s)://` (a live bidirectional channel), and inline `data:`
+  URIs. `data:` URIs get a distinct finding description ("may embed an obfuscated
+  payload that is decoded and executed at runtime").
+
+- **CRED-001 — credentials in URL userinfo.** `CredentialsAnalyzer` now parses
+  `server.url` and fires CRED-001 (with the password redacted in the evidence,
+  `https://user:***@host`) when a *literal* password is present in the userinfo
+  component of any scheme. Env-var references (`${PASSWORD}`, `%PW%`) are not
+  flagged. The `auth.py` docstring was updated to reflect this.
+
+- **Obfuscation inside trigger words (now a real detection, not just
+  defense-in-depth).** A zero-width space or a homoglyph mid-word in
+  `ignore previous instructions` is folded away by `normalize_for_detection()`,
+  so POISON-012 (and the rest of the literal set) now fires directly — in
+  addition to POISON-040/060 still firing on the obfuscation character itself.
+
+### Documented but not fixed (open)
+
+- **CRED-001/002 — high-entropy tokens with no recognised prefix.**
+  Evasion: a custom internal credential format (high entropy, no `sk-`/`ghp_`/
+  `AKIA`/etc. prefix and not matching the generic `password|secret|token|api_key`
+  `=`/`:`-quoted form) is not detected. This is the same class as the "Pattern
+  coverage is thin" note — production scanners use 700+ patterns plus Shannon
+  entropy. What would close it: an entropy-based detector with an allow-list, at
+  the cost of a higher false-positive rate.
+
+- **POISON-060 — full UTS #39 confusables coverage.**
+  The normalization pass closes the highest-risk confusable scripts (Cyrillic,
+  Greek, Armenian, Cherokee, Coptic) with a minimal hardcoded map. Characters
+  from the long tail of the UTS #39 confusables table (hundreds of additional
+  blocks) are not mapped. Why not fixed: shipping the full 4 MB dataset and the
+  skeleton algorithm is a separate research task with its own FP-tuning needs.
+
+- **Supply chain — cross-naming-convention squatting.**
+  Evasion: a malicious package named `mcp-official-filesystem` is plausible to a
+  human but is a large Levenshtein distance from
+  `@modelcontextprotocol/server-filesystem`, so typosquat detection never fires.
+  PEP 503 normalisation only folds `-_.`/case; it does not bridge naming
+  conventions. This is an inherent limitation of edit-distance typosquatting.
+  What would close it: token-set / semantic similarity plus npm/PyPI popularity
+  and publish-date signals (the registry already carries `first_published` and
+  `weekly_downloads` for this purpose).
+
+- **COMM-034 (God Key) — intentional boundary precision.**
+  `MY_ADMIN` (no trailing `_`) and `XADMIN_KEY` (an alphabetic char immediately
+  before `ADMIN`) do not fire. This is **by design**: the
+  `(?<![A-Z0-9])(ADMIN|ROOT|MASTER|SUPERUSER)_` shape deliberately requires a
+  delimiter before and an underscore after the keyword so that
+  `ADMINISTRATOR_URL` and similar substrings do not produce false positives.
+  Confirmed intentional; the FP tradeoff is accepted.
+
+- **SAST — no cross-function taint (Semgrep OSS).**
+  Evasion: a tainted URL or secret passed through an intermediate variable
+  *across a function boundary* before reaching the sink evades the variable-URL
+  SSRF and hardcoded-secret rules. Within a single function the variable-URL
+  rules over-match (LOW confidence) rather than under-match. This is a hard
+  limit of Semgrep OSS pattern mode — full dataflow taint requires Semgrep Pro.
+  See "SAST Rules → No taint analysis" above. Not closeable without Semgrep Pro.
+
+- **HOOK-002 — dynamically-constructed config paths.**
+  The check is path-string based, which makes it robust to *write-method*
+  variation (`tee`, `dd`, `sed -i`, `python -c "open(...)"` all fire as long as
+  the literal config path appears). It does **not** fire when the target path is
+  assembled at runtime (`os.path.join`, shell variable expansion, or base64-
+  encoded path). Documented; closing it would require shell/Python parsing far
+  beyond the hook-string regex's intent.
 
 ## Severity calibration
 
@@ -54,15 +283,19 @@ This document catalogs the known limitations of mcp-audit in its current prototy
 
 **`--verify-hashes` requires outbound network access.** Scans run fully offline by default. When `--verify-hashes` is passed, mcp-audit makes HTTPS requests to registry.npmjs.org and pypi.org. If the network is unavailable, INFO findings are produced for packages that could not be verified — the scan does not fail.
 
-~~**Layer 2 (Sigstore signature verification) and Layer 3 (dependency SBOM) are not yet implemented.**~~ **Layer 2 resolved 2026-04-23.** **Layer 3 resolved 2026-04-23.** `scan --verify-signatures` fetches SLSA provenance bundles from the npm and PyPI attestation APIs and verifies them with the `sigstore` Python library (Fulcio cert chain, SCT, Rekor inclusion proof). `scan --check-vulns` resolves transitive dependency graphs via [deps.dev](https://deps.dev) and queries [OSV.dev](https://osv.dev) for known CVEs; emits `VULN-<OSV-ID>` findings. `mcp-audit sbom` generates a CycloneDX 1.5 JSON SBOM. Both features are free for all tiers. `--vuln-registry URL` (Pro/Enterprise) allows a custom OSV-compatible endpoint. See `docs/supply-chain.md` for full documentation.
+~~**Layer 2 (Sigstore signature verification) and Layer 3 (dependency SBOM) are not yet implemented.**~~ **Layer 2 resolved 2026-04-23.** **Layer 3 resolved 2026-04-23.** `scan --verify-signatures` fetches SLSA provenance bundles from the npm and PyPI attestation APIs and verifies them with the `sigstore` Python library (Fulcio cert chain, SCT, Rekor inclusion proof). `scan --check-vulns` resolves transitive dependency graphs via [deps.dev](https://deps.dev) and queries [OSV.dev](https://osv.dev) for known CVEs; emits `VULN-<OSV-ID>` findings. `mcp-audit sbom` generates a CycloneDX 1.5 JSON SBOM. `--vuln-registry URL` allows a custom OSV-compatible endpoint. All features are free for all users (Apache 2.0; no paid tiers). See `docs/supply-chain.md` for full documentation.
 
 ## Supply chain coverage
 
-**Only npm packages are checked for typosquatting.** The MCP ecosystem includes Python servers (installed via uvx/pip), Docker containers, Go binaries, and other package managers. The supply chain analyzer only checks npm package names (npx/bunx/pnpx commands) against the known-server registry. PyPI typosquatting, Docker image verification, and other ecosystems are not covered.
+~~**Only npm packages are checked for typosquatting.**~~ **Resolved 2026-05-17 (STORY-0034).** The supply chain analyzer now covers both the npm ecosystem (npx/bunx/pnpx/yarn dlx) and the Python ecosystem (uvx, pipx, python -m). Python package names are normalised per PEP 503 before comparison so `mcp_server_filesystem` and `mcp-server-filesystem` are treated identically. Three new PyPI entries added to the registry (`mcp-server-filesystem`, `mcp-server-git`, `mcp-server-postgres`); all existing `"source": "pip"` entries updated with `"package_ecosystem": "pypi"`. Docker image verification, Go module typosquatting, and other ecosystems remain uncovered.
 
-**Registry size is below launch target.** The known-server registry ships with 64 entries as of April 2026. The launch target is 75+ entries to cover the most-installed community servers. Community contributions are needed before the August launch — open a PR against `registry/known-servers.json`. See `docs/registry-contributions.md` for the contribution guide.
+~~**Registry size is below launch target.**~~ **Resolved 2026-05-02.** The known-server registry now ships with 75 entries, meeting the launch target. Eleven new entries were added covering major ecosystem integrations: `@github/github-mcp-server`, `@playwright/mcp`, `tavily-mcp`, `firecrawl-mcp`, `mcp-server-qdrant`, `@neondatabase/mcp-server-neon`, `@shopify/dev-mcp`, `mcp-atlassian`, `@agentdeskai/browser-tools-mcp`, `@azure/mcp`, and `langchain-mcp-adapters`. Community contributions are still welcome — open a PR against `registry/known-servers.json`. See `docs/registry-contributions.md` for the contribution guide.
 
-**Levenshtein threshold may produce false positives for short package names.** The typosquatting threshold is 3 edits. For package names of 5 characters or fewer (e.g., `mcp`, `next`), a threshold of 3 is too permissive — nearly any 5-character name is within 3 edits of any other 5-character name. Monitor the demo environment after the registry refactor for false positives on short names.
+~~**Levenshtein threshold may produce false positives for short package names.**~~ **Resolved 2026-04-30.** Package names of 5 characters or fewer now use a tighter threshold of 1 edit instead of 3. Names of 6+ characters keep the existing threshold of 3. The fix is in `analyzers/supply_chain.py` (`typo_threshold = 1 if len(package) <= 5 else 3`). Covered by `tests/test_supply_chain.py::TestShortNameThreshold`.
+
+**SC-004 does not validate version ranges.** The offline CVE check (`SC-004`) fires whenever an exact-match package has `known_vulnerabilities` entries in the registry — it does not compare the installed/pinned version against the CVE's affected range. Operators must manually verify whether the version they are running is within the advisory's affected range. Version-range matching (semver `< X.Y.Z` or `>= A.B.C`) is deferred to a future iteration; see also `--check-vulns` (requires network, queries OSV.dev) for version-aware scanning.
+
+**CVE-2026-32211 (`@azure-devops/mcp`) not in registry.** NVD records the affected product as `azure_web_apps` (CPE `cpe:2.3:a:microsoft:azure_web_apps`), a fully-hosted service. Microsoft applied the fix server-side; there is no npm package version to pin or compare against. A registry entry with a pinnable `known_vulnerabilities` CVE would be misleading. Operators using the Azure DevOps MCP Server integration should check the MSRC advisory (CVE-2026-32211) directly.
 
 ~~**No registry metadata enrichment.**~~ **Resolved 2026-04-23.** `RegistryEntry` now carries three optional metadata fields — `first_published` (ISO date), `weekly_downloads` (int), and `publisher_history` (ordered list of publisher accounts). Ten entries in `registry/known-servers.json` have been pre-populated with npm data. When a typosquatted or unknown package is flagged (SC-001/SC-002), the finding description now includes a pipe-delimited metadata blurb for the legitimate package (e.g. "first published: 2024-11-14 | weekly downloads: 42,800 | known publishers: anthropic-bot, modelcontextprotocol"). The `scripts/enrich_registry.py` maintainer script fetches live data from the npm registry API to keep metadata fresh without any network calls during scanning.
 
@@ -72,7 +305,7 @@ This document catalogs the known limitations of mcp-audit in its current prototy
 
 **Server stderr output leaks to terminal.** When `--connect` launches a stdio server, the server's stderr output (warnings, logs, startup messages) appears in the user's terminal interleaved with mcp-audit output. This should be captured and suppressed or redirected.
 
-**No authentication support.** Some MCP servers (particularly SSE/HTTP servers) require authentication tokens or headers. The current `--connect` implementation doesn't support passing authentication credentials to remote servers.
+~~**No authentication support.**~~ **Resolved v0.6.0.** `scan --connect-token TOKEN` passes a Bearer token to SSE/HTTP servers. STDIO servers that require authentication via environment variables can be configured with `--env KEY=VALUE`. The gap tracker at line 640 of this file was already marked resolved; this prose entry was stale.
 
 ## Toxic flow analysis
 
@@ -88,9 +321,37 @@ This document catalogs the known limitations of mcp-audit in its current prototy
 
 ## Platform coverage
 
-**Windows not tested.** Config discovery includes Windows paths but the tool has only been tested on macOS. Path handling, file encoding, and process spawning may behave differently on Windows.
+**~~Windows not tested (critical paths).~~  Partially resolved 2026-05-02 (STORY-0017).
+Further resolved 2026-05-03 (STORY-0019).**
+The `source-smoke` CI job now runs `scripts/smoke_test.py` on `windows-latest` on every
+PR, covering: binary launch, discover, scan output, severity filter, SARIF, baseline
+round-trip, watcher re-scan (ReadDirectoryChangesW), rug-pull two-scan (state written to
+`%APPDATA%\mcp-audit\state\`), and canonical-path discovery (`%APPDATA%\Claude\…`).
+Config discovery includes Windows paths. Extension discovery paths for VS Code, VS Code
+Insiders, Cursor, and Windsurf are defined (STORY-0004, 2026-04-30) and unit-tested via
+monkeypatching.
 
-**Linux not tested.** Same as Windows — paths are defined but not validated on actual Linux systems.
+The new `synthetic-install.yml` CI workflow (STORY-0019) additionally runs
+`tests/integration/test_synthetic_install.py` on `windows-latest` on every PR, validating:
+all six supported clients' canonical config paths are discovered when `USERPROFILE` is
+redirected to a temp tree; `scan` produces findings against a config with a known-bad
+credential; paths with spaces and non-ASCII filenames are handled without crashes; the
+Windows >260-char path edge case is handled gracefully (exit ≤ 2, no traceback); and the
+`baseline save`/`compare` round-trip completes on non-ASCII paths.
+
+Full end-to-end validation on a physical Windows host is still a manual step.
+
+**~~Linux not tested (critical paths).~~  Partially resolved 2026-05-02 (STORY-0017).
+Further resolved 2026-05-03 (STORY-0019).**
+The `source-smoke` CI job also runs on `ubuntu-latest`, covering the same 11 smoke-test
+steps with inotify-backed filesystem events and `~/.config/mcp-audit/state/` rug-pull
+state. The existing `binary-smoke` job additionally validates the PyInstaller Linux binary.
+
+The new `synthetic-install.yml` CI workflow (STORY-0019) additionally runs
+`tests/integration/test_synthetic_install.py` on `ubuntu-latest`, validating the same
+canonical-discovery, credential-finding, paths-with-spaces, non-ASCII, and baseline
+round-trip scenarios on Linux. Config discovery and extension paths are defined but
+end-to-end validation on non-Ubuntu Linux distributions is a manual step.
 
 ## Internal security findings
 
@@ -98,7 +359,7 @@ Self-audit conducted 2026-04-12. Criticals and highs were patched in commit `18b
 
 ### Medium
 
-**V-07: Resolved (2026-04-23).** Poisoning detection bypassed by Unicode homoglyphs. All regex patterns now run against NFKD-normalized ASCII text. A new `POISON-060` pattern detects Cyrillic, Greek, general-punctuation lookalikes, and fullwidth ASCII variants in the original (non-normalized) text. CWE-116.
+**V-07: Resolved (2026-06-14).** Poisoning detection bypassed by Unicode homoglyphs. Correction: the earlier (2026-04-23) write-up claimed "all regex patterns now run against NFKD-normalized ASCII text" — that normalization was **not** actually implemented at the time; only the `POISON-060` character-class check existed and patterns matched raw bytes. The normalization is now real: `normalize_for_detection()` (in `analyzers/poisoning.py`) applies NFKD decomposition, strips combining marks (`Mn`) and format characters (`Cf`, incl. zero-width), and folds a minimal UTS #39 confusables map (Cyrillic / Greek / Armenian / Cherokee / Coptic) to ASCII. Literal patterns (POISON-010..030, HOOK-001/002, agent-file SKILL/MEM) match the normalized text; `POISON-060` fires on the original obfuscation character. Evidence retains the attacker's original bytes. CWE-116. See "Known detection evasions → Closed in the 2026-06-14 normalization pass".
 
 **V-08: Resolved (2026-04-23).** Poisoning detection bypassed by nesting depth > 10. The recursion limit in `_extract_text_fields` and `_extract_description_fields` raised from 10 to 50. A depth of 50 guards against circular-reference DoS while making the bypass impractical.
 
@@ -118,17 +379,17 @@ Self-audit conducted 2026-04-12. Criticals and highs were patched in commit `18b
 
 **V-15: Resolved.** All `yourusername` placeholder URLs replaced with `adudley78` across `sarif.py`, `pyproject.toml`, `README.md`, `scripts/install.sh`, and `docs/enterprise-deployment.md`.
 
-**V-16: `_home()` inconsistency in discovery.py.** `_home()` wraps `Path.home()` for test mocking, but `_get_client_specs()` calls `Path.home()` directly on one line, defeating the indirection. Fix: use `_home()` consistently.
+~~**V-16: `_home()` inconsistency in discovery.py.**~~ **Resolved v0.9.2.** `_get_client_specs()` called `Path.home()` directly on the Windows branch (line 40), bypassing the `_home()` indirection used everywhere else. Fixed by replacing `Path.home()` with `_home()`. Regression test `TestHomeHelperConsistency::test_discovery_uses_home_helper` in `tests/test_discovery.py` patches `mcp_audit.discovery._home` and asserts all returned paths are under the patched root.
 
-**V-17: Credential regex overlap and gaps.** The OpenAI pattern `sk-[A-Za-z0-9]{20,}` also matches Anthropic keys (`sk-ant-*`), causing double detection. No coverage for Google service account JSON, Azure SAS tokens, DigitalOcean tokens, Vercel tokens, or PEM-encoded keys. Generic secret pattern requires quotes around values, missing unquoted secrets. Fix: refine patterns and expand coverage incrementally.
+~~**V-17: Credential regex overlap and gaps.**~~ **Resolved v0.10.0 (STORY-0035).** Expanded `SECRET_PATTERNS` in `credentials.py` to cover GCP service-account JSON keys, Azure SAS tokens, DigitalOcean personal access tokens, Vercel access tokens, PEM private key blocks (RSA, EC, DSA, OpenSSH), HashiCorp Vault service and batch tokens, Anthropic API keys, and GitHub fine-grained PATs (`github_pat_`). Matching Semgrep rules added to both Python and TypeScript rule packs. 13 new unit tests added. Zero false positives confirmed against all demo config fixtures.
 
 ## Binary distribution
 
-**Binary distribution is architecture-specific.** The PyInstaller build pipeline produces a single-file binary for the platform it is built on. macOS (`mcp-audit-darwin-{arch}`) is built natively; Linux x86_64 (`mcp-audit-linux-x86_64`) is built via `scripts/build-linux.sh` which runs PyInstaller inside a `python:3.11-slim` Docker container — requires Docker Desktop. Apple Silicon (arm64) Macs require Rosetta 2 or a native arm64 build; Windows users need their own platform builds. GitHub Actions matrix builds across `[macos-13 (x86_64), macos-14 (arm64), ubuntu-latest, windows-latest]` are needed to produce the full platform matrix automatically on each release.
+**Binary distribution is architecture-specific.** GitHub Releases ship four PyInstaller binaries built by `.github/actions/build-binary/` (CPython 3.12.14 via uv): `mcp-audit-darwin-x86_64`, `mcp-audit-darwin-arm64`, `mcp-audit-linux-x86_64`, `mcp-audit-windows-x86_64.exe`. CI `binary-smoke` and `release.yml` `build` both call that composite. There is no local `scripts/build-linux.sh` / `build.py` path — those used Python 3.11 + pip and skipped the specs' excludes.
 
-**Linux binary requires glibc ≥ 2.17 at runtime.** The `python:3.11-slim` (Debian bookworm) build environment links against glibc 2.36. PyInstaller sets `for GNU/Linux 3.2.0` as the minimum ELF ABI, but the bundled `.so` files (from the Debian build environment) may reference symbols requiring glibc 2.17+. This covers all modern Linux distributions (Ubuntu 18.04+, Debian 9+, RHEL/CentOS 7+) but will fail on Alpine Linux (musl libc) and very old glibc environments. Use a `python:3.11-alpine`-based build with `--strip` and musl-compatible wheels for Alpine targets.
+**Linux binary requires a glibc host at runtime.** The linux artifact is built on GitHub-hosted `ubuntu-latest` with uv's standalone CPython 3.12.14, not Alpine/musl. Alpine and very old glibc hosts are unsupported.
 
-**Linux binary not tested end-to-end on a real Linux host.** The ELF binary was built and verified via `file(1)` on macOS using the Docker build path. Its behavior on actual Linux distributions — config discovery paths, rug-pull state storage, watcher filesystem events — has not been validated. See the existing "Linux not tested" note under Platform coverage.
+**Linux binary is exercised in CI, not only via `file(1)`.** `binary-smoke` on `ubuntu-latest` builds the linux artifact with the same composite as release, inspects the PYZ, and runs `scripts/smoke_test.py`. Distro-specific config discovery and watcher behaviour outside that smoke are still a gap.
 
 ~~**Dashboard browser compatibility untested.**~~ **Resolved 2026-04-23.** `tests/test_dashboard_compat.py` covers Chromium, Firefox, and WebKit (Safari engine) headlessly via Playwright. Tests assert: no JS errors on load or dark-mode toggle, findings table present, SVG graph container present, self-contained HTML (no external CDN references), D3 v7 bundled inline, scan data JSON embedded. Browser tests are skipped gracefully when Playwright binaries are not installed; CI installs them on the `ubuntu-latest / 3.12` matrix leg. Mobile browsers and WebView-based environments (Electron, VS Code webview) are not covered.
 
@@ -174,9 +435,9 @@ for a concrete example and further rationale.
 
 ## Fleet merge
 
-**HTML fleet output is a simplified table, not a full D3 fleet dashboard.** `mcp-audit merge --format html` renders a Rich-exported HTML table. A full D3 force-directed fleet visualization (showing machine relationships, shared findings as edges, attack-path overlays) is a future enhancement. The current output is functional but not interactive.
+~~**HTML fleet output is a simplified table, not a full D3 fleet dashboard.**~~ **Resolved v0.6.0.** `mcp-audit merge --format html` now produces a fully self-contained D3-powered fleet dashboard with a machine-card grid, filterable/sortable findings table, light/dark mode toggle, and severity breakdown bars — replacing the previous Rich-table HTML export. A full D3 force-directed fleet visualization (showing machine relationships, shared findings as edges, attack-path overlays) is still a future enhancement; the current dashboard shows per-machine cards but not cross-machine graph edges.
 
-**`--dir` is non-recursive.** `mcp-audit merge --dir ./results/` only looks at `*.json` files at the top level of the directory. Nested subdirectories (e.g. `./results/team-a/machine-1.json`) are not scanned. Use shell globbing (`mcp-audit merge ./results/**/*.json`) for recursive collection.
+~~**`--dir` is non-recursive.**~~ **Resolved v0.5.1.** `_collect_json_paths_from_dir()` now uses `rglob("*.json")` instead of `glob("*.json")`, so nested subdirectory layouts (e.g. `./results/team-a/machine-1.json`) are collected automatically.
 
 **Deduplication matches on exact `(analyzer, server_name, title)` triple.** Findings with subtly different titles — for example, two credential findings on the same server but matching different key names (`sk-abc123` vs `OPENAI_KEY=xyz`) — will produce two separate DeduplicatedFindings rather than being collapsed. This is intentional (exact-match deduplication avoids false-merges) but means the unique-findings count may be slightly inflated when the same issue class manifests with different evidence strings.
 
@@ -202,7 +463,7 @@ overrides — user-supplied directories are always treated as primary over bundl
 community rules.
 
 **Community rule false-positive rate is unmeasured.**
-The 12 community rules were written to cover clear-cut cases (netcat as binary,
+The 15 community rules were written to cover clear-cut cases (netcat as binary,
 eval in args, etc.) but have not been validated against a broad sample of
 real-world MCP server configurations.
 
@@ -303,10 +564,17 @@ The Semgrep SAST rule pack (`semgrep-rules/`) has the following known limitation
 - `mcp-no-type-check-before-use` fires when `arguments.get()` is used without an immediately adjacent `isinstance()` check, even when the MCP SDK provides type validation at the protocol level.
 - `mcp-flask-no-ssl` matches any `$APP.run(...)` call; explicitly excludes `subprocess.run` and `asyncio.run`, but may fire on other `.run()` patterns.
 
-**TypeScript rules are less comprehensive than Python rules:**
-- Python has 28 rules across 5 categories; TypeScript has 9 rules across 4 categories.
-- No TypeScript-specific path traversal, SQL injection, or protocol rules yet.
-- TypeScript SSRF detection not yet implemented.
+**TypeScript SAST parity substantially improved (v0.7.0 and v0.9.0):**
+- Python has 38 rules across 6 categories; TypeScript has 35 rules across 6 categories.
+- v0.7.0 added 11 new TypeScript rules across 5 categories: credential default params,
+  secrets in console output, URL/base64/unicode in tool descriptions, missing input
+  validation, stack trace exposure, and listen-all-interfaces.
+- v0.9.0 added MCP Sampling injection rules (Python + TypeScript), SSRF validation-path
+  rules (Python + TypeScript anchored to CVE-2026-44284, CVE-2026-39974, CVE-2026-27826),
+  and a TypeScript SDK singleton transport rule (CVE-2026-25536).
+- Remaining parity gaps (Python-only, no TS equivalent): hardcoded connection strings,
+  `app.run()` without SSL, and f-string SQL injection. These Python-specific patterns
+  have no idiomatic TypeScript equivalent in Semgrep OSS without taint analysis.
 
 **Rules target server source code, not installed binaries:**
 - SAST rules require access to the server implementation source code. They cannot scan pre-built npm packages, PyPI wheels, or Docker images. Config scanning (`mcp-audit scan`) remains the primary defense for production deployments.
@@ -339,8 +607,14 @@ and Augment paths were not found on the build machine.  Paths may differ by:
 - Client version (path changes between major versions)
 - Custom install location (non-default `--extensions-dir`)
 
-**Windows extension paths are not validated.**  The standard Windows path
-(`%USERPROFILE%\.vscode\extensions`) is not yet included in `EXTENSION_PATHS`.
+**~~Windows extension paths are not validated.~~  Resolved 2026-04-30 (STORY-0004).**
+Standard Windows paths are now defined in `_get_windows_paths()` in
+`extensions/discovery.py` and merged into `discover_extensions()` at call time:
+`%APPDATA%\Code\extensions` and `%APPDATA%\Code - Insiders\extensions` (VS Code),
+`%USERPROFILE%\.cursor\extensions` (Cursor), and
+`%USERPROFILE%\.windsurf\extensions` (Windsurf).  All four paths are covered by
+monkeypatched unit tests that run on every CI platform.  End-to-end validation on a
+real Windows host is a manual step deferred to pre-launch.
 
 **No runtime behaviour monitoring.**  The scanner analyses static manifest data only.
 Malicious extensions that hide capabilities inside their JS bundle (e.g. deferred
@@ -348,13 +622,195 @@ imports, obfuscated network calls) will not be detected by this approach.
 
 **Fleet extension inventory via `merge` not yet implemented.**  The `fleet_extensions`
 feature key is reserved but `mcp-audit merge` does not yet aggregate extension findings
-across machines (Enterprise, post-launch roadmap).
+across machines (post-launch roadmap).
 
-## Missing capabilities (not started)
+## Agent-file surface coverage (skills, memory, hooks)
 
-- **Multi-arch binary CI release matrix** — GitHub Actions matrix builds for `[macos-13 (x86_64), macos-14 (arm64), ubuntu-latest, windows-latest]` not yet set up
-- **pip packaging and TestPyPI dry run** — installable from source only (PyInstaller binary available as alternative; `pip install mcp-audit` used in the action but not yet on PyPI)
-- **Documentation beyond README** — no usage guide, Nucleus integration guide (scoring, registry, and rule-writing docs now exist in `docs/`)
+**Shipped 2026-06-14 (Phases 1–3):** The `src/mcp_audit/agent_files/` package
+is implemented and tested. Confirmed surfaces in `agent_files/discovery.py`:
+Claude Code commands (`~/.claude/commands/`, `.claude/commands/`), Claude Code
+memory (`CLAUDE.md` tiers), Cursor rules (`~/.cursor/rules/`, `.cursor/rules/`),
+GitHub Copilot workspace instructions, scoped instructions, and prompt templates.
+Hook analysis (`HOOK-001`, `HOOK-002`) extends `ConfigHygieneAnalyzer`.
+Known limitations per finding:
+
+- **SKILL-003** fires on all `http(s)://`, `ftp(s)://`, `ws(s)://`, and inline
+  `data:` URIs in instruction files, including legitimate documentation links in
+  `.github/copilot-instructions.md`. False-positive rate is moderate on Copilot
+  instruction files that reference their own repo or third-party docs.
+  Mitigation: `--severity-threshold medium`.
+- **HOOK-001** pattern may fire on local test scripts that contain `nc` (netcat)
+  as a tool invocation if the argument structure matches. Edge case; no known FP
+  in the current benchmark.
+- **MEM-002** (zero-width Unicode, POISON-040) fires even on CLAUDE.md files
+  that have copy-pasted content from a source that embedded invisible Unicode.
+  Inspect with `cat -A` or a Unicode hex dump to confirm.
+
+The sections below document unconfirmed client paths for future phases.
+Confirmed paths are implemented; unconfirmed paths are tracked here until
+official documentation or environment probes validate them. Do not write
+discovery or analysis code for unconfirmed paths — add them to
+`agent_files/discovery.py` only when confirmed.
+
+**Phase design decisions recorded 2026-06-14:**
+- Copilot prompt files (`.github/prompts/*.prompt.md`) scanned at the same
+  severity tier as instruction files; executable templates carry equal or higher
+  risk, not lower.
+- Memory analyzer (MEM-001/MEM-002) uses a restricted pattern subset:
+  POISON-010 (XML injection markers), POISON-011 (LLM format markers),
+  POISON-040 (zero-width Unicode), POISON-060 (homoglyphs) only. All other
+  PATTERNS entries — including POISON-050 (excessive length) — are excluded
+  from memory analysis to control false-positive rate on innocuous large files.
+- `--include-agent-files` flag includes project-tree walking for
+  `.claude/commands/`, `.cursor/rules/`, and `.github/` subtrees; the
+  cloned-malicious-repo scenario is the primary attack vector.
+- Hook content analysis (HOOK-001, HOOK-002) extends
+  `ConfigHygieneAnalyzer.analyze_config()` (via new `_check_hook_commands()`
+  helper) rather than splitting into a separate analyzer. Hook responsibility
+  stays with the config-hygiene analyzer.
+- OWASP mappings confirmed: SKILL-001/002/003 → MCP03 (Prompt Injection)
+  + MCP01 (Token Mismanagement); HOOK-001/002 → MCP05 (Command Injection)
+  + MCP07 (Insufficient Auth); MEM-001/002 → MCP03.
+
+---
+
+### Windsurf — skill/memory/hook files
+
+**Status: unconfirmed. No code written.**
+
+Windsurf's global MCP config (`~/.codeium/windsurf/mcp_config.json`) is
+already discovered by `discovery.py`. However, Windsurf's equivalents of
+Claude Code memory files (`CLAUDE.md` tiers) and Cursor rules (`.mdc` files)
+are not documented in the official Codeium/Windsurf developer docs as of
+2026-06-14.
+
+**What is unknown:**
+- Whether Windsurf reads a `WINDSURF.md`, `~/.windsurf/rules/`, or similar
+  freetext-instruction file into the agent context.
+- Whether Windsurf supports a hook or lifecycle-command API analogous to
+  Claude Code's `preToolUse` / `postToolUse` hooks.
+- Whether the Codeium extension pack has an instruction-file mechanism visible
+  to the agent (distinct from VS Code Copilot instructions).
+
+**Action:** Add confirmed paths to `agent_files/discovery.py` WINDSURF entry
+when Codeium publishes documentation or a path is validated via environment
+probe. Until then, `agent_files/discovery.py` omits Windsurf from skill/memory
+discovery (the MCP config path remains in `discovery.py` as before).
+
+---
+
+### Augment — skill/memory/hook files
+
+**Status: unconfirmed. No code written.**
+
+Augment's global MCP config (`~/.augment/settings.json`) is already
+discovered by `discovery.py`. Augment's instruction/memory surface is not
+publicly documented.
+
+**What is unknown:**
+- Whether Augment reads a project-level instruction file (e.g., `AUGMENT.md`,
+  `.augment/instructions.md`, or a `context:` block in its settings file).
+- Whether Augment exposes a hooks or lifecycle-command API.
+- Whether Augment uses VS Code extension APIs that would make the Copilot
+  instruction files (`.github/copilot-instructions.md`) available to it as
+  well.
+
+**Action:** Add confirmed paths when Augment publishes developer documentation
+or a path is validated via probe. If Augment reads VS Code Copilot instruction
+files as part of its VS Code extension, those paths are already covered by the
+Copilot discovery in `agent_files/discovery.py`.
+
+---
+
+### Kiro — MCP config and skill/memory/hook files
+
+**Status: unconfirmed. No code written.**
+
+`~/.kiro/settings/mcp.json` was referenced as a credential-theft target in
+the 2026-04-22 supply-chain malware analysis (Bitwarden npm package), which
+confirms the path exists and is used by an active client. However, no
+Kiro/AWS Kiro developer documentation is publicly available as of 2026-06-14
+to confirm the exact schema, root key (`mcpServers` vs `servers` vs other),
+or whether project-level files exist.
+
+**What is unknown:**
+- Exact JSON root key for Kiro's MCP config (`mcpServers`? `servers`?
+  `context_servers`?).
+- Whether Kiro supports project-level MCP configs analogous to `.mcp.json`.
+- Whether Kiro reads a `KIRO.md` or `.kiro/instructions.md` file into agent
+  context.
+- Whether Kiro exposes a hooks API.
+- Platform availability: Kiro was announced for macOS and Windows; Linux
+  support is unconfirmed.
+
+**Action (MCP config):** When Kiro publishes documentation, add a `ClientSpec`
+entry to `_get_client_specs()` in `discovery.py` with the confirmed path and
+root key. Until then, mcp-audit will not discover or scan Kiro MCP configs,
+which is a false-negative risk for Kiro users.
+
+**Action (skill/memory/hook):** Add to `agent_files/discovery.py` after the
+MCP config path is confirmed.
+
+---
+
+### `.claude/skills/` — Claude Code skills directory
+
+**Status: unconfirmed. No code written.**
+
+Several third-party articles and community posts reference a `.claude/skills/`
+directory as a location for Claude Code "skills" (structured capability
+definitions). As of 2026-06-14, this path is **not confirmed** in the official
+Anthropic Claude Code documentation.
+
+**What is confirmed vs. unconfirmed:**
+- ✅ `~/.claude/commands/` and `.claude/commands/` — confirmed in official
+  Anthropic docs as the mechanism for custom slash commands; both are
+  implemented in `agent_files/discovery.py`.
+- ✅ `CLAUDE.md`, `.claude/CLAUDE.md`, `~/.claude/CLAUDE.md` — confirmed
+  memory/instruction tiers.
+- ❌ `.claude/skills/` — not present in official Anthropic Claude Code
+  documentation; may be a user convention, an unreleased feature, or a
+  mischaracterization of the `commands/` directory.
+
+**Action:** Monitor Anthropic release notes. If `.claude/skills/` is
+confirmed as an official path in a future Claude Code release, add it to
+`agent_files/discovery.py` under the `claude-code-skills` surface key. Until
+confirmed, do not add it to discovery.
+
+---
+
+### VS Code Copilot — user-global instruction files
+
+**Status: partially confirmed. Not yet implemented.**
+
+Workspace-level Copilot instruction files (`.github/copilot-instructions.md`,
+`.github/instructions/*.instructions.md`, `.github/prompts/*.prompt.md`) are
+confirmed and implemented in `agent_files/discovery.py` for project-tree
+walking.
+
+**What is unconfirmed:**
+- A user-global Copilot instruction file on macOS/Linux (the Windows path
+  `%APPDATA%\Code\User\prompts\` is referenced in VS Code docs but its
+  macOS/Linux equivalent — `~/Library/Application Support/Code/User/prompts/`
+  or `~/.config/Code/User/prompts/` — has not been probed on the build machine).
+- Whether Copilot respects user-global instruction files outside a workspace
+  context.
+
+**Action:** Probe `~/Library/Application Support/Code/User/prompts/` (macOS)
+and `~/.config/Code/User/prompts/` (Linux) on a machine with VS Code + Copilot
+installed. If present, add to `agent_files/discovery.py` COPILOT user-global
+entry. Until confirmed, only workspace/project-tree paths are discovered.
+
+---
+
+## Missing capabilities
+
+~~**Multi-arch binary CI release matrix**~~ **Resolved v0.4.0.** `release.yml` builds four PyInstaller executables in parallel on `v*.*.*` tag push: `macos-15-intel` (x86_64), `macos-latest` (arm64), `ubuntu-latest`, and `windows-latest`.
+
+~~**pip packaging and TestPyPI dry run**~~ **Resolved v0.3.3.** PyPI Trusted Publishing (OIDC) pipeline in `release.yml` publishes to PyPI on every tag push. `pip install mcp-audit-scanner` resolves the current release. PEP 740 sigstore attestations are published alongside each wheel and sdist.
+
+~~**Documentation beyond README**~~ **Resolved (incrementally through v0.9.0).** Comprehensive docs now exist in `docs/`: scoring, registry, writing-rules, governance, SAST rules, extensions, fleet scanning, baselines, snapshot, diff, killchain, shadow, live-connection, enterprise-deployment, and more.
+
 - **Telemetry or usage analytics** — deliberately absent; see `docs/telemetry.md`.
 - **Registry auto-growth** — the known-server registry requires manual contributions as the MCP ecosystem grows; `update-registry` pulls the latest committed version but does not discover new servers automatically
 
@@ -403,11 +859,30 @@ Result documented in the module-level docstring of `poisoning.py`.
 Results of running mcp-audit's own analysis pipeline against its own source,
 as required before PyPI publication.
 
-### `mcp-audit sast src/`
-Semgrep is not installed in the local dev environment; SAST self-scan could
-not be run.  The 37 bundled rules ship in the wheel and are exercised by CI
-on every PR via the GitHub Actions workflow.  Manual SAST self-scan deferred
-until Semgrep is available in the environment (`pip install semgrep`).
+### `mcp-audit sast src/` (updated 2026-05-02)
+
+Semgrep is now a dev extra (`uv sync --extra dev`). Self-scan run against
+`src/mcp_audit/` using the bundled rule pack (`semgrep-rules/`):
+
+```
+semgrep --config semgrep-rules/ src/mcp_audit/
+Rules run: 34 (Python rules only — TypeScript rules do not apply to .py files)
+Targets scanned: 73 files
+Findings: 0
+```
+
+**Result: zero findings.** No `# nosemgrep` suppressions needed.
+
+Caveat: the venv-installed `semgrep` (via `uv run semgrep`) fails to start on
+Python 3.12 due to an `opentelemetry-instrumentation` transitive dependency
+bug (`ModuleNotFoundError: No module named 'pkg_resources'`). The scan above
+used the system `semgrep` binary
+(`/Library/Frameworks/Python.framework/Versions/3.12/bin/semgrep`).
+`semgrep` is retained in the dev extras because the CI environment (Ubuntu,
+Python 3.11) does not exhibit this issue and the `semgrep --test semgrep-rules/`
+rule-fixture tests run cleanly there. The `pkg_resources` absence is a known
+Python 3.12 + older `setuptools` interaction in specific venv configurations;
+tracking as a future dependency hygiene item.
 
 ### `mcp-audit scan --check-vulns`
 One finding: `rug_pull / claude-desktop/filesystem` (INFO severity).
@@ -426,3 +901,43 @@ sites in `attestation/sigstore_client.py`, `vulnerability/depsdev.py`,
 `vulnerability/osv.py`, and `vulnerability/resolver.py` (all call HTTPS-only
 hardcoded URLs), and `# nosec B104` to the wildcard-bind detection constant
 in `analyzers/transport.py`.
+
+---
+
+## Closed gaps
+
+Items below were confirmed open at some point and have since been resolved. Each entry records the gap ID or description, what fixed it, and in which version.
+
+| Gap | Resolution | Version |
+|-----|-----------|---------|
+| Paid-license infrastructure (`licensing.py`, `_gate.py`, `activate`/`license` commands, `data/revoked.json`) | Removed entirely; mcp-audit is fully Apache 2.0 | v0.2.0 |
+| `run_scan` and `run_scan_async` duplicated the analysis pipeline | Extracted `_run_static_pipeline()` as canonical implementation | v0.4.0 |
+| `--no-score` leaked score into SARIF `run.properties` | `cli.py` nulls `result.score` before any formatter | v0.4.0 |
+| Malformed JSON config silently swallowed | `result.errors` checked; exit 2 with human-readable message | v0.4.0 |
+| Multi-arch binary CI release matrix not set up | `release.yml` matrix across 4 platforms | v0.4.0 |
+| V-07: Unicode homoglyph bypass in poisoning detection | NFKD normalisation + `POISON-060` pattern | v0.5.0 (pre-release) |
+| V-08: Nesting depth > 10 bypass in poisoning detection | Recursion limit raised to 50 | v0.5.0 (pre-release) |
+| V-09: Wildcard interface binding not detected | `TRANSPORT-004` added | v0.5.0 (pre-release) |
+| V-10: Privilege escalation coverage incomplete | `TRANSPORT-002` expanded with `pkexec`, `su`, `run0`, absolute paths | v0.5.0 (pre-release) |
+| V-11: `yarn dlx` and `pipx` not detected | Added to `TransportAnalyzer` and `SupplyChainAnalyzer` | v0.5.0 (pre-release) |
+| V-12: `httpx` in core dependencies | Moved to `[mcp]` optional extra | v0.4.0 |
+| V-13: Version string hardcoded in 6 locations | Centralised via `importlib.metadata` in `__init__.py` | v0.4.0 (pre-release) |
+| V-14: Missing LICENSE file / `pyproject.toml` alignment | Apache 2.0 `LICENSE` created; classifiers aligned | v0.4.0 (pre-release) |
+| V-15: Placeholder URLs throughout codebase | All `yourusername` replaced with `adudley78` | v0.4.0 (pre-release) |
+| pip packaging and TestPyPI dry run | PyPI Trusted Publishing (OIDC) in `release.yml` | v0.3.3 |
+| SARIF not tested with GitHub | Schema validation tests + manual verification checklist | v0.8.0 (pre-release) |
+| Nucleus FlexConnect not validated | Validated end-to-end against live Nucleus instance | v0.10.0 (pre-release) |
+| Dashboard browser compatibility untested | Playwright cross-browser test suite added | v0.10.1 (pre-release) |
+| Layer 2 (Sigstore provenance verification) not implemented | `--verify-signatures` shipped | v0.6.0 (pre-release) |
+| Layer 3 (dependency CVE scanning) not implemented | `--check-vulns` shipped via deps.dev + OSV.dev | v0.6.0 (pre-release) |
+| Registry size below launch target | 75 entries, exceeding launch target | v0.7.0 |
+| Levenshtein threshold false positives for short names | Short-name threshold tightened to 1 edit for ≤ 5 chars | v0.5.1 |
+| No registry metadata enrichment | `RegistryEntry` carries `first_published`, `weekly_downloads`, `publisher_history` | v0.5.0 (pre-release) |
+| `--dir` non-recursive in fleet merge | `rglob("*.json")` replaces `glob("*.json")` | v0.5.1 |
+| Fleet HTML output was a simplified Rich table | D3-powered fleet dashboard with machine cards and filterable table | v0.6.0 |
+| Windows extension paths not validated | `_get_windows_paths()` added; covered by monkeypatched unit tests | v0.5.1 |
+| Documentation beyond README not written | Comprehensive `docs/` directory covers all features | incremental through v0.9.0 |
+| Server stderr leaked to terminal during `--connect` | stderr captured; `--verbose` to surface it | v0.6.0 |
+| No authentication support for SSE/HTTP servers | `--connect-token TOKEN` flag added | v0.6.0 |
+| V-16: `_home()` inconsistency — Windows branch of `_get_client_specs()` called `Path.home()` directly | Replaced with `_home()`; regression test added | v0.9.2 |
+| V-17: Credential regex gaps — no GCP, Azure SAS, DigitalOcean, Vercel, PEM, Vault, or GitHub fine-grained PAT coverage | 8 new patterns added to `credentials.py`; matching Semgrep rules added; 13 new tests | v0.10.0 |

@@ -1,24 +1,42 @@
 <!--
-Template used by .github/workflows/release.yml to compose the body of every
-v*.*.* GitHub Release.  The double-curly VERSION token below is replaced at
-release time with the pushed git tag (set from $GITHUB_REF_NAME, e.g. v0.3.4)
-via the "Compose release notes from template" step.
+Evergreen GitHub Release body. Per-release prose does NOT live here.
 
-Keep this file in sync with README.md copy — CI does not verify it.
-If the feature list or test count changes in README.md, update here too.
+.github/workflows/release.yml runs scripts/compose_release_notes.py, which:
+  - replaces the VERSION placeholder with the pushed tag (e.g. v0.15.0)
+  - splices the CHANGELOG.md section ## [X.Y.Z] at the CHANGELOG_SECTION marker
+  - fails the release if that heading is missing or any placeholder survives
+
+Keep Install / coverage / integrations in sync with README.md copy.
+tests/test_release_notes_facts.py asserts the facts that actually go stale —
+package name, CLI command, binary asset filenames (checked against the
+PyInstaller specs, not README, since README never enumerates them),
+SBOM filenames, the supported-host list (checked as a subset of README's
+table, not equal — this tagline is a sample, not the full list), test count
+(cross-checked against README.md, not re-derived — see
+scripts/update_test_count.py), and the poisoning / credential / SAST /
+exploit-fixture / benchmark-server counts. It compares extracted values, not
+paragraphs: a reworded sentence will not fail CI; a renamed asset, a dropped
+host, or a changed count will.
+
+Everything else — wording, section order, which integrations get a bullet,
+flag descriptions in prose — is still unverified and can drift silently.
+
+Do not put Highlights, a What's-new block, or a security banner in this
+file. Those belong under the matching CHANGELOG heading (### Security is
+the banner: it renders first in the spliced section). A forgotten
+CHANGELOG promotion fails the tag; it does not republish the last
+release's notes.
 -->
 ## mcp-audit {{VERSION}}
 
 Security scanner for MCP (Model Context Protocol) server configurations.
 Detects prompt injection, supply chain risks, credential exposure, toxic flow
 combinations, transport vulnerabilities, and more — across Claude Desktop,
-Cursor, VS Code, Zed, and any MCP-compatible host.
+Cursor, VS Code, Windsurf, and any MCP-compatible host.
 
 ---
 
-### What's new in {{VERSION}}
-
-See [`CHANGELOG.md`](CHANGELOG.md) for the full change list for this release.
+{{CHANGELOG_SECTION}}
 
 ---
 
@@ -37,6 +55,9 @@ Or grab a pre-built binary from **Assets** below (no Python required):
 | Linux x86-64 | `mcp-audit-linux-x86_64` |
 | Windows x86-64 | `mcp-audit-windows-x86_64.exe` |
 
+Each GitHub Release also attaches a CycloneDX SBOM per binary
+(`mcp-audit-<platform>.cdx.json`) plus `mcp-audit-scanner-wheel.cdx.json`.
+
 ### Use as a GitHub Action
 
 ```yaml
@@ -52,13 +73,21 @@ after v1, `@v1` will track the latest 1.x release automatically.
 
 ---
 
+### Upgrading
+
+`pip install --upgrade mcp-audit-scanner` or download the new binary from
+the release assets. Anything you must do for this version is in the
+changelog section above.
+
+---
+
 ### Detection coverage
 
 - **Prompt injection / tool poisoning** — 11 patterns, Unicode homoglyph-aware, depth-50 recursion
 - **Credential exposure** — 9 patterns (AWS, GitHub, Stripe, Slack, and more)
 - **Supply chain risk** — npm/PyPI provenance, Sigstore signature verification (`--verify-signatures`), SBOM + OSV.dev CVE scan (`--check-vulns`)
 - **Toxic flow detection** — dangerous server *combinations* (e.g. database + web fetch)
-- **SAST** — 37 rules across Python (28) and TypeScript (9)
+- **SAST** — 89 rules across Python (46) and TypeScript (43)
 - **Transport security** — insecure bindings, wildcard hosts, unverified TLS
 
 ### Integrations
@@ -67,14 +96,16 @@ after v1, `@v1` will track the latest 1.x release automatically.
 - Nucleus Security FlexConnect (`mcp-audit push-nucleus`)
 - Baseline diffing for CI regression gates (`mcp-audit baseline`)
 - HTML dashboard — self-contained, no CDN dependencies
+- VS Code / Cursor extension — inline squiggles and command palette
+- Signed OSV advisory feed (`mcp-audit advise`) — experimental until a project signing key ships
 
 ### Validated against
 
 - 6 real-world exploit fixtures (Invariant Labs SSH exfiltration, CrowdStrike `add_numbers`, XML injection, cloud credential theft, behavioral override)
 - 22-server false-positive benchmark — 0% poisoning FP rate on legitimate servers
-- CVSS + OWASP Agentic Top 10 severity mappings on every finding ID
+- CVSS + OWASP MCP Top 10 severity mappings on every finding ID
 
-**1,391 tests · Apache 2.0 · macOS · Linux · Windows**
+**3,082 tests · Apache 2.0 · macOS · Linux · Windows**
 
 ---
 

@@ -4,6 +4,21 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Dry-run: same `build` job (and therefore the same composite) as a tag
+  # push, including `upload-artifact`. Never creates a GitHub Release,
+  # publishes to PyPI, or moves @vN — those jobs are `if: push` only.
+  # Dispatch this after changing the composite or the upload path; do not
+  # wait for the next tag to be the first release-side execution.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >
+          Ignored as a gate: workflow_dispatch never publishes. Builds the
+          four binaries via .github/actions/build-binary/ and keeps them as
+          workflow artifacts so the upload path is proven. Only a v*.*.*
+          tag push creates a GitHub Release or publishes the wheel.
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -39,91 +54,70 @@ jobs:
             binary: mcp-audit-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
+      # Interpreter, extras, spec, PyInstaller, PYZ inspect, smoke, size:
+      # one definition, shared with ci.yml binary-smoke. Do not inline a copy here.
+      - uses: ./.github/actions/build-binary
         with:
-          version: "latest"
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Install dependencies
-        # sigstore is installed into .venv so `uv sync --all-extras` resolves,
-        # but the four PyInstaller specs explicitly `excludes=[...]` sigstore
-        # and its transitive modules, so it is never bundled into the binary.
-        run: uv sync --all-extras
-
-      - name: Install PyInstaller
-        run: uv pip install pyinstaller
-
-      - name: Build binary
-        run: uv run pyinstaller ${{ matrix.spec }} --distpath dist/
-
-      - name: Smoke test — version
-        run: dist/${{ matrix.binary }} version
-        shell: bash
-
-      - name: Smoke test — full end-to-end
-        # `uv run python` pins the interpreter to the uv-managed .venv so the
-        # step does not depend on whatever `python` happens to be on PATH.
-        run: uv run python scripts/smoke_test.py dist/${{ matrix.binary }}
-        shell: bash
-
-      - name: Binary size check
-        shell: bash
-        run: |
-          BINARY="dist/${{ matrix.binary }}"
-          SIZE_BYTES=$(wc -c < "$BINARY" | tr -d ' ')
-          # `bc` is not installed in Windows' Git Bash; awk is universally
-          # available on every runner, so use it for the MB float format.
-          SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.1f", b/1048576 }')
-          echo "Binary size: ${SIZE_MB} MB (${SIZE_BYTES} bytes)"
-          # Warn at 25 MB, fail at 35 MB.  The binary ships *without* sigstore
-          # (excluded in the .spec files); local linux build is ~21 MB.
-          if [ "$SIZE_BYTES" -gt 36700160 ]; then   # 35 MB
-            echo "ERROR: binary exceeds 35 MB hard limit (${SIZE_MB} MB)" >&2
-            exit 1
-          elif [ "$SIZE_BYTES" -gt 26214400 ]; then  # 25 MB
-            echo "WARNING: binary exceeds 25 MB soft limit (${SIZE_MB} MB)"
-          else
-            echo "OK: binary is within size target"
-          fi
+          spec: ${{ matrix.spec }}
+          binary: ${{ matrix.binary }}
+          target: ${{ matrix.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: dist/${{ matrix.binary }}
+          path: |
+            dist/${{ matrix.binary }}
+            dist/mcp-audit-${{ matrix.target }}.cdx.json
           if-no-files-found: error
 
   release:
     name: Create GitHub Release
     needs: build
+    # Tag pushes only. workflow_dispatch is a dry-run of `build`.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist/
 
-      - name: Compose release notes from template
-        # Substitutes {{VERSION}} with the pushed git tag (e.g. v0.3.4) so
-        # the body Quick-start example and the "What's new in" header both
-        # point at a real, resolvable ref — not a floating `@v0` / `@v1`
-        # that doesn't exist yet.  Output is a plain markdown file that
-        # softprops passes through verbatim via `body_path:`.
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "latest"
+
+      - name: Generate wheel CycloneDX SBOM
+        # Separate document from the per-binary PYZ SBOMs. Describes a default
+        # `pip install mcp-audit-scanner` (no extras). Pin must match the
+        # composite default; tests/test_ci_binary_smoke.py locks the copy.
         run: |
-          sed "s|{{VERSION}}|${GITHUB_REF_NAME}|g" \
-            .github/release-notes-template.md \
-            > "${RUNNER_TEMP}/release-notes.md"
+          set -euo pipefail
+          uv python install 3.12.14
+          export UV_PYTHON=3.12.14
+          uv build --wheel -o "${RUNNER_TEMP}/wheel"
+          chmod +x scripts/generate_wheel_sbom.sh
+          scripts/generate_wheel_sbom.sh \
+            "${RUNNER_TEMP}/wheel"/*.whl \
+            dist/mcp-audit-scanner-wheel.cdx.json
+
+      - name: Compose release notes from template
+        # Evergreen template + CHANGELOG.md ## [X.Y.Z] for this tag.
+        # Missing section or leftover {{TOKEN}} fails the job (exit 2).
+        # python3 is on the runner; do not inline sed for the changelog.
+        run: |
+          python3 scripts/compose_release_notes.py \
+            --tag "${GITHUB_REF_NAME}" \
+            --output "${RUNNER_TEMP}/release-notes.md"
 
       - name: Create release and upload binaries
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: dist/**/*
           # Prefer the hand-curated template in .github/ over GitHub's
@@ -139,12 +133,21 @@ jobs:
     # not withhold the GitHub Release binaries, and vice versa.  Both still
     # depend on `build` so a broken build never publishes anywhere.
     needs: build
+    # Tag pushes only. workflow_dispatch is a dry-run of `build`.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     # Bound to the `pypi` Environment so PyPI's Trusted Publisher OIDC claim
-    # can scope the issued token to *this specific environment* (defence in
-    # depth against a forked workflow trying to impersonate the release
-    # pipeline).  Create the environment once via Settings → Environments.
+    # can scope the issued token to *this specific environment*. This is
+    # enforced, not just intended: the `pypi` environment has a deployment
+    # branch/tag policy (Settings → Environments → pypi) restricting it to
+    # the `main` branch and `v*.*.*` tags — set 2026-08-23, see
+    # humans/decisions/2026-08-23-signing-key-custody-recommendation.md in
+    # the `marcus` repo. A workflow run on any other ref cannot obtain this
+    # environment's OIDC token, which is what actually stops a forked
+    # workflow from impersonating the release pipeline. No required
+    # reviewers — this job is tag-triggered and fully automated; a human
+    # approval gate here would only stall releases.
     environment:
       name: pypi
       url: https://pypi.org/p/mcp-audit-scanner
@@ -156,15 +159,23 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        # uv is deliberately unpinned. Downstream (CPython 3.12.14, uv.lock,
+        # four-platform PYZ inspect) is pinned and checked; an incompatible
+        # uv fails the build immediately. latest-known was tried 2026-08-22
+        # and resolved uv 0.12.4, which cannot fetch 3.12.14. Do not pin a
+        # uv version — Dependabot does not bump action input strings.
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.12
+        # Pin must match .github/actions/build-binary/ `python-version`
+        # default. This job cannot call the composite (PyInstaller). The
+        # copy is locked by tests/test_ci_binary_smoke.py.
+        run: uv python install 3.12.14
 
       - name: Build sdist + wheel
         # Pure-Python project (hatchling backend), so `uv build` produces a
@@ -174,18 +185,29 @@ jobs:
           uv build
 
       - name: Publish to PyPI
-        # Pinned to the v1.14.0 commit SHA (2026-04-07) for supply-chain
+        # Pinned to the v1.14.2 commit SHA (2026-07-29) for supply-chain
         # hardening — `release/v1` is a floating branch that could be moved
         # to a future malicious commit without our knowledge.  Bump the SHA
         # deliberately when picking up a new upstream release and audit the
         # diff at https://github.com/pypa/gh-action-pypi-publish/compare.
+        #
+        # Bumped from v1.14.0 after the v0.15.0 release run failed publish
+        # with `InvalidDistribution: '2.5' is not a valid metadata version`:
+        # hatchling >=1.32 (picked up unpinned via `build-system.requires =
+        # ["hatchling"]`) now emits Core-Metadata 2.5 by default, and v1.14.0
+        # bundles Twine 6, which rejects it outright. v1.14.2 ships Twine 7,
+        # which accepts 2.5. Diff audited: a setup-python bump, the Twine 7
+        # upgrade itself, and a sigstore/pypi-attestations bump — no other
+        # behavioural changes.
         #
         # `attestations: true` enables PEP 740 provenance attestations —
         # sigstore-signed statements that bind *these specific artefacts*
         # to *this specific workflow run*.  PyPI surfaces them on the
         # project page.  For a security-scanner project this is a
         # non-negotiable best practice.
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        # CI `wheel-check` fetches this SHA's requirements/runtime.txt and
+        # runs that Twine — no copy of the version in ci.yml.
         with:
           attestations: true
 
@@ -196,6 +218,7 @@ jobs:
     # every `@v1` consumer to a release where `pip install mcp-audit-scanner`
     # 404s, and a broken GitHub Release must not advertise missing binaries.
     needs: [build, release, publish-pypi]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     permissions:
@@ -223,7 +246,7 @@ jobs:
             echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.decide.outputs.move == 'true'
 
       - name: Force-move @${{ steps.decide.outputs.major }} to ${{ github.ref_name }}
@@ -254,7 +277,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist/
 

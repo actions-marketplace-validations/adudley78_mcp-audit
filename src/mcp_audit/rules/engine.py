@@ -47,6 +47,11 @@ class MatchField(StrEnum):
     SERVER_NAME = "server_name"
     URL = "url"
     TRANSPORT = "transport"
+    CAPABILITIES = "capabilities"
+    # Path of the config file that defines this server (e.g. .mcp.json).
+    # Allows rules to match on the location of the server definition, which
+    # is used by COMM-033 to detect project-level MCP config files.
+    CONFIG_PATH = "config_path"
 
 
 class CompoundOperator(StrEnum):
@@ -133,6 +138,12 @@ class PolicyRule(BaseModel):
     # CVE identifiers for this rule (e.g., ["CVE-2026-33032"]).
     # Set in rule YAML; propagated to emitted Finding objects.
     cve: list[str] = Field(default_factory=list)
+    # Attribution metadata — purely informational, not used in matching.
+    # ``author`` identifies the contributor (GitHub handle or full name).
+    # ``bounty_accepted`` is an ISO-8601 date string (e.g. "2026-05-17")
+    # indicating when the rule was accepted into the bounty program.
+    author: str | None = None
+    bounty_accepted: str | None = None
 
 
 # ── Rule engine ────────────────────────────────────────────────────────────────
@@ -254,6 +265,12 @@ def _extract_field(field: MatchField, server: ServerConfig) -> str | None:
         return server.url
     if field == MatchField.TRANSPORT:
         return str(server.transport) if server.transport else None
+    if field == MatchField.CAPABILITIES:
+        if server.capabilities is None:
+            return None
+        return " ".join(server.capabilities.keys())
+    if field == MatchField.CONFIG_PATH:
+        return str(server.config_path)
     return None  # pragma: no cover
 
 

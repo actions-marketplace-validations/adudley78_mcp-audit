@@ -48,8 +48,8 @@ MCP-specific). See the reference tables at the bottom of this document.
 
 | Finding ID | Severity | OWASP Agentic Top 10 | OWASP MCP Top 10 | Rationale |
 |------------|----------|----------------------|------------------|-----------|
-| CRED-001   | HIGH     | ASI06 | MCP01 | API key or secret in environment variable. Key is stored in plaintext and accessible to any process reading the config file. CWE-798. CVSS: 7.5 |
-| CRED-002   | HIGH     | ASI06 | MCP01 | API key or secret in command arguments. Command lines are visible in process listings (`ps aux`) — wider exposure than env vars. CWE-798. CVSS: 7.5 |
+| CRED-001   | HIGH     | ASI06 | MCP01 | API key or secret in environment variable. Key is stored in plaintext and accessible to any process reading the config file. Credential types detected: AWS access/secret keys, GitHub tokens (classic `ghp_/gho_/ghu_/ghs_/ghr_` and fine-grained `github_pat_`), OpenAI keys (`sk-`), Anthropic keys (`sk-ant-`), Stripe keys, Slack tokens, GCP service-account JSON keys (`"private_key":"-----BEGIN`), Azure SAS tokens (`sv=…&sig=`), DigitalOcean tokens (`dop_v1_`), Vercel tokens (`vercel_`), PEM private key blocks (RSA/EC/DSA/OpenSSH), HashiCorp Vault service tokens (`hvs.`) and batch tokens (`hvb.`), generic secrets, and database URLs with inline credentials. CWE-798. CVSS: 7.5 |
+| CRED-002   | HIGH     | ASI06 | MCP01 | API key or secret in command arguments. Command lines are visible in process listings (`ps aux`) — wider exposure than env vars. Same credential patterns as CRED-001. CWE-798. CVSS: 7.5 |
 
 ### Transport analyzer (`analyzers/transport.py`)
 
@@ -67,6 +67,7 @@ MCP-specific). See the reference tables at the bottom of this document.
 | SC-001     | CRITICAL | ASI02, ASI10 | MCP04 | Levenshtein distance 1 from a known-good package. Single-character substitutions are almost exclusively malicious per Vu et al. (NDSS 2021). CVSS: 9.1 |
 | SC-002     | HIGH     | ASI10 | MCP04 | Levenshtein distance 2. Still very likely malicious; two-character substitutions are a common squatting technique. CVSS: 7.5 |
 | SC-003     | MEDIUM   | ASI10 | MCP04 | Levenshtein distance 3. Possible innocent mismatch; warrants review. CVSS: 4.3 |
+| SC-004     | HIGH     | ASI10 | MCP04 | Exact registry match with `known_vulnerabilities` entries. Package is a known-legitimate server with a public CVE advisory. Operator must verify installed version is in the affected range. No network required (offline bundled registry). CWE-1104. |
 
 ### Rug-pull analyzer (`analyzers/rug_pull.py`)
 
@@ -90,7 +91,7 @@ capability combination, not any individual server.
 | TOXIC-004  | HIGH     | ASI04 | MCP10 | File read + shell execution. Malicious content read from a file could be executed. |
 | TOXIC-005  | HIGH     | ASI03 | MCP05, MCP10 | Database + network. Database contents could be exfiltrated. |
 | TOXIC-006  | CRITICAL | ASI04 | MCP05, MCP10 | Shell execution + network. Arbitrary command execution with exfiltration capability. |
-| TOXIC-007  | MEDIUM   | — | — | Git access + network. Source code or commit history could be exfiltrated. |
+| TOXIC-007  | MEDIUM   | — | MCP10 | Git access + network. Source code or commit history could be exfiltrated via outbound requests. |
 
 ### Attestation (`attestation/`)
 
@@ -98,8 +99,8 @@ capability combination, not any individual server.
 
 | Finding ID  | Severity | OWASP MCP Top 10 | Rationale |
 |-------------|----------|------------------|-----------|
-| ATTEST-001  | CRITICAL | MCP04 | Hash mismatch — downloaded tarball does not match pinned SHA-256. Strong indicator of supply chain tampering. |
-| ATTEST-002  | INFO     | — | Package could not be verified (version unextractable or no hash pin). Informational; surfaces candidates for manual pinning. |
+| ATT-{hash}  | CRITICAL | MCP04 | Hash mismatch — downloaded tarball does not match pinned SHA-256. Strong indicator of supply chain tampering. Dynamic ID: `ATT-{8-char hex}` derived from package:version:kind. |
+| ATT-{hash}  | INFO     | — | Package could not be verified (version unextractable or no hash pin). Informational; surfaces candidates for manual pinning. |
 
 **Layer 2 — Sigstore provenance verification (`--verify-signatures`)**
 
@@ -163,10 +164,113 @@ the two exploitation pre-conditions that malware relied on.
 | CFHYG-002   | HIGH     | ASI06, ASI10 | MCP01, MCP09 | Config file resides in a world-writable ancestor directory. Any process can atomically replace the file — a filesystem-level rug-pull. `/tmp` is the canonical case. Bitwarden incident (2026-04-22) exploited this pre-condition to inject malicious server definitions. CWE-732. CVSS: 7.5 |
 | CFHYG-003   | HIGH     | ASI06 | MCP01 | Config file stores a plaintext secret inline. The file itself becomes a high-value harvesting target. Complements CRED-001/002 with a file-level signal and explicit malware-targeting context. CWE-312. CVSS: 7.5 |
 | CFHYG-004   | INFO     | — | MCP01 | Config uses env-var references for all credentials (e.g., `${VAR}`, `$VAR`, `%(VAR)s`). Positive signal — reinforces correct practice. No security impact. |
+| CFHYG-005   | MEDIUM   | ASI06 | MCP01, MCP07 | Claude Code hooks section detected in `.claude.json`. Hooks execute as shell commands — a write-access threat actor can inject arbitrary commands. CVE-2025-59536. CWE-78. CVSS: 6.5 |
+| CFHYG-006   | MEDIUM   | ASI06 | MCP01, MCP08 | `ANTHROPIC_BASE_URL` overrides the Anthropic API endpoint. All API traffic (including the API key) is routed to the configured domain. CVE-2026-21852. CWE-441. CVSS: 7.5 |
 
 **Windows note:** CFHYG-001 and CFHYG-002 are skipped on Windows because POSIX
 `st_mode` bits do not map to Windows ACL semantics. Windows ACL checking
 (`pywin32` / `icacls`) is planned but not yet implemented.
+
+---
+
+### Auth analyzer (`analyzers/auth.py`)
+
+The auth analyzer checks remote MCP server configurations for the presence of
+authentication material (AUTH-001) and checks OAuth-configured servers for
+audience/resource binding per RFC 8707 (AUTH-002).
+
+**Research basis:**
+- **arXiv 2605.22333** — Measurement study that scanned 7,973 live remote MCP
+  servers and found 40.55% require no authentication. Also tested 119
+  OAuth-enabled servers and found every one had at least one flaw (325 total;
+  dynamic-client-registration flaws in 96.6%).
+- **Censys** — Internet-scanning report counting 12,520 internet-exposed MCP
+  services, the majority unauthenticated.
+- **RFC 8707** — Resource Indicators for OAuth 2.0. Absence of a concrete
+  audience/resource binding creates token cross-resource replay risk.
+
+| Finding ID | Severity              | OWASP Agentic Top 10 | OWASP MCP Top 10 | Rationale |
+|------------|----------------------|----------------------|------------------|-----------|
+| AUTH-001   | HIGH (public host)   | ASI05 | MCP06 | Remote server with no auth material. Public-routable host: anyone on the internet can call every tool. 40.55% of measured live remote MCP servers unauthenticated (arXiv 2605.22333). CWE-306. CVSS: 8.2 |
+| AUTH-001   | MEDIUM (private host) | ASI05 | MCP06 | Same check for RFC 1918 / `*.local` hosts — reachable within the network segment. CWE-306. CVSS: 5.3 |
+| AUTH-002   | MEDIUM               | ASI05 | MCP06 | OAuth configured but audience/resource binding absent or wildcard. RFC 8707 violation; token cross-resource replay risk. CWE-346. CVSS: 5.3 |
+
+**Coverage limits (AUTH-002):**
+OAuth config shapes vary widely across MCP clients. The analyzer covers:
+`oauth`/`oauth2` dict blocks, `auth.type: oauth2` nested blocks, and
+flat top-level `client_id` + `authorization_endpoint` co-occurrence. Formats
+not matching these patterns will not fire (prefer false negatives over noise).
+See GAPS.md — *AUTH-002 coverage limits*.
+
+**Suppression rules for AUTH-001** (any one suppresses):
+- `Authorization`, `x-api-key`, `api-key`, `x-auth-token`, `x-access-token`,
+  `api_key`, or `token` header in `server.headers` (case-insensitive).
+- `token`, `apiKey`, `api_key`, `auth`, `bearer`, `authorization`,
+  `access_token`, or `secret` field at the top level of the raw server entry.
+- Any OAuth-related field (`oauth`, `oauth2`, `authorization_endpoint`,
+  `client_id`, `token_endpoint`).
+- URL userinfo component (`https://user:pass@host` or `https://token@host`).
+- `stdio` transport — local trust boundary, never fires.
+
+### Trust analyzer (`cli/scan.py::_apply_project_scan`, finding ID `TRUST-001`)
+
+TRUST-001 fires once per MCP server found in a **project-level** config file
+(`.mcp.json`, `.cursor/mcp.json`, `.claude/settings.json`,
+`.claude/settings.local.json`, `.cursor/settings.json`, `.vscode/mcp.json`)
+discovered by `mcp-audit scan --project <dir>`.  The finding fires on
+**origin** (the file's location in the repo), not on the server's content.
+Content-based analysis (credentials, poisoning, transport, auth) runs
+separately via the full analyzer pipeline.
+
+| Finding ID | Severity | OWASP Agentic Top 10 | OWASP MCP Top 10 | Rationale |
+|------------|----------|----------------------|------------------|-----------|
+| TRUST-001  | HIGH     | ASI07 | MCP09 | MCP server defined in project-level config. Auto-spawns with developer's full OS privileges on "Trust this folder". Supply-chain attacker or malicious contributor can silently backdoor all developers who trust the repo. Adversa TrustFall (May 2026); CVE-2026-30615 config-tamper channel. CWE-829. CVSS: 7.8 |
+
+**Supported project-level config paths** (discovered by `discover_project_configs()`):
+
+| Path | Client | Root key |
+|------|--------|----------|
+| `.mcp.json` | Claude Code | `mcpServers` |
+| `.claude/settings.json` | Claude Code | `mcpServers` |
+| `.claude/settings.local.json` | Claude Code | `mcpServers` |
+| `.cursor/mcp.json` | Cursor | `mcpServers` |
+| `.cursor/settings.json` | Cursor | `mcpServers` |
+| `.vscode/mcp.json` | VS Code / GitHub Copilot | `servers` |
+
+Windsurf has no project-level MCP config (global only). Zed uses a different
+schema (`context_servers`). See GAPS.md — *Project scan coverage limits*.
+
+---
+
+### Collision analyzer (`analyzers/collision.py`, finding ID `COLLIDE-001`)
+
+`COLLIDE-001` fires when live `tools/list` enumeration (via `--connect`)
+reveals that two or more **distinct** MCP servers advertise the same tool name.
+The finding does not fire in static-only scans — MCP config files do not
+declare tool names.
+
+| Finding ID   | Severity | OWASP MCP Top 10 | Rationale |
+|--------------|----------|------------------|-----------|
+| COLLIDE-001  | MEDIUM   | MCP01 + MCP09 | Two or more distinct servers expose the same tool name. Agent tie-break is undocumented/order-dependent; attacker can register a colliding name to intercept calls. NSA CSI item 5. CWE-694. |
+| COLLIDE-001  | HIGH     | MCP01 + MCP09 | Same collision, AND one claimant is registry-verified while at least one is not. Unknown server shadowing a trusted tool name is the strongest indicator of a namespace-shadowing attack. |
+
+**Severity escalation logic:**
+
+1. Look up every colliding server against `known-servers.json` via
+   `_is_registry_known()` (checks command, args, and server name).
+2. If at least one claimant is registry-known **and** at least one is not →
+   HIGH.  The disparity suggests an attacker registered a look-alike or
+   injected an extra server to shadow the trusted one.
+3. If all claimants are registry-known, or all are unknown → MEDIUM.
+   Two known-legitimate servers sharing a tool name is unusual but may be
+   intentional (e.g. two versions of the same server configured in parallel).
+
+**Scope and limitations:**
+
+- Requires `--connect` (live enumeration). No static signal exists.
+- Comparison is case-sensitive: `read_file` and `Read_File` are distinct names.
+- No Levenshtein / near-miss detection in v1.
+- Servers that fail to connect are excluded from comparison.
 
 ---
 
@@ -252,3 +356,27 @@ Note: this framework is in beta as of April 2026; category rankings and
 descriptions may shift. mcp-audit follows the project page as authoritative.
 See `docs/owasp-mcp-top-10.md` for how mcp-audit exposes this mapping in
 terminal output, JSON, and SARIF.
+
+A machine-readable version of the complete finding-ID → OWASP MCP Top 10 mapping
+is published at [`docs/owasp-mapping.json`](owasp-mapping.json). Every finding ID
+(static and dynamic-pattern) is documented there. Use
+`python scripts/validate_owasp_mapping.py` to verify completeness; CI runs this
+check automatically on the ubuntu/py3.12 leg.
+
+## Shadow MCP Risk Levels (`mcp-audit shadow`)
+
+The `mcp-audit shadow` command uses the same severity rubric as the scan
+pipeline but expresses it through a `RiskLevel` enum that adds an `UNKNOWN`
+state for servers whose capability data is unavailable.
+
+| RiskLevel | Maps to | When assigned |
+|-----------|---------|---------------|
+| CRITICAL  | Severity.CRITICAL | Single server holds both SHELL_EXEC + NETWORK_OUT, or SECRETS + NETWORK_OUT |
+| HIGH      | Severity.HIGH | Single server holds DATABASE + NETWORK_OUT, FILE_READ + NETWORK_OUT, FILE_READ + EMAIL, or FILE_READ + SHELL_EXEC |
+| MEDIUM    | Severity.MEDIUM | Single server holds GIT + NETWORK_OUT |
+| LOW       | Severity.LOW | Capabilities detected but no toxic pair fires |
+| INFO      | Severity.INFO | Registry-verified server with an explicitly empty capability set |
+| UNKNOWN   | (no Severity analogue) | Registry entry exists with `capabilities: null`, or no capability data at all |
+
+All shadow server records carry `owasp_mcp_top_10: ["MCP09"]`.
+See `docs/shadow-mcp.md` for the full `shadow` command documentation.

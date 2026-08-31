@@ -1661,6 +1661,8 @@ class TestRunStaticPipeline:
             skip_rug_pull: bool,  # noqa: ARG001
             state_path: Path | None,  # noqa: ARG001
             extra_rules_dirs: list[Path] | None,  # noqa: ARG001
+            scoring_weights=None,  # noqa: ARG001
+            scoring_weights_source: str = "default",  # noqa: ARG001
         ) -> ScanResult:
             sentinel.servers = all_servers
             # Stash the analyzer list on the sentinel so the test can assert.
@@ -1678,9 +1680,9 @@ class TestRunStaticPipeline:
         assert any(e == "servers=['delegate-srv']" for e in sentinel.errors), (
             f"run_scan did not delegate with parsed servers: {sentinel.errors}"
         )
-        # Default analyzer list = 5 (poisoning, credentials, transport, supply,
-        # config_hygiene).
-        assert any(e == "analyzers=5" for e in sentinel.errors)
+        # Default analyzer list = 6 (poisoning, credentials, transport, supply,
+        # config_hygiene, auth).
+        assert any(e == "analyzers=6" for e in sentinel.errors)
 
     async def test_run_scan_async_delegates_to_static_pipeline(
         self, tmp_path: Path
@@ -1707,6 +1709,8 @@ class TestRunStaticPipeline:
             skip_rug_pull: bool,  # noqa: ARG001
             state_path: Path | None,  # noqa: ARG001
             extra_rules_dirs: list[Path] | None,  # noqa: ARG001
+            scoring_weights=None,  # noqa: ARG001
+            scoring_weights_source: str = "default",  # noqa: ARG001
         ) -> ScanResult:
             sentinel.errors.append(f"servers={[s.name for s in all_servers]}")
             return sentinel
@@ -1719,3 +1723,187 @@ class TestRunStaticPipeline:
 
         assert result is sentinel
         assert any(e == "servers=['async-srv']" for e in sentinel.errors)
+
+
+# ── TestCustomScoringWeightsPipeline ──────────────────────────────────────────
+
+
+class TestCustomScoringWeightsPipeline:
+    """Scoring weights are threaded from run_scan into _run_static_pipeline."""
+
+    def test_custom_weights_wired_through_pipeline(self, tmp_path: Path) -> None:
+        """Pipeline with custom weights produces the correct weights_source."""
+        from mcp_audit.governance.models import ScoringDeductions, ScoringWeights
+        from mcp_audit.scanner import _run_static_pipeline
+
+        server = _make_server("weights-test")
+        result = ScanResult()
+        result.servers = [server]
+        result.servers_found = 1
+
+        weights = ScoringWeights(deductions=ScoringDeductions(CRITICAL=-40))
+
+        returned = _run_static_pipeline(
+            result=result,
+            all_servers=[server],
+            configs=[],
+            analyzers=[],
+            skip_rug_pull=True,
+            state_path=tmp_path / "state.json",
+            extra_rules_dirs=None,
+            scoring_weights=weights,
+            scoring_weights_source="policy:/tmp/test-policy.yml",
+        )
+
+        assert returned.score is not None
+        assert returned.score.weights_source == "policy:/tmp/test-policy.yml"
+
+    def test_custom_critical_weight_lowers_score(self, tmp_path: Path) -> None:
+        """A heavier CRITICAL deduction must produce a strictly lower numeric score."""
+        from mcp_audit.analyzers.base import BaseAnalyzer
+        from mcp_audit.governance.models import ScoringDeductions, ScoringWeights
+        from mcp_audit.scanner import _run_static_pipeline
+
+        class _CriticalFindingAnalyzer(BaseAnalyzer):
+            name = "test-crit"
+            description = "Injects one CRITICAL finding for testing."
+
+            def analyze(self, server: ServerConfig) -> list[Finding]:
+                return [
+                    Finding(
+                        id="CRIT-TEST",
+                        severity=Severity.CRITICAL,
+                        analyzer=self.name,
+                        client=server.client,
+                        server=server.name,
+                        title="Critical test",
+                        description="desc",
+                        evidence="ev",
+                        remediation="fix",
+                    )
+                ]
+
+        server = _make_server("crit-server")
+
+        def _run(weights=None, source="default") -> ScanResult:
+            r = ScanResult()
+            r.servers = [server]
+            r.servers_found = 1
+            return _run_static_pipeline(
+                result=r,
+                all_servers=[server],
+                configs=[],
+                analyzers=[_CriticalFindingAnalyzer()],
+                skip_rug_pull=True,
+                state_path=tmp_path / "state.json",
+                extra_rules_dirs=None,
+                scoring_weights=weights,
+                scoring_weights_source=source,
+            )
+
+        default_result = _run()
+        custom_result = _run(
+            weights=ScoringWeights(deductions=ScoringDeductions(CRITICAL=-40)),
+            source="policy:/tmp/p.yml",
+        )
+
+        assert default_result.score is not None
+        assert custom_result.score is not None
+        assert custom_result.score.numeric_score < default_result.score.numeric_score
+        assert custom_result.score.weights_source == "policy:/tmp/p.yml"
+
+    def test_default_weights_source_is_default(self, tmp_path: Path) -> None:
+        """Without custom weights, weights_source must be 'default'."""
+        from mcp_audit.scanner import _run_static_pipeline
+
+        server = _make_server("default-weights")
+        result = ScanResult()
+        result.servers = [server]
+
+        returned = _run_static_pipeline(
+            result=result,
+            all_servers=[server],
+            configs=[],
+            analyzers=[],
+            skip_rug_pull=True,
+            state_path=tmp_path / "state.json",
+            extra_rules_dirs=None,
+        )
+
+        assert returned.score is not None
+        assert returned.score.weights_source == "default"
+
+
+# ── COLLIDE-001 wiring in run_scan_async connect block ────────────────────────
+
+
+class TestCollisionWiringInConnectBlock:
+    """Verify detect_tool_collisions() is called during --connect runs."""
+
+    async def test_collision_findings_injected_before_pipeline(
+        self, tmp_path: Path
+    ) -> None:
+        """When --connect enumerates servers with colliding tools, COLLIDE-001
+        findings are present in the final ScanResult."""
+        from mcp_audit.models import ServerEnumeration, ToolInfo
+
+        config = tmp_path / "mcp.json"
+        config.write_text(
+            '{"mcpServers":'
+            ' {"srv-a": {"command": "cmd-a"}, "srv-b": {"command": "cmd-b"}}}'
+        )
+
+        enum_a = ServerEnumeration(tools=[ToolInfo(name="shared_tool")])
+        enum_b = ServerEnumeration(tools=[ToolInfo(name="shared_tool")])
+        enumerations = [enum_a, enum_b]
+        call_counter = {"n": 0}
+
+        async def _fake_connect(server, auth_token=None):  # noqa: ARG001
+            idx = call_counter["n"]
+            call_counter["n"] += 1
+            return enumerations[idx] if idx < len(enumerations) else ServerEnumeration()
+
+        with (
+            _patch_no_known_clients(),
+            patch(
+                "mcp_audit.mcp_client.connect_and_enumerate",
+                side_effect=_fake_connect,
+            ),
+        ):
+            result = await run_scan_async(
+                extra_paths=[config],
+                connect=True,
+                skip_rug_pull=True,
+            )
+
+        collide_findings = [f for f in result.findings if f.id == "COLLIDE-001"]
+        assert len(collide_findings) >= 1
+        assert collide_findings[0].severity == Severity.MEDIUM
+
+    async def test_no_collision_when_connect_errors(self, tmp_path: Path) -> None:
+        """All connect errors → no COLLIDE-001 findings."""
+        from mcp_audit.models import ServerEnumeration
+
+        config = tmp_path / "mcp.json"
+        config.write_text(
+            '{"mcpServers":'
+            ' {"srv-a": {"command": "cmd-a"}, "srv-b": {"command": "cmd-b"}}}'
+        )
+
+        async def _fail_connect(server, auth_token=None):  # noqa: ARG001
+            return ServerEnumeration(error="connection refused")
+
+        with (
+            _patch_no_known_clients(),
+            patch(
+                "mcp_audit.mcp_client.connect_and_enumerate",
+                side_effect=_fail_connect,
+            ),
+        ):
+            result = await run_scan_async(
+                extra_paths=[config],
+                connect=True,
+                skip_rug_pull=True,
+            )
+
+        assert not any(f.id == "COLLIDE-001" for f in result.findings)

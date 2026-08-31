@@ -18,13 +18,13 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run mcp-audit
         # Pin to a published release tag.  Switch to `@v1` once a major v1.x
         # release exists on GitHub Marketplace (the `v1` ref will then track
         # the latest 1.x release automatically).
-        uses: adudley78/mcp-audit@v0.5.0
+        uses: adudley78/mcp-audit@1959b4922fe8b6ef4fea95b8326f574f157088d7 # v0.14.1
         with:
           severity-threshold: high
           upload-sarif: 'true'
@@ -39,10 +39,10 @@ jobs:
   #     contents: read
   #
   #   steps:
-  #     - uses: actions/checkout@v6
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   #
   #     - name: Run mcp-audit with SAST
-  #       uses: adudley78/mcp-audit@v0.5.0
+  #       uses: adudley78/mcp-audit@v0.9.1
   #       with:
   #         run-sast: 'true'
   #         sast-path: 'src/'

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from platformdirs import user_config_dir
 
 from mcp_audit.analyzers.attack_paths import summarize_attack_paths
+from mcp_audit.analyzers.auth import AuthAnalyzer
 from mcp_audit.analyzers.base import BaseAnalyzer
 from mcp_audit.analyzers.config_hygiene import ConfigHygieneAnalyzer
 from mcp_audit.analyzers.credentials import CredentialsAnalyzer
@@ -18,8 +20,18 @@ from mcp_audit.analyzers.toxic_flow import ToxicFlowAnalyzer
 from mcp_audit.analyzers.transport import TransportAnalyzer
 from mcp_audit.config_parser import parse_config
 from mcp_audit.discovery import DiscoveredConfig, discover_configs
-from mcp_audit.models import Finding, RegistryStats, ScanResult, ServerConfig, Severity
+from mcp_audit.models import (
+    Finding,
+    RegistryStats,
+    ScanResult,
+    ServerConfig,
+    ServerEnumeration,
+    Severity,
+)
 from mcp_audit.scoring import calculate_score
+
+if TYPE_CHECKING:
+    from mcp_audit.governance.models import ScoringWeights
 
 _USER_RULES_DIR = Path(user_config_dir("mcp-audit")) / "rules"
 
@@ -109,7 +121,7 @@ def _run_rules_engine(
     """Load and run the policy-as-code rule engine against all servers.
 
     Always loads bundled community rules.  When *extra_rules_dirs* is
-    provided (caller is responsible for Pro-gating), also loads rules from
+    provided (caller-supplied;) also loads rules from
     those directories (user rules take precedence on ID conflicts).
 
     When *analyzers* is supplied and contains a
@@ -173,6 +185,7 @@ def get_default_analyzers() -> list[BaseAnalyzer]:
         TransportAnalyzer(registry=supply_chain.registry),
         supply_chain,
         ConfigHygieneAnalyzer(),
+        AuthAnalyzer(),
     ]
 
 
@@ -184,12 +197,18 @@ def _run_static_pipeline(
     skip_rug_pull: bool = False,
     state_path: Path | None = None,
     extra_rules_dirs: list[Path] | None = None,
+    scoring_weights: ScoringWeights | None = None,
+    scoring_weights_source: str = "default",
 ) -> ScanResult:
     """Run the canonical static analysis pipeline against parsed servers.
 
     Pipeline order (this is the single source of truth for the scanner flow —
     both :func:`run_scan` and :func:`run_scan_async` delegate here):
 
+    0. Config-level checks via
+       :meth:`~mcp_audit.analyzers.base.BaseAnalyzer.analyze_config` —
+       calls every analyzer once per config file, independent of server count.
+       Analyzers that have nothing to check return ``[]`` (the default).
     1. Per-server analyzers (``analyzer.analyze(server)`` for each pair).
     2. :meth:`~mcp_audit.analyzers.rug_pull.RugPullAnalyzer.analyze_all`
        (skipped when ``skip_rug_pull`` is ``True``).
@@ -221,13 +240,33 @@ def _run_static_pipeline(
             registry-stats extraction.
         skip_rug_pull: Skip rug-pull analysis entirely (used by ``pin``/``diff``).
         state_path: Override the rug-pull state file location.
-        extra_rules_dirs: Additional rule directories to load (Pro-gated by caller).
+        extra_rules_dirs: Additional rule directories to load
+            (optional; caller-supplied).
+        scoring_weights: Optional custom scoring weights from a governance policy.
+            When ``None``, the hardcoded defaults in :mod:`mcp_audit.scoring` are used.
+        scoring_weights_source: Audit label written to ``ScanScore.weights_source``.
+            Callers should pass ``"policy:<abs-path>"`` when custom weights are active.
 
     Returns:
         The same :class:`~mcp_audit.models.ScanResult` passed in, now
         populated with findings, ``attack_path_summary``, ``score``, and
         ``registry_stats``.
     """
+    # ── 0. Config-level checks (run once per file for all analyzers) ──────────
+    for config in configs:
+        for analyzer in analyzers:
+            try:
+                config_findings = analyzer.analyze_config(
+                    raw=config.raw,
+                    config_path=config.path,
+                    client=config.client_name,
+                )
+                for finding in config_findings:
+                    finding.finding_path = str(config.path)
+                result.findings.extend(config_findings)
+            except Exception:  # noqa: BLE001, S110
+                pass  # parse errors already captured by _discover_and_parse
+
     # ── 1. Per-server static analysis ─────────────────────────────────────────
     for server in all_servers:
         for analyzer in analyzers:
@@ -282,7 +321,11 @@ def _run_static_pipeline(
         result.errors.append(f"rules_engine error: {e}")
 
     # ── 6. Scoring ────────────────────────────────────────────────────────────
-    result.score = calculate_score(result.findings)
+    result.score = calculate_score(
+        result.findings,
+        weights=scoring_weights,
+        weights_source=scoring_weights_source,
+    )
 
     # ── 7. Registry metadata ──────────────────────────────────────────────────
     result.registry_stats = _extract_registry_stats(analyzers)
@@ -327,6 +370,9 @@ async def run_scan_async(
     skip_rug_pull: bool = False,
     offline: bool = False,
     extra_rules_dirs: list[Path] | None = None,
+    auth_token: str | None = None,
+    scoring_weights: ScoringWeights | None = None,
+    scoring_weights_source: str = "default",
 ) -> ScanResult:
     """Async scan entrypoint with optional live server enumeration.
 
@@ -349,7 +395,13 @@ async def run_scan_async(
         state_path: Override the rug-pull state file location (useful in tests).
         skip_rug_pull: Skip rug-pull analysis entirely.  Used by ``pin``/``diff``.
         offline: When ``True``, forbid all network calls.
-        extra_rules_dirs: Additional rule directories to load (Pro-gated by caller).
+        extra_rules_dirs: Additional rule directories to load
+            (optional; caller-supplied).
+        auth_token: Bearer token forwarded to SSE/HTTP servers as
+            ``Authorization: Bearer <token>``.  Silently ignored for stdio
+            servers.  Never stored or logged.
+        scoring_weights: Optional custom scoring weights from a governance policy.
+        scoring_weights_source: Audit label for ``ScanScore.weights_source``.
 
     Returns:
         :class:`~mcp_audit.models.ScanResult` with all findings.
@@ -377,13 +429,25 @@ async def run_scan_async(
         )
 
         poisoning = PoisoningAnalyzer()
+        # Accumulate successful (server, enumeration) pairs for cross-server
+        # tool-name collision detection (COLLIDE-001) after the per-server loop.
+        connect_pairs: list[tuple[ServerConfig, ServerEnumeration]] = []
 
         for server in all_servers:
-            enumeration = await connect_and_enumerate(server)
+            enumeration = await connect_and_enumerate(server, auth_token=auth_token)
+
+            # Collect captured stderr for --verbose surfacing.
+            if enumeration.server_stderr:
+                result.server_logs.append(
+                    f"[{server.name}] {enumeration.server_stderr}"
+                )
 
             if enumeration.error:
                 result.errors.append(f"[connect] {server.name}: {enumeration.error}")
                 continue
+
+            # Record successful enumeration for collision detection.
+            connect_pairs.append((server, enumeration))
 
             runtime_config = build_runtime_server_config(server, enumeration)
             if runtime_config is None:
@@ -400,6 +464,22 @@ async def run_scan_async(
                     _analyzer_crash_finding("poisoning (runtime)", server, e)
                 )
 
+        # ── Cross-server tool-name collision detection (COLLIDE-001) ──────────
+        # Requires at least two successfully connected servers to compare.
+        if len(connect_pairs) >= 2:
+            from mcp_audit.analyzers.collision import (  # noqa: PLC0415
+                detect_tool_collisions,
+            )
+
+            try:
+                result.findings.extend(
+                    detect_tool_collisions(
+                        connect_pairs, registry=_extract_registry(analyzers)
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                result.errors.append(f"collision error: {e}")
+
     return _run_static_pipeline(
         result=result,
         all_servers=all_servers,
@@ -408,6 +488,8 @@ async def run_scan_async(
         skip_rug_pull=skip_rug_pull,
         state_path=state_path,
         extra_rules_dirs=extra_rules_dirs,
+        scoring_weights=scoring_weights,
+        scoring_weights_source=scoring_weights_source,
     )
 
 
@@ -419,6 +501,9 @@ def run_scan(
     skip_rug_pull: bool = False,
     offline: bool = False,
     extra_rules_dirs: list[Path] | None = None,
+    auth_token: str | None = None,
+    scoring_weights: ScoringWeights | None = None,
+    scoring_weights_source: str = "default",
 ) -> ScanResult:
     """Run a complete scan: discover configs, parse them, analyze, return results.
 
@@ -440,7 +525,13 @@ def run_scan(
         skip_rug_pull: When ``True``, skip rug-pull analysis entirely.  Used by
             the ``pin`` and ``diff`` CLI commands which manage state directly.
         offline: When ``True``, forbid all network calls.
-        extra_rules_dirs: Additional rule directories to load (Pro-gated by caller).
+        extra_rules_dirs: Additional rule directories to load
+            (optional; caller-supplied).
+        auth_token: Bearer token forwarded to SSE/HTTP servers as
+            ``Authorization: Bearer <token>``.  Silently ignored for stdio
+            servers.  Never stored or logged.
+        scoring_weights: Optional custom scoring weights from a governance policy.
+        scoring_weights_source: Audit label for ``ScanScore.weights_source``.
 
     Returns:
         :class:`~mcp_audit.models.ScanResult` with all findings.
@@ -461,6 +552,9 @@ def run_scan(
                 skip_rug_pull=skip_rug_pull,
                 offline=offline,
                 extra_rules_dirs=extra_rules_dirs,
+                auth_token=auth_token,
+                scoring_weights=scoring_weights,
+                scoring_weights_source=scoring_weights_source,
             )
         )
 
@@ -478,4 +572,6 @@ def run_scan(
         skip_rug_pull=skip_rug_pull,
         state_path=state_path,
         extra_rules_dirs=extra_rules_dirs,
+        scoring_weights=scoring_weights,
+        scoring_weights_source=scoring_weights_source,
     )
