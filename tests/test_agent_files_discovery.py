@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
-from mcp_audit.agent_files.discovery import discover_agent_files
+from mcp_audit.agent_files.discovery import (
+    AGENT_INSTRUCTION_PATTERNS,
+    _resolve_relative_pattern,
+    discover_agent_files,
+)
 from mcp_audit.agent_files.models import AgentFileSurface
 
 # ---------------------------------------------------------------------------
@@ -231,6 +236,70 @@ def test_discover_project_finds_copilot_prompts(tmp_path: Path) -> None:
     assert files[0].surface == AgentFileSurface.COPILOT_PROMPT
 
 
+def test_discover_project_finds_skill(tmp_path: Path) -> None:
+    """Project-level .claude/skills/<name>/SKILL.md is discovered as CLAUDE_SKILL."""
+    skill_dir = tmp_path / ".claude" / "skills" / "deploy-helper"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Deploy Helper\n\nDeploys.", encoding="utf-8")
+
+    files = discover_agent_files(project_root=tmp_path, include_user_global=False)
+
+    assert len(files) == 1
+    assert files[0].surface == AgentFileSurface.CLAUDE_SKILL
+    assert files[0].client == "claude-code"
+
+
+def test_discover_project_finds_nested_skill(tmp_path: Path) -> None:
+    """Skill nesting (spec-permitted) is matched at any depth via '**'."""
+    skill_dir = tmp_path / ".claude" / "skills" / "category" / "subcategory" / "deploy"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Nested skill", encoding="utf-8")
+
+    files = discover_agent_files(project_root=tmp_path, include_user_global=False)
+
+    assert len(files) == 1
+    assert files[0].surface == AgentFileSurface.CLAUDE_SKILL
+
+
+def test_discover_user_global_finds_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User-global ~/.claude/skills/**/SKILL.md is discovered."""
+    home = tmp_path
+    skill_dir = home / ".claude" / "skills" / "notes"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Notes skill", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    files = discover_agent_files(include_user_global=True)
+
+    assert len(files) == 1
+    assert files[0].surface == AgentFileSurface.CLAUDE_SKILL
+    assert files[0].scope == "user"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
+def test_discover_project_skills_symlinked_dir_reports_trust_005(
+    tmp_path: Path,
+) -> None:
+    """A symlinked directory inside the skills tree is not traversed, but is audible."""
+    real_dir = tmp_path / "real_skills" / "deploy"
+    real_dir.mkdir(parents=True)
+    (real_dir / "SKILL.md").write_text("# Deploy", encoding="utf-8")
+
+    skills_root = tmp_path / ".claude" / "skills"
+    skills_root.mkdir(parents=True)
+    (skills_root / "deploy").symlink_to(real_dir, target_is_directory=True)
+
+    skip_findings: list = []
+    files = discover_agent_files(
+        project_root=tmp_path, include_user_global=False, skip_findings=skip_findings
+    )
+
+    assert files == []
+    assert any(f.id == "TRUST-005" for f in skip_findings)
+
+
 def test_discover_deduplicates_same_path(tmp_path: Path) -> None:
     """The same resolved path is never returned twice."""
     (tmp_path / "CLAUDE.md").write_text("# Project", encoding="utf-8")
@@ -274,3 +343,172 @@ def test_discover_reads_content_and_frontmatter(tmp_path: Path) -> None:
     assert af.frontmatter == {"applyTo": "**/*.py"}
     assert "# Rule body" in af.body
     assert "---" not in af.body
+
+
+# ---------------------------------------------------------------------------
+# AGENT_INSTRUCTION_PATTERNS / _resolve_relative_pattern (R39)
+#
+# The single importable path-pattern constant that both this module's own
+# discovery functions and any future write-target check are meant to share —
+# see GAPS.md ("FILE_WRITE integrity axis") for why nothing currently builds
+# on it beyond discovery itself.
+# ---------------------------------------------------------------------------
+
+
+def test_agent_instruction_patterns_covers_every_documented_surface() -> None:
+    """Every surface named in the module docstring has at least one pattern."""
+    surfaces = {p.surface for p in AGENT_INSTRUCTION_PATTERNS}
+    assert surfaces == {
+        AgentFileSurface.CLAUDE_COMMAND,
+        AgentFileSurface.CLAUDE_SKILL,
+        AgentFileSurface.CLAUDE_MEMORY,
+        AgentFileSurface.CURSOR_RULE,
+        AgentFileSurface.COPILOT_INSTRUCTION,
+        AgentFileSurface.COPILOT_SCOPED,
+        AgentFileSurface.COPILOT_PROMPT,
+        AgentFileSurface.CLAUDE_AGENT,  # STORY-0094
+        # STORY-0098
+        AgentFileSurface.CLAUDE_RULE,
+        AgentFileSurface.AGENTS_MD,
+        AgentFileSurface.OPENCLAW_WORKSPACE,
+        AgentFileSurface.HEARTBEAT,
+    }
+
+
+def test_agent_instruction_patterns_scopes_are_user_or_project() -> None:
+    assert {p.scope for p in AGENT_INSTRUCTION_PATTERNS} == {"user", "project"}
+
+
+def test_resolve_relative_pattern_single_segment_literal(tmp_path: Path) -> None:
+    """A pattern with no directory component matches a literal filename."""
+    (tmp_path / "CLAUDE.md").write_text("hi", encoding="utf-8")
+    matches = _resolve_relative_pattern(tmp_path, "CLAUDE.md", root=None)
+    assert matches == [tmp_path / "CLAUDE.md"]
+
+
+def test_resolve_relative_pattern_multi_segment_glob(tmp_path: Path) -> None:
+    """A pattern with two directory levels (.github/instructions/*.md-style)."""
+    instr = tmp_path / ".github" / "instructions"
+    instr.mkdir(parents=True)
+    (instr / "a.instructions.md").write_text("a", encoding="utf-8")
+    (instr / "b.instructions.md").write_text("b", encoding="utf-8")
+    matches = _resolve_relative_pattern(
+        tmp_path, ".github/instructions/*.instructions.md", root=None
+    )
+    assert matches == [instr / "a.instructions.md", instr / "b.instructions.md"]
+
+
+def test_resolve_relative_pattern_missing_intermediate_dir_returns_empty(
+    tmp_path: Path,
+) -> None:
+    assert _resolve_relative_pattern(tmp_path, ".claude/commands/*.md", root=None) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
+def test_resolve_relative_pattern_refuses_symlinked_intermediate_dir(
+    tmp_path: Path,
+) -> None:
+    """A symlinked intermediate directory is never followed — TRUST-005 reports it."""
+    real_dir = tmp_path / "real_claude"
+    real_dir.mkdir()
+    (real_dir / "CLAUDE.md").write_text("secret", encoding="utf-8")
+    (tmp_path / ".claude").symlink_to(real_dir, target_is_directory=True)
+
+    skip_findings: list = []
+    assert (
+        _resolve_relative_pattern(
+            tmp_path, ".claude/CLAUDE.md", root=None, skip_findings=skip_findings
+        )
+        == []
+    )
+    assert len(skip_findings) == 1
+    assert skip_findings[0].id == "TRUST-005"
+    assert str(tmp_path / ".claude") in skip_findings[0].evidence
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
+def test_resolve_relative_pattern_includes_symlinked_file_info_shaped(
+    tmp_path: Path,
+) -> None:
+    """A symlinked file matching the final glob segment is included, not dropped.
+
+    root=None (user-global call shape) → TRUST-004, always INFO.
+    """
+    real_file = tmp_path / "real.md"
+    real_file.write_text("real", encoding="utf-8")
+    link = tmp_path / "CLAUDE.md"
+    link.symlink_to(real_file)
+
+    skip_findings: list = []
+    matches = _resolve_relative_pattern(
+        tmp_path, "CLAUDE.md", root=None, skip_findings=skip_findings
+    )
+
+    assert matches == [link]
+    assert len(skip_findings) == 1
+    assert skip_findings[0].id == "TRUST-004"
+    from mcp_audit.models import Severity  # noqa: PLC0415
+
+    assert skip_findings[0].severity == Severity.INFO
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
+def test_resolve_relative_pattern_includes_symlinked_file_boundary_shaped(
+    tmp_path: Path,
+) -> None:
+    """root=<project root> is boundary-shaped → TRUST-002, HIGH outside root."""
+    outside = tmp_path.parent / f"{tmp_path.name}_outside"
+    outside.mkdir(exist_ok=True)
+    real_file = outside / "real.md"
+    real_file.write_text("real", encoding="utf-8")
+    link = tmp_path / "CLAUDE.md"
+    link.symlink_to(real_file)
+
+    skip_findings: list = []
+    matches = _resolve_relative_pattern(
+        tmp_path, "CLAUDE.md", root=tmp_path, skip_findings=skip_findings
+    )
+
+    assert matches == [link]
+    assert len(skip_findings) == 1
+    assert skip_findings[0].id == "TRUST-002"
+    from mcp_audit.models import Severity  # noqa: PLC0415
+
+    assert skip_findings[0].severity == Severity.HIGH
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
+def test_discover_project_symlinked_claude_dir_reads_nothing_through_it(
+    tmp_path: Path,
+) -> None:
+    """STORY-0108: agent-file discovery never reads through a symlinked parent.
+
+    ``.claude -> /elsewhere`` holds commands, rules, agents, skills and
+    memory; none is read as the repository's own, and the refusal is
+    reported (TRUST-005 naming the link), never silent.
+    """
+    outside = tmp_path / "outside"
+    for rel in (
+        "commands/deploy.md",
+        "rules/style.md",
+        "agents/helper.md",
+        "skills/deploy/SKILL.md",
+        "CLAUDE.md",
+        "AGENTS.md",
+    ):
+        target = outside / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# outside the repository", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".claude").symlink_to(outside, target_is_directory=True)
+
+    skip_findings: list = []
+    files = discover_agent_files(
+        project_root=repo, include_user_global=False, skip_findings=skip_findings
+    )
+
+    assert files == []
+    trust_005 = [f for f in skip_findings if f.id == "TRUST-005"]
+    assert trust_005
+    assert all(str(repo / ".claude") in f.evidence for f in trust_005)

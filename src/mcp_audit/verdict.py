@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from mcp_audit.registry.loader import KnownServerRegistry, RegistryEntry
+from mcp_audit.registry.malicious import MaliciousMatch
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -26,10 +27,85 @@ SCHEMA_VERSION = "1.0.0"
 _VERDICT_BASE_URL = "https://mcp-audit.dev/v1/verdicts"
 _BADGE_BASE_URL = "https://img.shields.io/endpoint?url=https://mcp-audit.dev/v1/badge"
 _NVD_BASE_URL = "https://nvd.nist.gov/vuln/detail"
+
+
+def advisory_link(advisory_id: str) -> str:
+    """Public page for an advisory ID: NVD for CVEs, GitHub for GHSA, OSV otherwise."""
+    if advisory_id.startswith("CVE-"):
+        return f"{_NVD_BASE_URL}/{advisory_id}"
+    if advisory_id.startswith("GHSA-"):
+        return f"https://github.com/advisories/{advisory_id}"
+    return f"https://osv.dev/vulnerability/{advisory_id}"
+
+
 _REGISTRY_CONTRIBUTION_URL = "https://mcp-audit.dev/contribute"
 
 # Matches @scope/name (npm scoped packages).
 _SCOPED_RE = re.compile(r"^@([^/]+)/(.+)$")
+
+# What counts as an exact version in `vet pkg@1.2.3` / `vet pkg==1.2.3`.
+_PINNED_VERSION_RE = re.compile(r"^[vV]?(\d[0-9A-Za-z.+_!-]*)$")
+
+
+def split_package_spec(spec: str) -> tuple[str, str | None]:
+    """Split ``name@version`` / ``@scope/name@version`` / ``name==version``.
+
+    Registry lookups use the bare name; the version is reported against the
+    recorded CVE ranges.  Only an exact version (starts with a digit, optional
+    ``v``) counts as a pin.  A dist-tag (``@latest``) or a range (``@^1.2``) is
+    dropped without a pin: it names no single release.
+
+    Args:
+        spec: The package argument as typed.
+
+    Returns:
+        ``(name, version)``; *version* is ``None`` when none was given.
+    """
+    spec = spec.strip()
+    if "==" in spec:
+        name, _, rest = spec.partition("==")
+        match = _PINNED_VERSION_RE.match(rest.strip())
+        return name.strip(), match.group(1) if match else None
+    at = spec.rfind("@")
+    if at <= 0:
+        return spec, None
+    name, rest = spec[:at], spec[at + 1 :]
+    match = _PINNED_VERSION_RE.match(rest)
+    return name, match.group(1) if match else None
+
+
+def with_pinned_version(
+    verdict: dict[str, Any], version: str | None, semver_resumed_at: str | None
+) -> dict[str, Any]:
+    """Record a pinned *version* on *verdict* and judge each CVE against it.
+
+    Adds ``package.version`` and, per ``known_vulnerabilities`` item, a
+    ``status`` of ``affected`` (no recorded fix, or *version* is below it),
+    ``fixed`` or ``undecidable`` (the fix uses a different numbering scheme,
+    calendar versus semantic, and nothing offline orders them: the same rule
+    as SC-004/SC-009).  A verdict without a version is returned unchanged.
+
+    Args:
+        verdict: A verdict document (modified in place and returned).
+        version: The exact version asked about, or ``None``.
+        semver_resumed_at: The registry entry's ``semver_resumed_at``, if any.
+
+    Returns:
+        *verdict*.
+    """
+    if version is None:
+        return verdict
+    from mcp_audit.analyzers.supply_chain import _fix_status  # noqa: PLC0415
+
+    verdict["package"]["version"] = version
+    for item in verdict.get("known_vulnerabilities") or []:
+        if not isinstance(item, dict):
+            continue
+        fixed = item.get("fixed_in")
+        item["status"] = (
+            _fix_status(version, str(fixed), semver_resumed_at) if fixed else "affected"
+        )
+    return verdict
 
 
 # ── Public helpers ─────────────────────────────────────────────────────────────
@@ -123,7 +199,7 @@ def _normalise_vulns(entry: RegistryEntry) -> list[dict[str, Any]]:
                 "description": vuln.get("description"),
                 "fixed_in": vuln.get("fixed_in"),
                 "source": "NVD",
-                "link": f"{_NVD_BASE_URL}/{cve}",
+                "link": advisory_link(cve),
             }
         )
 
@@ -139,11 +215,41 @@ def _normalise_vulns(entry: RegistryEntry) -> list[dict[str, Any]]:
                 "description": None,
                 "fixed_in": None,
                 "source": "NVD",
-                "link": f"{_NVD_BASE_URL}/{cve_id}",
+                "link": advisory_link(cve_id),
             }
         )
 
     return result
+
+
+def malicious_item(match: MaliciousMatch) -> dict[str, Any]:
+    """Shape one OSV ``MAL-*`` match for the verdict's ``malicious`` list.
+
+    Args:
+        match: An :func:`~mcp_audit.registry.malicious.assess` result.
+
+    Returns:
+        ``{id, ecosystem, aliases, summary, versions, ranges, latest_affected,
+        blanket_range_ignored, link, note}``.  ``ranges`` keeps OSV's events
+        (``[{"introduced": "0"}]`` means every version).  ``latest_affected``
+        is ``True`` when OSV marks every release (or every release from some
+        version on), so the latest release ``vet`` answers for is covered.
+    """
+    record = match.record
+    return {
+        "id": record.id,
+        "ecosystem": record.ecosystem,
+        "aliases": list(record.aliases),
+        "summary": record.summary or None,
+        "versions": list(record.versions),
+        "ranges": [
+            [{kind: value} for kind, value in events] for events in record.ranges
+        ],
+        "latest_affected": match.latest_affected,
+        "blanket_range_ignored": match.blanket_range_ignored,
+        "link": record.link,
+        "note": record.note,
+    }
 
 
 # ── Public builder ────────────────────────────────────────────────────────────
@@ -155,11 +261,18 @@ def build_verdict(
     entry: RegistryEntry | None,
     typosquat_of: RegistryEntry | None,
     registry: KnownServerRegistry,
+    *,
+    typosquat_basis: str | None = None,
+    malicious: list[dict[str, Any]] | None = None,
+    other_ecosystem_malicious: list[dict[str, Any]] | None = None,
+    pinned_version: str | None = None,
 ) -> dict[str, Any]:
     """Build a v1 verdict document from registry data.
 
     This is the **only** place that assembles the verdict document shape.
-    All fields conform to ``https://mcp-audit.dev/v1/schema.json``.
+    All fields conform to ``https://mcp-audit.dev/v1/schema.json`` (which
+    allows additional properties; ``typosquat_basis``, ``malicious`` and
+    ``other_ecosystem_malicious`` were added by STORY-0097).
 
     Args:
         name: Package name exactly as supplied by the user.
@@ -171,12 +284,21 @@ def build_verdict(
             ``typosquat_of`` is only meaningful when *entry* is ``None``.
         registry: The loaded :class:`~mcp_audit.registry.loader.KnownServerRegistry`
             instance, used for metadata (``last_updated``, entry count).
+        typosquat_basis: Why *typosquat_of* was chosen: ``"edit-distance"``
+            (SC-001..003 logic) or ``"unscoped-twin"`` (SC-007).  Defaults to
+            ``"edit-distance"`` when *typosquat_of* is set.
+        malicious: :func:`malicious_item` dicts for OSV ``MAL-*`` records on
+            this package in this ecosystem (SC-008 data).
+        other_ecosystem_malicious: The same, for a same-named package in the
+            other registry (``vet mcp-server-git`` answers for the PyPI
+            package; the npm package of that name is ``MAL-2026-5478``).
 
     Returns:
         Verdict ``dict`` ready for JSON serialisation.  Always includes every
         required schema key so callers can treat the document as complete.
     """
     now_iso = datetime.now(tz=UTC).isoformat()
+    basis = None if typosquat_of is None else typosquat_basis or "edit-distance"
 
     if entry is not None:
         registry_block: dict[str, Any] = {
@@ -211,7 +333,7 @@ def build_verdict(
         tags = []
         repo = None
 
-    return {
+    document = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": now_iso,
         "package": {
@@ -223,9 +345,15 @@ def build_verdict(
         "capabilities": capabilities,
         "attestation": attestation_block,
         "typosquat_of": typosquat_of.name if typosquat_of is not None else None,
+        "typosquat_basis": basis,
+        "malicious": list(malicious or []),
+        "other_ecosystem_malicious": list(other_ecosystem_malicious or []),
         "tags": tags,
         "links": {
             "repo": repo,
             "verdict_page": verdict_page_url(ecosystem, name),
         },
     }
+    return with_pinned_version(
+        document, pinned_version, entry.semver_resumed_at if entry else None
+    )

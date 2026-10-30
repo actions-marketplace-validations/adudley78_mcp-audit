@@ -9,6 +9,14 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from mcp_audit.analyzers.credentials import SECRET_PATTERNS
+from mcp_audit.analyzers.supply_chain import (
+    FLAG_REDACTION_MARKER,
+    REDACTION_MARKER,
+    redact_args,
+    redact_env_values,
+    redact_url,
+)
+from mcp_audit.lock.identity import describe_remote_move
 from mcp_audit.models import ServerConfig, Severity
 
 
@@ -44,6 +52,8 @@ class Change(BaseModel):
     owasp_mcp_top_10: list[str] = Field(default_factory=list)
     # Populated for command/args changes on server entities.
     command_diff: dict | None = None
+    # Plain-language note, e.g. a remote host move (STORY-0135).
+    note: str | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -92,19 +102,44 @@ def _classify_env_key(key: str) -> tuple[bool, str]:
     return False, ""
 
 
-def _extract_external_urls(server: ServerConfig) -> list[str]:
-    """Extract non-localhost HTTP/HTTPS URLs from a server's url and args."""
+def _hostname(url: str) -> str | None:
+    """``urlparse(url).hostname``, or ``None`` when the URL doesn't parse.
+
+    ``urlparse`` raises ``ValueError`` on some malformed authorities (an
+    unbalanced ``[``, a non-numeric port); a diff never fails over one URL.
+    """
+    try:
+        return urlparse(url).hostname
+    except ValueError:
+        return None
+
+
+def _extract_external_urls(server: ServerConfig, redact: bool = True) -> list[str]:
+    """Extract non-localhost HTTP/HTTPS URLs from a server's url and args.
+
+    With *redact* the URLs are read in redacted form (what a scan file holds);
+    pass ``False`` to compare two unredacted inputs, where a rotated query
+    token is a change.  Output that prints a URL redacts it itself.
+    """
     urls: list[str] = []
     candidates: list[str] = []
 
     if server.url:
         candidates.append(server.url)
     candidates.extend(server.args)
+    # Redacted first, so a directory and its own scan file give the same set
+    # (and no URL printed from here carries a credential).
+    if redact:
+        candidates = redact_args([str(c) for c in candidates])
 
     for candidate in candidates:
         for match in _URL_RE.findall(candidate):
-            parsed = urlparse(match)
-            host = (parsed.hostname or "").strip("[]")
+            try:
+                host = (urlparse(match).hostname or "").strip("[]")
+            except ValueError:
+                # Unparsable authority: report it rather than drop it.
+                urls.append(match)
+                continue
             if host and host not in (  # nosec B104 — detection pattern, not a bind address
                 "localhost",
                 "127.0.0.1",
@@ -115,11 +150,69 @@ def _extract_external_urls(server: ServerConfig) -> list[str]:
     return urls
 
 
+def _redacted_env(server: ServerConfig) -> dict[str, str]:
+    """``server.env`` as a scan file holds it, so both inputs compare alike."""
+    return redact_env_values(server.env)
+
+
+def _has_marker(server: ServerConfig) -> bool:
+    """True when *server* came from a scan file that redacted a credential."""
+    text = " ".join(
+        [
+            server.command or "",
+            server.url or "",
+            *map(str, server.args),
+            *map(str, server.env.values()),
+        ]
+    )
+    return REDACTION_MARKER in text or FLAG_REDACTION_MARKER in text
+
+
+def mixed_inputs(base: ServerConfig, head: ServerConfig) -> bool:
+    """True when exactly one side holds redaction markers (a scan file vs a directory).
+
+    Only then are the two compared in redacted form (STORY-0118); two
+    unredacted inputs are compared as written so a rotated credential is a
+    change, and two scan files already agree on the markers.
+    """
+    return _has_marker(base) != _has_marker(head)
+
+
+def comparison_view(
+    server: ServerConfig, redacted: bool
+) -> tuple[str, list[str], str, dict]:
+    """Command, args, URL and env as compared: redacted, or as written."""
+    if redacted:
+        return _launch_view(server)
+    return (
+        server.command or "",
+        [str(a) for a in server.args],
+        server.url or "",
+        dict(server.env),
+    )
+
+
+def _launch_view(server: ServerConfig) -> tuple[str, list[str], str, dict]:
+    """Command, args, URL and env in redacted form (STORY-0118).
+
+    A JSON scan file is redacted and a directory is not; comparing the two
+    raw reports every credential as changed.  Redaction is idempotent, so both
+    inputs reduce to the same text.
+    """
+    return (
+        redact_url(server.command or "") or "",
+        redact_args([str(a) for a in server.args]),
+        redact_url(server.url or "") or "",
+        _redacted_env(server),
+    )
+
+
 def _has_hardcoded_cred(server: ServerConfig) -> tuple[bool, str, str]:
     """Return ``(found, secret_name, provider)`` if hardcoded creds appear in args.
 
     Checks env values as well — we want CRITICAL when the actual secret value is
-    present, not just a reference key name.
+    present, not just a reference key name.  ``found`` is only for a definite
+    credential (CRITICAL); see :func:`_credential_change` for the HIGH case.
     """
     args_str = " ".join(server.args)
     env_vals = " ".join(server.env.values())
@@ -127,7 +220,82 @@ def _has_hardcoded_cred(server: ServerConfig) -> tuple[bool, str, str]:
     for secret_name, pattern, provider in SECRET_PATTERNS:
         if pattern.search(text):
             return True, secret_name, provider
+    # A JSON scan file (STORY-0108) carries ``[REDACTED]`` where a launch
+    # argument or URL held a credential, so a diff between two scan files
+    # still sees one being added.
+    # A gateway upstream's env values are redacted the same way (STORY-0111).
+    launch_text = " ".join([server.command or "", args_str, server.url or "", env_vals])
+    if REDACTION_MARKER in launch_text:
+        return True, "Redacted credential", "redacted"
+    # A directory input holds the credential in clear where a scan file holds
+    # the marker (STORY-0118): judge both by what redaction would make of it.
+    command, args, url, env = _launch_view(server)
+    view_text = " ".join([command, *args, url, *map(str, env.values())])
+    if REDACTION_MARKER in view_text:
+        return True, "Redacted credential", "redacted"
     return False, "", ""
+
+
+def _possible_flag_credential(server: ServerConfig) -> bool:
+    """True when a scan file redacted a secret-named flag's value (STORY-0108).
+
+    ``--password VALUE`` whose value matches no SECRET_PATTERNS entry reads
+    ``[REDACTED-FLAG]`` in a scan file: probably a credential, not certainly.
+    """
+    command, args, url, env = _launch_view(server)
+    launch_text = " ".join(
+        [
+            server.command or "",
+            *server.args,
+            server.url or "",
+            *server.env.values(),
+            command,
+            *args,
+            url,
+            *map(str, env.values()),
+        ]
+    )
+    return FLAG_REDACTION_MARKER in launch_text
+
+
+def _credential_change(
+    server: ServerConfig, base: ServerConfig | None = None
+) -> Change | None:
+    """The CREDENTIAL change for *server* (added, or modified from *base*).
+
+    CRITICAL for a hardcoded credential (SECRET_PATTERNS, or ``[REDACTED]``
+    from a scan file); HIGH for a possible one (``[REDACTED-FLAG]``).  With
+    *base*, only a credential *base* does not already have counts.
+    """
+    found, secret_name, provider = _has_hardcoded_cred(server)
+    if found and not (base is not None and _has_hardcoded_cred(base)[0]):
+        return Change(
+            change_type=ChangeType.ADDED,
+            entity_type=EntityType.CREDENTIAL,
+            entity_name=secret_name,
+            parent_server=server.name,
+            before=None,
+            after={"provider": provider, "location": "args/env-value"},
+            severity=Severity.CRITICAL,
+            owasp_mcp_top_10=["MCP01"],
+        )
+    if found:
+        return None
+    if _possible_flag_credential(server) and not (
+        base is not None
+        and (_possible_flag_credential(base) or _has_hardcoded_cred(base)[0])
+    ):
+        return Change(
+            change_type=ChangeType.ADDED,
+            entity_type=EntityType.CREDENTIAL,
+            entity_name="Possible credential flag value",
+            parent_server=server.name,
+            before=None,
+            after={"provider": "redacted-flag", "location": "args"},
+            severity=Severity.HIGH,
+            owasp_mcp_top_10=["MCP01"],
+        )
+    return None
 
 
 def _server_fingerprint(server: ServerConfig) -> tuple[str, str]:
@@ -150,10 +318,10 @@ def _server_summary(server: ServerConfig) -> dict:
     """Compact dict representation of a server for before/after fields."""
     return {
         "name": server.name,
-        "command": server.command,
-        "args": server.args,
+        "command": redact_url(server.command),
+        "args": redact_args(list(server.args)),
         "env_keys": sorted(server.env.keys()),
-        "url": server.url,
+        "url": redact_url(server.url),
         "transport": str(server.transport),
     }
 
@@ -192,20 +360,9 @@ def _changes_for_added_server(
     )
 
     # ── Hardcoded credential in args/env values ───────────────────────────
-    found, secret_name, provider = _has_hardcoded_cred(server)
-    if found:
-        changes.append(
-            Change(
-                change_type=ChangeType.ADDED,
-                entity_type=EntityType.CREDENTIAL,
-                entity_name=secret_name,
-                parent_server=server.name,
-                before=None,
-                after={"provider": provider, "location": "args/env-value"},
-                severity=Severity.CRITICAL,
-                owasp_mcp_top_10=["MCP01"],
-            )
-        )
+    cred = _credential_change(server)
+    if cred is not None:
+        changes.append(cred)
 
     # ── High-value env-var key references ────────────────────────────────
     for key in server.env:
@@ -230,10 +387,10 @@ def _changes_for_added_server(
             Change(
                 change_type=ChangeType.ADDED,
                 entity_type=EntityType.ENDPOINT,
-                entity_name=urlparse(url).hostname or url,
+                entity_name=_hostname(url) or redact_url(url) or "",
                 parent_server=server.name,
                 before=None,
-                after={"url": url},
+                after={"url": redact_url(url)},
                 severity=Severity.HIGH,
                 owasp_mcp_top_10=["MCP07"],
             )
@@ -277,17 +434,20 @@ def _changes_for_modified_server(
 
     # ── Command / args diff ───────────────────────────────────────────────
     cmd_diff: dict | None = None
-    if base.command != head.command or base.args != head.args:
+    mixed = mixed_inputs(base, head)
+    base_view, head_view = comparison_view(base, mixed), comparison_view(head, mixed)
+    if base_view[:2] != head_view[:2]:
         cmd_diff = {
-            "before_command": base.command,
-            "after_command": head.command,
-            "before_args": base.args,
-            "after_args": head.args,
+            "before_command": redact_url(base.command),
+            "after_command": redact_url(head.command),
+            "before_args": redact_args(list(base.args)),
+            "after_args": redact_args(list(head.args)),
         }
         field_changes.append("command/args")
 
-    if base.url != head.url:
+    if base_view[2] != head_view[2]:
         field_changes.append("url")
+    host_note = describe_remote_move(base.url, head.url)
 
     # ── Env-var changes ───────────────────────────────────────────────────
     base_keys = set(base.env.keys())
@@ -296,7 +456,9 @@ def _changes_for_modified_server(
     added_keys = head_keys - base_keys
     removed_keys = base_keys - head_keys
     # Changed values for keys present in both
-    changed_keys = {k for k in base_keys & head_keys if base.env[k] != head.env[k]}
+    changed_keys = {
+        k for k in base_keys & head_keys if base_view[3][k] != head_view[3][k]
+    }
 
     if added_keys or removed_keys or changed_keys:
         field_changes.append("env")
@@ -330,6 +492,7 @@ def _changes_for_modified_server(
             severity=server_severity,
             owasp_mcp_top_10=_owasp_for_modified(field_changes),
             command_diff=cmd_diff,
+            note=host_note,
         )
     )
 
@@ -353,34 +516,22 @@ def _changes_for_modified_server(
         )
 
     # ── Sub-change: hardcoded credential introduced in head args/env ──────
-    base_found, _, _ = _has_hardcoded_cred(base)
-    head_found, secret_name, provider = _has_hardcoded_cred(head)
-    if head_found and not base_found:
-        changes.append(
-            Change(
-                change_type=ChangeType.ADDED,
-                entity_type=EntityType.CREDENTIAL,
-                entity_name=secret_name,
-                parent_server=head.name,
-                before=None,
-                after={"provider": provider, "location": "args/env-value"},
-                severity=Severity.CRITICAL,
-                owasp_mcp_top_10=["MCP01"],
-            )
-        )
+    cred = _credential_change(head, base)
+    if cred is not None:
+        changes.append(cred)
 
     # ── Sub-change: new external endpoint ────────────────────────────────
-    base_endpoints = set(_extract_external_urls(base))
-    head_endpoints = set(_extract_external_urls(head))
+    base_endpoints = set(_extract_external_urls(base, mixed))
+    head_endpoints = set(_extract_external_urls(head, mixed))
     for url in head_endpoints - base_endpoints:
         changes.append(
             Change(
                 change_type=ChangeType.ADDED,
                 entity_type=EntityType.ENDPOINT,
-                entity_name=urlparse(url).hostname or url,
+                entity_name=_hostname(url) or redact_url(url) or "",
                 parent_server=head.name,
                 before=None,
-                after={"url": url},
+                after={"url": redact_url(url)},
                 severity=Severity.HIGH,
                 owasp_mcp_top_10=["MCP07"],
             )
@@ -409,12 +560,16 @@ def _new_toxic_pair_changes(
     base_servers: list[ServerConfig],
     head_servers: list[ServerConfig],
 ) -> list[Change]:
-    """Detect new toxic-flow pairs introduced by *new_server*.
+    """Detect new toxic-flow / integrity pairs introduced by *new_server*.
 
     A pair is "new" if the partner server was already present in *base_servers*
-    (so the pair couldn't have existed before *new_server* was added).
+    (so the pair couldn't have existed before *new_server* was added). Checks
+    both exfiltration-shaped (TOXIC-*) and integrity-shaped (INTEG-*) pairs.
     """
-    from mcp_audit.analyzers.toxic_flow import TOXIC_PAIRS, tag_server  # noqa: PLC0415
+    from mcp_audit.analyzers.toxic_flow import (  # noqa: PLC0415
+        TOXIC_AND_INTEGRITY_PAIRS,
+        tag_server,
+    )
 
     new_caps = tag_server(new_server)
     if not new_caps:
@@ -432,7 +587,7 @@ def _new_toxic_pair_changes(
             continue
 
         existing_caps = tag_server(existing)
-        for pair in TOXIC_PAIRS:
+        for pair in TOXIC_AND_INTEGRITY_PAIRS:
             if (pair.source in new_caps and pair.sink in existing_caps) or (
                 pair.source in existing_caps and pair.sink in new_caps
             ):

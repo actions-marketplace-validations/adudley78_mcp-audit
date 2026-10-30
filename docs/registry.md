@@ -88,15 +88,17 @@ Each entry follows this schema:
 | `last_verified` | ISO date | Date the entry was last reviewed |
 | `known_versions` | list | Pinned versions (empty = all versions accepted) |
 | `tags` | list | Descriptive labels, e.g. `official`, `database`, `remote` |
+| `semver_resumed_at` | string \| null | Optional (STORY-0105). The first semantic version a package released after it used calendar versions, e.g. `"1.0.0"` for `@modelcontextprotocol/server-filesystem` (0.6.2, then 2025.1.14 … 2026.8.31, then 1.0.0 on 2026-10-11). SC-004 uses it to order a pin against a fix recorded in the other scheme. Set it only from the package registry's own publish times. |
 
 ## Current Coverage
 
-64 entries as of April 2026, covering:
-
-- **22 official Anthropic/MCP packages** — all `@modelcontextprotocol/server-*`
-  npm packages, the Python SDK (`mcp`), and related tooling
-- **35 community packages** — high-profile servers from Upstash, Supabase,
-  Cloudflare, Stripe, Browserbase, and community-maintained integrations
+The live figures are `entry_count` and `last_updated` at the top of
+`registry/known-servers.json`; the terminal scan output's "Registry:" line
+prints the same numbers from whichever copy the scan loaded. Entries tagged
+`official` are the Anthropic-maintained reference servers and SDK
+(`@modelcontextprotocol/*`, `mcp`, `mcp-server-fetch`, `mcp-server-git`);
+every other entry is community-maintained. Counts are not repeated here
+because a hand-maintained number drifts from the file.
 
 ## Contributing to the Registry
 
@@ -109,6 +111,36 @@ To add a server, open a pull request against the mcp-audit repository editing
   package name exactly as published. The `repo` field can be `null` if unknown.
 - Increment `entry_count` to match the actual number of entries in the array.
 - Set `last_verified` to the ISO date of your review.
+- **`capabilities` is derived from the package's own source and documentation,
+  never from the submission form's checkboxes.** The registry-submission
+  issue template's checkboxes are a starting point for that review, not the
+  record — a submitter's free-text description or the package's own README
+  frequently says more than their checkboxes do (docpull's checkbox omitted
+  filesystem access that both its own issue text and its README stated
+  plainly; R34 corrected a comment that had been written from the checkbox
+  instead of the merged entry). This matters beyond accuracy: when an entry
+  has an explicit `capabilities` list, `toxic_flow.py`'s registry-first
+  lookup returns it verbatim and skips the keyword-heuristic fallback
+  entirely — so an incomplete list on a `verified` entry is *strictly worse*
+  than no list at all, because it silently switches off the inference that
+  would otherwise have caught the gap. `scripts/audit_registry.py` reports
+  (read-only) any entry whose declared `capabilities` are a strict subset of
+  what the keyword heuristics alone would infer from the package name, and
+  separately reports any capability string that is not a defined
+  `Capability` enum member — see that script's module docstring.
+- **`comms_out`** (STORY-0101) is for a server that posts to a shared service:
+  issue, pull-request or review comments, pushed commits or files, chat
+  messages, social posts, webhooks. Record it from the package's own tool
+  list (a write tool such as `add_issue_comment`, `push_files`,
+  `slack_post_message`, `confluence_add_comment`), not from the platform's
+  name: a read-only GitHub search server is `git`, not `comms_out`. A server
+  that sends email is `email`, not `comms_out`. Keep `network_out` when the
+  server also reaches arbitrary hosts (the reference Slack server does,
+  through link previews Slack fetches, CVE-2025-34072); entries that declared
+  `network_out` before `comms_out` existed keep it so their existing
+  TOXIC-001/003/005/006/007 findings do not disappear. A capability that is
+  switched off by default (Discourse's `--allow_writes`) is left out, as
+  `@toolbox-sdk/server`'s conditional `shell_exec` is (GAPS.md).
 
 ## Auditing the registry
 
@@ -184,6 +216,30 @@ and is not published to mcp-audit.dev.
 Investigate a red run with `python scripts/audit_registry.py`. Clear a false
 `attestation_expected` with `python scripts/audit_registry.py --stamp`. Remove
 a `MISSING` entry; do not stamp it.
+
+## Known-malicious packages (`registry/known-malicious.json`)
+
+A second bundled data file, added by STORY-0097, sits next to the registry. It
+is a mirror of OSV's malicious-package (`MAL-*`) records for npm and PyPI
+packages whose name contains `mcp` or that `known-servers.json` lists, and it
+drives `SC-008` and the `malicious` block of `mcp-audit vet` (see
+[docs/supply-chain.md](supply-chain.md#sc-008-known-malicious-packages)).
+It is a separate file, not new `known-servers.json` fields, because most of the
+packages it names are not (and never will be) registry entries, and the
+registry schema stays unchanged.
+
+Each entry keeps OSV's `id`, `ecosystem`, `name`, `aliases`, `summary`,
+`published`, `versions` and `ranges` as OSV states them, plus an optional
+mcp-audit `note`. `scripts/sync_registry_advisories.py --write` regenerates it;
+do not edit it by hand. It ships in the wheel and in every PyInstaller binary
+(`sys._MEIPASS/registry/known-malicious.json`). `mcp-audit update-registry`
+does not refresh it; it updates with each release. If the file can't be read,
+the scan still runs and says so in its errors (`known-malicious data: …`).
+
+The same release added `SC-007`, which reads only `known-servers.json`: an
+unscoped name derived from a registry entry (`mcp-server-github` from
+`@modelcontextprotocol/server-github`) is reported as a twin. See
+`src/mcp_audit/registry/twins.py`.
 
 ## Implementation Notes
 

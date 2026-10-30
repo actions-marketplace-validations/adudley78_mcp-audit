@@ -83,11 +83,11 @@ changelog section above.
 
 ### Detection coverage
 
-- **Prompt injection / tool poisoning** — 11 patterns, Unicode homoglyph-aware, depth-50 recursion
-- **Credential exposure** — 9 patterns (AWS, GitHub, Stripe, Slack, and more)
+- **Prompt injection / tool poisoning** — 18 patterns, Unicode homoglyph-aware, depth-50 recursion
+- **Credential exposure** — 17 patterns (AWS, GitHub, Stripe, Slack, and more)
 - **Supply chain risk** — npm/PyPI provenance, Sigstore signature verification (`--verify-signatures`), SBOM + OSV.dev CVE scan (`--check-vulns`)
 - **Toxic flow detection** — dangerous server *combinations* (e.g. database + web fetch)
-- **SAST** — 89 rules across Python (46) and TypeScript (43)
+- **SAST** — 91 rules across Python (47) and TypeScript (44)
 - **Transport security** — insecure bindings, wildcard hosts, unverified TLS
 
 ### Integrations
@@ -97,15 +97,17 @@ changelog section above.
 - Baseline diffing for CI regression gates (`mcp-audit baseline`)
 - HTML dashboard — self-contained, no CDN dependencies
 - VS Code / Cursor extension — inline squiggles and command palette
-- Signed OSV advisory feed (`mcp-audit advise`) — experimental until a project signing key ships
+- Signed OSV advisory feed (`mcp-audit advise`) — mcp-audit's own published feed is signed with a
+  real minisign project key (record *format* is still experimental; don't build automation on
+  today's exact field layout)
 
 ### Validated against
 
 - 6 real-world exploit fixtures (Invariant Labs SSH exfiltration, CrowdStrike `add_numbers`, XML injection, cloud credential theft, behavioral override)
-- 22-server false-positive benchmark — 0% poisoning FP rate on legitimate servers
+- 22-server false-positive benchmark — 0% poisoning FP rate on legitimate server config entries (measured recall and precision on tool descriptions: [`docs/poisoning.md`](docs/poisoning.md))
 - CVSS + OWASP MCP Top 10 severity mappings on every finding ID
 
-**3,082 tests · Apache 2.0 · macOS · Linux · Windows**
+**8,354 tests · Apache 2.0 · macOS · Linux · Windows**
 
 ---
 

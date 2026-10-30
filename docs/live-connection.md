@@ -9,8 +9,6 @@ static config file.
 **Requires the optional `mcp` extra:**
 
 ```bash
-pip install 'mcp-audit[mcp]'
-# or
 pip install 'mcp-audit-scanner[mcp]'
 ```
 
@@ -56,6 +54,16 @@ Captured stderr is also available in JSON output under the `server_logs` array:
 ```bash
 mcp-audit scan --connect --format json | jq '.server_logs'
 ```
+
+**When a server fails to start** (STORY-0105), its stderr is still read, and the
+error names the real cause rather than the MCP SDK's wrapper text ("unhandled errors
+in a TaskGroup (1 sub-exception)"): the first underlying exception, followed by the
+last line the server wrote, in the form
+`[connect] stripe: Enumeration failed: <ExceptionType>: <message> (server stderr:
+Error: STRIPE_SECRET_KEY not set)`.  Server text is redacted before it is shown or
+saved: known credential formats, the values of the server's own `env` entries (8
+characters or longer), and the password in any `scheme://user:pass@host`.  At most
+the last 64 KiB of stderr is kept, and the quoted line is cut at 300 characters.
 
 ---
 
@@ -138,7 +146,7 @@ a bearer token through your identity provider and pass it via `--connect-token`.
 
 ## Troubleshooting
 
-**`MCP SDK not installed`** — Run `pip install 'mcp-audit[mcp]'`. The standalone
+**`MCP SDK not installed`** — Run `pip install 'mcp-audit-scanner[mcp]'`. The standalone
 binary does not include the SDK; switch to a pip/uv install with the `[mcp]` extra.
 
 **`MCP SDK is not bundled in the standalone binary`** — Same cause, different

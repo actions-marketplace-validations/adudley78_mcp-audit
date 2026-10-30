@@ -9,15 +9,19 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from mcp_audit.cli import app
+from mcp_audit.lock.writer import regenerate, write_lock
 from mcp_audit.models import (
     AttackPath,
     AttackPathSummary,
     Finding,
     ScanResult,
     ScanScore,
+    ServerConfig,
     Severity,
+    TransportType,
 )
 from mcp_audit.output.check import _remediation_hint, print_check_results
+from tests.conftest import split_runner, unwrapped
 
 runner = CliRunner()
 
@@ -109,10 +113,45 @@ class TestRemediationHint:
         hint = _remediation_hint(f)
         assert "127.0.0.1" in hint.lower() or "localhost" in hint.lower()
 
-    def test_cfhyg001_pin_instruction(self) -> None:
+    def test_cfhyg001_permissions_instruction(self) -> None:
         f = _make_finding(finding_id="CFHYG-001")
         hint = _remediation_hint(f)
-        assert "pin" in hint.lower() or "version" in hint.lower()
+        assert "permission" in hint.lower() or "chmod" in hint.lower()
+
+    def test_hint_nouns_match_finding_ids(self) -> None:
+        """Each CFHYG / LOCK / SC hint must mention the right noun (R61 Part 5)."""
+        expected = {
+            "CFHYG-001": ("permission", "chmod"),
+            "CFHYG-002": ("directory", "writable", "permission"),
+            "CFHYG-003": ("secret", "environment"),
+            "CFHYG-004": ("environment", "credential"),
+            "CFHYG-005": ("hook",),
+            "CFHYG-006": ("anthropic", "url"),
+            "LOCK-001": ("lock",),
+            "LOCK-002": ("lock",),
+            "LOCK-003": ("lock",),
+            "LOCK-004": ("pin", "lock", "version"),
+            "LOCK-005": ("lock",),
+            "SC-001": ("package", "fix"),
+            "SC-002": ("package", "fix"),
+            "SC-003": ("package", "registry"),
+        }
+        for finding_id, nouns in expected.items():
+            hint = _remediation_hint(_make_finding(finding_id=finding_id)).lower()
+            assert any(n in hint for n in nouns), (finding_id, hint)
+
+    def test_comms_pair_hints_name_the_posting_side(self) -> None:
+        """STORY-0101: each TOXIC-008..011 hint names its source and the
+        posting server, not a generic 'review this pair'."""
+        expected = {
+            "TOXIC-008": ("file", "posting"),
+            "TOXIC-009": ("secret", "post"),
+            "TOXIC-010": ("database", "posting"),
+            "TOXIC-011": ("shell", "posting"),
+        }
+        for finding_id, nouns in expected.items():
+            hint = _remediation_hint(_make_finding(finding_id=finding_id)).lower()
+            assert all(n in hint for n in nouns), (finding_id, hint)
 
     def test_unknown_id_falls_back_to_remediation_text(self) -> None:
         f = _make_finding(
@@ -433,6 +472,21 @@ class TestCheckCommand:
         assert r.exit_code == 0
         assert "No MCP config files found" in r.output
 
+    def test_findings_without_mcp_configs_are_not_swallowed(self) -> None:
+        # STORY-0089: a repo's git config can carry HIGH findings on a machine
+        # with no MCP clients at all (a CI runner); check must still report.
+        result = _findings_result(
+            [_make_finding(finding_id="TRUST-006", severity=Severity.HIGH)],
+            numeric=90,
+            grade="A",
+        )
+        result.clients_scanned = 0
+        result.servers_found = 0
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check"])
+        assert r.exit_code == 1
+        assert "No MCP config files found" not in r.output
+
     def test_verbose_flag_uses_full_output(self) -> None:
         findings = [_make_finding(finding_id="CRED-001", severity=Severity.HIGH)]
         result = _findings_result(findings, numeric=55, grade="C")
@@ -550,3 +604,241 @@ class TestCheckCommand:
         with self._patch_run_scan(result):
             r = runner.invoke(app, ["check"])
         assert "more" not in r.output or "mcp-audit scan" in r.output
+
+
+# ── Lock auto-verification (STORY-0070) ───────────────────────────────────────
+
+
+def _server(config_path: Path, name: str = "github") -> ServerConfig:
+    return ServerConfig(
+        name=name,
+        client="cursor",
+        config_path=config_path,
+        transport=TransportType.STDIO,
+        command="npx",
+        args=["-y", "foo@1.0.0"],
+    )
+
+
+def _write_lock_for(lock_dir: Path, servers: list[ServerConfig]) -> None:
+    doc = regenerate(None, servers, lock_dir, offline=True, registry=None)
+    write_lock(lock_dir / "mcp-lock.json", doc)
+
+
+class TestLockAutoVerification:
+    def _patch_run_scan(self, result: ScanResult):
+        return patch("mcp_audit.cli.check.run_scan", return_value=result)
+
+    def test_no_lock_file_no_output_change(self, tmp_path: Path) -> None:
+        config_path = tmp_path / ".mcp.json"
+        server = _server(config_path)
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [server]
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check"])
+        assert "Lock:" not in r.output
+        assert r.exit_code == 0
+
+    def test_clean_lock_prints_verified_line(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        config_path = tmp_path / ".mcp.json"
+        server = _server(config_path)
+        _write_lock_for(tmp_path, [server])
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [server]
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check"])
+        assert "Lock: verified (1 server" in r.output
+        # trees is an always-present reserved-foreign stub section — never
+        # silently claimed as verified (`tools: null` holds nothing).
+        assert "not verified: trees" in r.output
+        assert r.exit_code == 0
+
+    def test_recorded_tool_definitions_are_named_as_not_compared(
+        self, tmp_path: Path
+    ) -> None:
+        """check never starts servers, so it must not read as fully verified."""
+        from mcp_audit.lock import tool_digests
+        from mcp_audit.models import ToolInfo
+
+        (tmp_path / ".git").mkdir()
+        server = _server(tmp_path / ".mcp.json")
+        key = f"{server.client}/{server.name}"
+        doc = regenerate(
+            None,
+            [server],
+            tmp_path,
+            offline=True,
+            registry=None,
+            tool_records={key: tool_digests.server_record([ToolInfo(name="t")])},
+        )
+        write_lock(tmp_path / "mcp-lock.json", doc)
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [server]
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check"])
+        assert "tool definitions not compared" in r.output
+        assert r.exit_code == 0
+
+    def test_drifted_lock_appends_findings_and_affects_grade(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".git").mkdir()
+        config_path = tmp_path / ".mcp.json"
+        server = _server(config_path)
+        _write_lock_for(tmp_path, [server])
+
+        drifted = _server(config_path)
+        drifted.args = ["-y", "foo@9.9.9"]
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [drifted]
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check"])
+        # A LOCK-001/HIGH finding drags a clean A-grade result below the
+        # A/B threshold, so check must fail even though run_scan's own
+        # score object said "A, no findings".
+        assert r.exit_code == 1
+        assert "Lock:" in r.output
+
+    def test_no_lock_flag_skips_verification(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        config_path = tmp_path / ".mcp.json"
+        server = _server(config_path)
+        _write_lock_for(tmp_path, [server])
+
+        drifted = _server(config_path)
+        drifted.args = ["-y", "foo@9.9.9"]
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [drifted]
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check", "--no-lock"])
+        assert "Lock:" not in r.output
+        assert r.exit_code == 0
+
+    def test_json_output_includes_lock_status(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        config_path = tmp_path / ".mcp.json"
+        server = _server(config_path)
+        _write_lock_for(tmp_path, [server])
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [server]
+        with self._patch_run_scan(result):
+            r = runner.invoke(app, ["check", "--json"])
+        parsed = json.loads(r.output)
+        assert parsed["lock_status"]["present"] is True
+        assert parsed["lock_status"]["verified"] is True
+        assert parsed["lock_status"]["checked_servers"] == 1
+
+
+class TestCheckJsonStdoutStaysParseable:
+    """`check --json` stdout is one JSON document with a lock present, and a
+    registered user's failed ping does not follow it (STORY-0103)."""
+
+    _split = split_runner()
+
+    @staticmethod
+    def _result_for(server: ServerConfig) -> ScanResult:
+        result = _findings_result([], numeric=100, grade="A")
+        result.servers = [server]
+        return result
+
+    def test_verified_lock(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        server = _server(tmp_path / ".mcp.json")
+        _write_lock_for(tmp_path, [server])
+        with patch(
+            "mcp_audit.cli.check.run_scan", return_value=self._result_for(server)
+        ):
+            r = self._split.invoke(app, ["check", "--json"])
+        doc = json.loads(r.stdout)
+        assert doc["lock_status"]["present"] is True
+        assert doc["lock_status"]["verified"] is True
+        assert "Lock:" not in r.stdout
+
+    def test_outside_root_and_not_covered(self, tmp_path: Path) -> None:
+        from mcp_audit.models import LockStatus
+
+        server = _server(tmp_path / ".mcp.json")
+        status = LockStatus(
+            present=True,
+            verified=True,
+            checked_servers=1,
+            lock_paths=[str(tmp_path / "mcp-lock.json")],
+            outside_root=["/elsewhere/.mcp.json"],
+            not_covered=["claude-code-agent/browser (/r/.claude/agents/a.md)"],
+        )
+        with (
+            patch(
+                "mcp_audit.cli.check.run_scan", return_value=self._result_for(server)
+            ),
+            patch("mcp_audit.cli.check._lock_auto_verify", return_value=([], status)),
+        ):
+            as_json = self._split.invoke(app, ["check", "--json"])
+            verdict = self._split.invoke(app, ["check"])
+        doc = json.loads(as_json.stdout)
+        assert doc["lock_status"]["outside_root"] == ["/elsewhere/.mcp.json"]
+        assert len(doc["lock_status"]["not_covered"]) == 1
+        assert "WARN" not in as_json.stdout
+        # The one-page verdict still prints both warnings.
+        out = unwrapped(verdict.stdout)
+        assert "outside the lock root" in out
+        assert "not covered by mcp-lock.json" in out
+
+    def test_failed_ping_goes_to_stderr(self, tmp_path: Path) -> None:
+        server = _server(tmp_path / ".mcp.json")
+        with (
+            patch(
+                "mcp_audit.cli.check.run_scan", return_value=self._result_for(server)
+            ),
+            patch(
+                "mcp_audit.registration.manager.load_registration",
+                return_value=object(),
+            ),
+            patch("mcp_audit.registration.client.post_ping", return_value=False),
+        ):
+            r = self._split.invoke(app, ["check", "--json"])
+        json.loads(r.stdout)
+        assert "Registration ping failed" in r.stderr
+
+    def test_nothing_found_still_writes_one_json_document(self) -> None:
+        empty = ScanResult()
+        empty.clients_scanned = 0
+        empty.servers_found = 0
+        with patch("mcp_audit.cli.check.run_scan", return_value=empty):
+            r = self._split.invoke(app, ["check", "--json"])
+        assert r.exit_code == 0
+        assert json.loads(r.stdout)["servers"] == []
+        assert "No MCP config files found" in unwrapped(r.stderr)
+
+    def test_errors_go_to_stderr(self, tmp_path: Path) -> None:
+        r = self._split.invoke(app, ["check", str(tmp_path / "missing.json"), "--json"])
+        assert r.exit_code == 2
+        assert r.stdout == ""
+        assert "File not found" in r.stderr
+
+    def test_report_takes_precedence_over_json(self, tmp_path: Path) -> None:
+        """`--json --report pdf` writes the PDF; stdout stays empty (docs/check.md)."""
+        server = _server(tmp_path / ".mcp.json")
+
+        def _fake_pdf(result, output_file, org, console) -> None:  # noqa: ANN001
+            console.print("PDF report written: x.pdf")
+
+        with (
+            patch(
+                "mcp_audit.cli.check.run_scan", return_value=self._result_for(server)
+            ),
+            patch("mcp_audit.cli.check._write_pdf_report", side_effect=_fake_pdf),
+        ):
+            r = self._split.invoke(app, ["check", "--json", "--report", "pdf"])
+        assert r.stdout == ""
+        assert "PDF report written" in r.stderr
+
+    def test_bad_report_format_error_goes_to_stderr(self, tmp_path: Path) -> None:
+        server = _server(tmp_path / ".mcp.json")
+        with patch(
+            "mcp_audit.cli.check.run_scan", return_value=self._result_for(server)
+        ):
+            r = self._split.invoke(app, ["check", "--json", "--report", "docx"])
+        assert r.exit_code == 2
+        assert r.stdout == ""
+        assert "Unknown report format" in r.stderr

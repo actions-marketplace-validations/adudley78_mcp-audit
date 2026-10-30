@@ -36,6 +36,7 @@ from mcp_audit.diff.render import (
 )
 from mcp_audit.diff.risk import classify_added_server, classify_modified_server
 from mcp_audit.models import ServerConfig, Severity, TransportType
+from tests.conftest import unwrapped
 
 runner = CliRunner()
 
@@ -194,6 +195,22 @@ class TestServerAdded:
         # Toxic pairs are HIGH or CRITICAL
         high_or_crit = (Severity.HIGH, Severity.CRITICAL)
         assert all(c.severity in high_or_crit for c in cap_changes)
+
+    def test_added_posting_server_creates_comms_pair(self) -> None:
+        """STORY-0101: adding GitLab next to a file server is a TOXIC-008
+        change (HIGH), with no TOXIC-001 (GitLab has no network_out)."""
+        gitlab = _server("gitlab", args=["-y", "@modelcontextprotocol/server-gitlab"])
+        base = [_filesystem_server()]
+        head = [_filesystem_server(), gitlab]
+        changes = compare(base, head)
+        pairs = {
+            c.after["toxic_pair"]: c
+            for c in changes
+            if c.entity_type == EntityType.CAPABILITY and c.after
+        }
+        assert "TOXIC-008" in pairs
+        assert pairs["TOXIC-008"].severity == Severity.HIGH
+        assert "TOXIC-001" not in pairs
 
 
 # ── comparator: server removed ────────────────────────────────────────────────
@@ -645,7 +662,7 @@ class TestCLIDiff:
         f = tmp_path / "mcp.json"
         f.write_text(json.dumps(cfg), encoding="utf-8")
         result = runner.invoke(app, ["diff", str(tmp_path), str(tmp_path)])
-        assert "No MCP changes" in result.output
+        assert "No MCP changes" in unwrapped(result.output)
 
     def test_added_server_exits_1(self, tmp_path: Path) -> None:
         base_dir = tmp_path / "base"
@@ -703,7 +720,7 @@ class TestCLIDiff:
             app, ["diff", str(base_dir), str(head_dir), "--format", "pr-comment"]
         )
         assert result.exit_code == 1
-        assert "## MCP Security Diff" in result.output
+        assert "## MCP Security Diff" in unwrapped(result.output)
         assert len(result.output.splitlines()) <= 100
 
     def test_severity_threshold_high_filters_low(self, tmp_path: Path) -> None:

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 from platformdirs import user_config_dir
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 # ── PEP 503 normalisation ──────────────────────────────────────────────────────
 
@@ -86,6 +86,54 @@ def _resolve_bundled_path() -> Path:
 
 
 BUNDLED_REGISTRY_PATH: Path = _resolve_bundled_path()
+
+
+# ── Errors ───────────────────────────────────────────────────────────────────
+
+
+class RegistryLoadError(ValueError):
+    """A registry file exists but cannot be loaded (malformed JSON or a
+    duplicate entry name caught by :meth:`KnownServerRegistry._build_name_index`).
+
+    Subclasses ``ValueError`` on purpose: existing ``except ValueError`` call
+    sites (``cli/fix.py``'s ``_resolve_findings`` catch, and anything else
+    that already treats a bad registry as "just a ValueError") keep working
+    unchanged and automatically get the improved, path-naming,
+    recovery-hinting message below with no code change at their end. New call
+    sites that want to react *specifically* to a corrupt registry (as opposed
+    to some unrelated ``ValueError`` elsewhere in the same try block) should
+    catch ``RegistryLoadError``, not the broader ``ValueError`` — see
+    ``cli/scan.py``, ``cli/vet.py``, and ``cli/shadow.py``.
+
+    R45: found by re-running R43's transient "Duplicate registry entry" crash
+    deliberately instead of writing it off as noise. ``scan``, ``vet``, and
+    ``shadow`` had no catch at all around registry construction and printed a
+    raw Python traceback; ``fix`` and ``check`` happened to already catch
+    ``ValueError``/``Exception`` broadly, but neither message named the
+    offending file or said how to recover. This class fixes both: every
+    caller now gets the same path + reason + recovery text, whether it
+    catches broadly or narrowly.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        """Build the error, storing *path* and *reason* for programmatic use.
+
+        Args:
+            path: The resolved registry file path that failed to load.
+            reason: Human-readable description of why (already includes any
+                nested exception detail — e.g. the JSON decoder message, or
+                :meth:`KnownServerRegistry._build_name_index`'s own duplicate-
+                name explanation).
+        """
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            f"Registry file could not be loaded: {path}\n"
+            f"  Reason: {reason}\n"
+            "  To recover: delete this file, then run 'mcp-audit "
+            "update-registry' to fetch a fresh copy (or pass --registry to "
+            "use a different file)."
+        )
 
 
 # ── Data models ────────────────────────────────────────────────────────────────
@@ -152,6 +200,14 @@ class RegistryEntry(BaseModel):
     # Default empty list — entries without vuln data omit this field.
     known_vulns: list[dict] = []
 
+    # The first semantic version released after the package used calendar
+    # versions (STORY-0105).  ``@modelcontextprotocol/server-filesystem`` went
+    # 0.6.2 -> 2025.1.14 ... 2026.8.31 -> 1.0.0, so this is "1.0.0": a semantic
+    # pin below it predates every calendar release, one at or above it came
+    # after them.  SC-004 uses it to order a pin against a fix recorded in the
+    # other scheme.  ``None`` (the default) means no switch back is recorded.
+    semver_resumed_at: str | None = None
+
 
 # ── Registry class ─────────────────────────────────────────────────────────────
 
@@ -179,24 +235,31 @@ class KnownServerRegistry:
 
         Raises:
             FileNotFoundError: If no registry file can be located.
-            ValueError: If the registry JSON is malformed, or if two entries
+            RegistryLoadError: If the located registry file's JSON is
+                malformed, an entry fails schema validation, or two entries
                 share the same (case-insensitive) ``name`` — see
-                :meth:`_build_name_index`.
+                :meth:`_build_name_index`. Subclasses ``ValueError``, so
+                existing ``except ValueError`` call sites keep working.
         """
         resolved = self._locate(path, offline=offline)
         raw = resolved.read_text(encoding="utf-8")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Malformed registry JSON at {resolved}: {exc}") from exc
+            raise RegistryLoadError(
+                resolved, f"Malformed registry JSON: {exc}"
+            ) from exc
 
         self.schema_version: str = str(data.get("schema_version", "unknown"))
         self.last_updated: str = str(data.get("last_updated", "unknown"))
 
         raw_entries = data.get("entries", [])
-        self.entries: list[RegistryEntry] = [
-            RegistryEntry.model_validate(e) for e in raw_entries
-        ]
+        try:
+            self.entries: list[RegistryEntry] = [
+                RegistryEntry.model_validate(e) for e in raw_entries
+            ]
+        except ValidationError as exc:
+            raise RegistryLoadError(resolved, f"Invalid entry data: {exc}") from exc
 
         # Build a lowercase name → entry index for O(1) exact lookups (all entries).
         #
@@ -214,7 +277,15 @@ class KnownServerRegistry:
         # canary package collided with the real, verified PyPI entry). Fail
         # loudly at load time instead so the collision is fixed in the data, not
         # silently outrun in a lookup.
-        self._name_index = self._build_name_index(self.entries)
+        try:
+            self._name_index = self._build_name_index(self.entries)
+        except ValueError as exc:
+            # Wrap, don't change: _build_name_index's own raise (message,
+            # condition) is untouched — this only adds the file path and
+            # recovery instructions that a static method operating on a bare
+            # entries list has no way to know. See RegistryLoadError's
+            # docstring for why this stays a ValueError subclass.
+            raise RegistryLoadError(resolved, str(exc)) from exc
 
         # PyPI-ecosystem sub-index (PEP 503 normalised name → entry).
         self._pypi_entries: list[RegistryEntry] = [
@@ -441,6 +512,8 @@ class KnownServerRegistry:
             d = levenshtein(lower, entry.name.lower())
             if d == 0:
                 return None  # shouldn't happen given the index check above
+            if d < min_dist and not scoped_parts_close(lower, entry.name.lower()):
+                continue
             if d < min_dist:
                 min_dist = d
                 closest_entry = entry
@@ -553,6 +626,87 @@ def load_registry(
 
 
 # ── Levenshtein implementation ─────────────────────────────────────────────────
+
+
+# A scope or name part that differs from the registry entry's counts as a
+# lookalike only when at most this fraction of the entry part's characters
+# were edited (Q-015).
+_SCOPED_PART_MAX_EDIT_FRACTION = 3
+
+
+def _split_scoped(name: str) -> tuple[str, str] | None:
+    """Return ``(scope, name)`` for ``@scope/name``, or ``None`` if unscoped."""
+    if not name.startswith("@") or "/" not in name:
+        return None
+    scope, _, rest = name[1:].partition("/")
+    return scope, rest
+
+
+def scoped_parts_close(candidate: str, entry_name: str) -> bool:
+    """Return whether two scoped npm names are close part by part (Q-015).
+
+    A whole-string edit distance of 3 made ``@netlify/mcp`` a typosquat of
+    ``@mintlify/mcp``: two real vendors whose short scopes share most letters.
+    An npm scope is an owned namespace, so a lookalike works only if each
+    part a reader compares still looks like the original.  When both names
+    are scoped, the scope and the name are compared separately, and every
+    part that differs must have no more than a third of the entry part's
+    length edited, counting an adjacent swap as one edit (optimal string
+    alignment, so ``@azrue/mcp`` is one edit from ``@azure/mcp``).
+    ``mintlify`` is 8 characters, so at most 2 edits; ``netlify`` needs 3.
+    Real squats stay in: a one- or two-letter slip
+    in a scope (``@modelcontextprotocal/...``) or a name
+    (``@modelcontextprotocol/server-filesytem``), or both.
+
+    Unscoped names, or one scoped and one unscoped, are not split and keep
+    the whole-string comparison.
+
+    Args:
+        candidate: The configured package name, lowercased.
+        entry_name: The registry entry's name, lowercased.
+
+    Returns:
+        ``True`` when the pair stays a typosquat candidate.
+    """
+    a, b = _split_scoped(candidate), _split_scoped(entry_name)
+    if a is None or b is None:
+        return True
+    for part_a, part_b in zip(a, b, strict=True):
+        dist = osa_distance(part_a, part_b)
+        if dist and dist * _SCOPED_PART_MAX_EDIT_FRACTION > len(part_b):
+            return False
+    return True
+
+
+def osa_distance(a: str, b: str) -> int:
+    """Return the optimal-string-alignment distance between *a* and *b*.
+
+    Levenshtein distance plus one operation: swapping two adjacent
+    characters counts as a single edit (Damerau's observation that
+    transpositions are among the commonest typing errors).  O(len(a) *
+    len(b)) time, three rows of memory.
+
+    Args:
+        a: First string.
+        b: Second string.
+
+    Returns:
+        The number of single-character insertions, deletions, substitutions
+        and adjacent transpositions needed to turn *a* into *b*.
+    """
+    if a == b:
+        return 0
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[len(b)]
 
 
 def levenshtein(a: str, b: str) -> int:

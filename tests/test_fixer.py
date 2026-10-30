@@ -16,6 +16,7 @@ from mcp_audit.fixer.strategies.credentials import CredentialsFixStrategy
 from mcp_audit.fixer.strategies.pinning import PackagePinningStrategy, _find_package_arg
 from mcp_audit.fixer.strategies.transport import TransportFixStrategy
 from mcp_audit.models import Finding, ScanResult, ServerConfig, Severity, TransportType
+from tests.conftest import unwrapped
 
 runner = CliRunner()
 
@@ -183,6 +184,93 @@ class TestCredentialFixStrategy:
         finding = _make_finding("CRED-002", evidence="args match GitHub Token pattern")
         _, desc = s.apply(config, finding)
         assert "already fixed" in desc
+
+    # ── CRED-003: literal secrets in authentication headers ───────────────────
+
+    def test_can_fix_cred003(self) -> None:
+        s = CredentialsFixStrategy()
+        assert s.can_fix(_make_finding("CRED-003"))
+
+    def _config_with_header(
+        self,
+        server_name: str = "my-server",
+        header_key: str = "Authorization",
+        header_value: str = "Bearer live-token-abc123",
+    ) -> dict:
+        return {
+            "mcpServers": {
+                server_name: {
+                    "command": "node",
+                    "headers": {header_key: header_value},
+                }
+            }
+        }
+
+    def test_cred003_replaces_header_value_preserving_scheme_prefix(self) -> None:
+        s = CredentialsFixStrategy()
+        config = self._config_with_header(
+            header_key="Authorization", header_value="Bearer live-token-abc123"
+        )
+        finding = _make_finding(
+            "CRED-003", evidence="Header: Authorization", analyzer="credentials"
+        )
+        new_config, desc = s.apply(config, finding)
+        headers = new_config["mcpServers"]["my-server"]["headers"]
+        assert headers["Authorization"] == "Bearer ${AUTHORIZATION}"  # noqa: S105
+        assert "Authorization" in desc
+        # Original must be unchanged (strategy must deep-copy)
+        assert config["mcpServers"]["my-server"]["headers"]["Authorization"] == (
+            "Bearer live-token-abc123"
+        )
+
+    def test_cred003_no_scheme_prefix_gets_bare_placeholder(self) -> None:
+        s = CredentialsFixStrategy()
+        config = self._config_with_header(
+            header_key="X-Api-Key", header_value="live-token-abc123"
+        )
+        finding = _make_finding("CRED-003", evidence="Header: X-Api-Key")
+        new_config, _ = s.apply(config, finding)
+        headers = new_config["mcpServers"]["my-server"]["headers"]
+        assert headers["X-Api-Key"] == "${X_API_KEY}"  # noqa: S105
+
+    def test_cred003_idempotent_when_already_env_ref(self) -> None:
+        s = CredentialsFixStrategy()
+        config = self._config_with_header(
+            header_key="Authorization", header_value="Bearer ${AUTHORIZATION}"
+        )
+        finding = _make_finding("CRED-003", evidence="Header: Authorization")
+        new_config, desc = s.apply(config, finding)
+        assert "already fixed" in desc
+        assert new_config == config
+
+    def test_cred003_raises_when_header_missing(self) -> None:
+        s = CredentialsFixStrategy()
+        config = self._config_with_header()
+        finding = _make_finding("CRED-003", evidence="Header: X-Nonexistent")
+        with pytest.raises(ValueError, match="not found"):
+            s.apply(config, finding)
+
+    def test_cred003_raises_on_bad_evidence(self) -> None:
+        s = CredentialsFixStrategy()
+        config = self._config_with_header()
+        finding = _make_finding("CRED-003", evidence="completely unparseable")
+        with pytest.raises(ValueError, match="Cannot parse header key"):
+            s.apply(config, finding)
+
+    def test_cred003_provider_pattern_branch_evidence_also_parses(self) -> None:
+        """Evidence with a trailing '| Matches ... pattern' detail still parses."""
+        s = CredentialsFixStrategy()
+        config = self._config_with_header(
+            header_key="X-Custom-Thing",
+            header_value="ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+        )
+        finding = _make_finding(
+            "CRED-003",
+            evidence="Header: X-Custom-Thing | Matches GitHub Token pattern",
+        )
+        new_config, _ = s.apply(config, finding)
+        headers = new_config["mcpServers"]["my-server"]["headers"]
+        assert headers["X-Custom-Thing"] == "${X_CUSTOM_THING}"  # noqa: S105
 
 
 # ── TransportFixStrategy unit tests ───────────────────────────────────────────
@@ -410,6 +498,151 @@ class TestPackagePinningStrategy:
             s.apply(config, finding)
 
 
+# ── VULN-UNPINNED / LOCK-004 version pinning (STORY-0070) ─────────────────────
+
+
+def _config_unpinned(
+    server_name: str = "my-server",
+    command: str = "npx",
+    pkg: str = "some-mcp-server",
+) -> dict:
+    return {
+        "mcpServers": {
+            server_name: {
+                "command": command,
+                "args": ["-y", pkg],
+            }
+        }
+    }
+
+
+def _version_finding(
+    finding_id: str = "VULN-UNPINNED",
+    server: str = "my-server",
+    evidence: str = "unpinned package",
+) -> Finding:
+    return _make_finding(
+        finding_id,
+        server=server,
+        evidence=evidence,
+        analyzer="vulnerability" if finding_id == "VULN-UNPINNED" else "lock",
+    )
+
+
+def _lock_doc(
+    client: str = "claude-desktop",
+    server: str = "my-server",
+    name: str = "some-mcp-server",
+    resolved_version: str = "2.5.0",
+    range_spec: str | None = None,
+) -> dict:
+    return {
+        "servers": {
+            f"{client}/{server}": {
+                "package": {
+                    "name": name,
+                    "resolved_version": resolved_version,
+                    "range_spec": range_spec,
+                }
+            }
+        }
+    }
+
+
+class TestVersionPinningStrategy:
+    def test_can_fix_vuln_unpinned_and_lock_004(self) -> None:
+        s = PackagePinningStrategy()
+        assert s.can_fix(_make_finding("VULN-UNPINNED"))
+        assert s.can_fix(_make_finding("LOCK-004"))
+
+    def test_uses_lock_resolved_version_with_no_network_call(self) -> None:
+        config = _config_unpinned()
+        finding = _version_finding("LOCK-004")
+        s = PackagePinningStrategy(lock_doc=_lock_doc())
+        with patch(_URLOPEN) as mock_urlopen:
+            new_config, msg = s.apply(config, finding)
+        mock_urlopen.assert_not_called()
+        assert new_config["mcpServers"]["my-server"]["args"] == [
+            "-y",
+            "some-mcp-server@2.5.0",
+        ]
+        assert "some-mcp-server@2.5.0" in msg
+        assert not s.warnings
+
+    def test_falls_back_to_live_resolution_without_lock(self) -> None:
+        config = _config_unpinned()
+        finding = _version_finding("VULN-UNPINNED")
+        s = PackagePinningStrategy()
+        with patch(_URLOPEN, return_value=_npm_mock("3.1.0")):
+            new_config, msg = s.apply(config, finding)
+        assert new_config["mcpServers"]["my-server"]["args"] == [
+            "-y",
+            "some-mcp-server@3.1.0",
+        ]
+        assert "run `mcp-audit lock`" in msg
+
+    def test_pypi_uses_at_syntax_not_double_equals(self) -> None:
+        """uvx pins use `pkg@version`, matching the existing SC-001/002
+        convention and `extract_pypi_package`'s own documented grammar —
+        not the `pkg==version` form."""
+        config = _config_unpinned(command="uvx", pkg="some-pypi-server")
+        finding = _version_finding("VULN-UNPINNED")
+        s = PackagePinningStrategy()
+        with patch(_URLOPEN, return_value=_pypi_mock("0.4.0")):
+            new_config, _ = s.apply(config, finding)
+        assert new_config["mcpServers"]["my-server"]["args"] == [
+            "-y",
+            "some-pypi-server@0.4.0",
+        ]
+
+    def test_range_spec_noted_as_collapsed(self) -> None:
+        config = _config_unpinned()
+        finding = _version_finding("LOCK-004")
+        s = PackagePinningStrategy(
+            lock_doc=_lock_doc(range_spec="^2.0.0"),
+        )
+        _, msg = s.apply(config, finding)
+        assert "semver range collapsed" in msg
+
+    def test_offline_without_lock_skips_with_warning(self) -> None:
+        config = _config_unpinned()
+        finding = _version_finding("VULN-UNPINNED")
+        s = PackagePinningStrategy(offline=True)
+        new_config, msg = s.apply(config, finding)
+        assert new_config == config
+        assert "offline" in msg
+        assert s.warnings
+
+    def test_offline_with_lock_still_pins_no_network_needed(self) -> None:
+        config = _config_unpinned()
+        finding = _version_finding("LOCK-004")
+        s = PackagePinningStrategy(offline=True, lock_doc=_lock_doc())
+        new_config, msg = s.apply(config, finding)
+        assert new_config["mcpServers"]["my-server"]["args"] == [
+            "-y",
+            "some-mcp-server@2.5.0",
+        ]
+        assert "2.5.0" in msg
+
+    def test_unresolvable_version_skips_without_raising(self) -> None:
+        config = _config_unpinned()
+        finding = _version_finding("VULN-UNPINNED")
+        s = PackagePinningStrategy()
+        with patch(_URLOPEN, side_effect=OSError("network down")):
+            new_config, msg = s.apply(config, finding)
+        assert new_config == config
+        assert "unresolvable" in msg
+        assert s.warnings
+
+    def test_idempotent_already_pinned(self) -> None:
+        config = _config_unpinned(pkg="some-mcp-server@2.5.0")
+        finding = _version_finding("LOCK-004")
+        s = PackagePinningStrategy(lock_doc=_lock_doc())
+        new_config, msg = s.apply(config, finding)
+        assert new_config == config
+        assert "already fixed" in msg
+
+
 # ── _find_package_arg helper ──────────────────────────────────────────────────
 
 
@@ -554,6 +787,34 @@ class TestRunFix:
         assert new_data["mcpServers"]["my-server"]["env"]["TOKEN"] == "${TOKEN}"  # noqa: S105
         assert new_data["mcpServers"]["my-server"]["url"] == "http://remote:8080"
 
+    def test_fix_type_credentials_includes_cred003(self, tmp_path: Path) -> None:
+        """R60-02: CRED-003 must reach the credentials strategy, not be filtered out."""
+        config: dict = {
+            "mcpServers": {
+                "my-server": {
+                    "command": "node",
+                    "headers": {"Authorization": "Bearer live-token-abc123"},
+                }
+            }
+        }
+        cp = _write_config(tmp_path, config)
+        findings = [
+            _make_finding(
+                "CRED-003",
+                evidence="Header: Authorization",
+                analyzer="credentials",
+            )
+        ]
+
+        result = run_fix(findings, cp, apply=True, fix_types=["credentials"])
+
+        assert not result.no_fixable
+        new_data = json.loads(cp.read_text(encoding="utf-8"))
+        assert (
+            new_data["mcpServers"]["my-server"]["headers"]["Authorization"]
+            == "Bearer ${AUTHORIZATION}"
+        )
+
     def test_pinning_apply(self, tmp_path: Path) -> None:
         config = _config_with_typosquat(pkg="@modelcontextprotocol/server-filesytem")
         cp = _write_config(tmp_path, config)
@@ -644,6 +905,8 @@ class TestRunFix:
 
         if sys.platform == "win32":
             pytest.skip("chmod semantics differ on Windows")
+        if os.geteuid() == 0:
+            pytest.skip("root ignores file mode bits, so 0o444 cannot block the write")
 
         original_mode = cp.stat().st_mode
         os.chmod(cp, 0o444)
@@ -729,7 +992,7 @@ class TestFixCLI:
             result = runner.invoke(app, ["fix", "--path", str(cp)])
 
         assert result.exit_code == 0
-        assert "No fixable findings" in result.output
+        assert "No fixable findings" in unwrapped(result.output)
 
     def test_invalid_fix_type_exits_2(self, tmp_path: Path) -> None:
         config = {"mcpServers": {}}
@@ -764,7 +1027,9 @@ class TestFixCLI:
 
         result = runner.invoke(app, ["fix", "--input", str(scan_json)])
         assert result.exit_code == 0
-        assert "${GITHUB_TOKEN}" in result.output or "Would apply" in result.output  # noqa: S105
+        assert "${GITHUB_TOKEN}" in result.output or "Would apply" in unwrapped(  # noqa: S105
+            result.output
+        )
 
     def test_path_and_input_mutually_exclusive(self, tmp_path: Path) -> None:
         cp = _write_config(tmp_path, {"mcpServers": {}})

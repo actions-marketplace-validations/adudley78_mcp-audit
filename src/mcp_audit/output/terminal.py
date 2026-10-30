@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
 from mcp_audit import __version__
+from mcp_audit.exploit import signals
 from mcp_audit.models import (
     AttackPathSummary,
     FeedStatus,
@@ -218,8 +220,10 @@ def print_results(
     console.print()
 
     # Individual findings
+    # KEV first, then severity, then EPSS (highest first); stable otherwise.
     sorted_findings = sorted(
-        result.findings, key=lambda f: list(Severity).index(f.severity)
+        result.findings,
+        key=lambda f: signals.priority_key(f, list(Severity).index(f.severity)),
     )
     for finding in sorted_findings:
         color = SEVERITY_COLORS[finding.severity]
@@ -235,17 +239,27 @@ def print_results(
         if finding.cve:
             cve_ids = ", ".join(finding.cve)
             cve_badge = f"  [dim red]\\[{cve_ids}][/dim red]"
+            exploit_text = signals.badge(finding)
+            if exploit_text:
+                cve_badge += f"  [bold red]\\[{exploit_text}][/bold red]"
 
+        # Finding text can carry what a scanned server sent (tool names, live
+        # descriptions): escape it so "[/dim]" in it is shown, not parsed as
+        # Rich markup (which raises, or renders a hidden "[link=…]").
         console.print(
             f"{icon} [{color} bold]{finding.severity.value}[/{color} bold]  "
-            f"[dim]{finding.analyzer}[/dim]  "
-            f"{finding.client}/{finding.server}"
+            f"[dim]{escape(finding.analyzer)}[/dim]  "
+            f"{escape(finding.client)}/{escape(finding.server)}"
             f"{owasp_badge}"
             f"{cve_badge}"
         )
-        console.print(f"   {finding.title}")
-        console.print(f"   [dim]→ {finding.evidence}[/dim]")
-        console.print(f"   [italic]ℹ {finding.remediation}[/italic]")
+        console.print(f"   {escape(finding.title)}")
+        console.print(f"   [dim]→ {escape(finding.evidence)}[/dim]")
+        console.print(f"   [italic]ℹ {escape(finding.remediation)}[/italic]")
+        console.print()
+
+    if result.exploit_data:
+        console.print(f"[dim]{escape(result.exploit_data['line'])}[/dim]")
         console.print()
 
     # Policy violations panel — distinct from security findings
@@ -265,7 +279,8 @@ def print_results(
         for gf in gov_findings:
             color = SEVERITY_COLORS[gf.severity]
             gov_lines.append(
-                f"  [dim]{gf.client}/{gf.server}[/dim]  [{color}]{gf.title}[/{color}]"
+                f"  [dim]{escape(gf.client)}/{escape(gf.server)}[/dim]  "
+                f"[{color}]{escape(gf.title)}[/{color}]"
             )
         console.print(
             Panel(
@@ -291,4 +306,4 @@ def print_results(
     if result.errors:
         console.print("[yellow bold]Errors:[/yellow bold]")
         for error in result.errors:
-            console.print(f"  ⚠ {error}", style="yellow")
+            console.print(f"  ⚠ {error}", style="yellow", markup=False)

@@ -40,6 +40,15 @@ def _has_hardcoded_cred(server: ServerConfig) -> bool:
     return _hc(server)[0]
 
 
+def _possible_flag_cred(server: ServerConfig) -> bool:
+    """True when a scan file redacted a secret-named flag's value (STORY-0108)."""
+    from mcp_audit.diff.comparator import (  # noqa: PLC0415
+        _possible_flag_credential,
+    )
+
+    return _possible_flag_credential(server)
+
+
 def classify_added_server(
     server: ServerConfig,
     base_servers: list[ServerConfig],  # noqa: ARG001
@@ -64,6 +73,8 @@ def classify_added_server(
     """
     if _has_hardcoded_cred(server):
         return Severity.CRITICAL
+    if _possible_flag_cred(server):
+        return Severity.HIGH
 
     caps = tag_server(server)
 
@@ -119,10 +130,20 @@ def classify_modified_server(
     head_hc = _has_hardcoded_cred(head)
     if head_hc and not base_hc:
         return Severity.CRITICAL
+    if (
+        _possible_flag_cred(head)
+        and not _possible_flag_cred(base)
+        and not head_hc
+        and not base_hc
+    ):
+        return Severity.HIGH
 
     # HIGH: new external endpoint
-    base_urls = set(_extract_external_urls(base))
-    head_urls = set(_extract_external_urls(head))
+    from mcp_audit.diff.comparator import mixed_inputs  # noqa: PLC0415
+
+    mixed = mixed_inputs(base, head)
+    base_urls = set(_extract_external_urls(base, mixed))
+    head_urls = set(_extract_external_urls(head, mixed))
     if head_urls - base_urls:
         return Severity.HIGH
 
@@ -130,7 +151,10 @@ def classify_modified_server(
     base_env = set(base.env.keys())
     head_env = set(head.env.keys())
     new_keys = head_env - base_env
-    changed_keys = {k for k in base_env & head_env if base.env[k] != head.env[k]}
+    from mcp_audit.diff.comparator import comparison_view  # noqa: PLC0415
+
+    b_env, h_env = comparison_view(base, mixed)[3], comparison_view(head, mixed)[3]
+    changed_keys = {k for k in base_env & head_env if b_env[k] != h_env[k]}
     for key in new_keys | changed_keys:
         is_hv, _ = _classify_env_key(key)
         if is_hv:

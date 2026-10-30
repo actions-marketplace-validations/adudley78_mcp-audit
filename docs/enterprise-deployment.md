@@ -75,19 +75,21 @@ curl -sSL https://github.com/adudley78/mcp-audit/releases/latest/download/mcp-au
 
 No Python installation required. The binary bundles the Python runtime and all dependencies.
 
-### Option B — Python package (when published to PyPI)
+### Option B — Python package (PyPI)
+
+The PyPI package is `mcp-audit-scanner`; the command it installs is `mcp-audit`.
 
 ```bash
-pip install mcp-audit
+pip install mcp-audit-scanner
 ```
 
 Pin to a specific version in production:
 
 ```bash
-pip install mcp-audit==0.1.0
+pip install mcp-audit-scanner==0.25.0
 ```
 
-### Option C — Source install (current method for internal alpha)
+### Option C — Source install
 
 ```bash
 git clone https://github.com/adudley78/mcp-audit.git /opt/mcp-audit
@@ -419,7 +421,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install mcp-audit
-        run: pip install mcp-audit
+        run: pip install mcp-audit-scanner
 
       - name: Scan MCP configs
         run: |
@@ -452,5 +454,5 @@ findings; use `--severity-threshold MEDIUM` to catch more.
 | **Credentials** | API keys, tokens, passwords, and database connection strings hardcoded in server environment variables or command arguments. |
 | **Transport** | Insecure transport configurations: HTTP (non-TLS) remote URLs, servers bound to all interfaces, and runtime package fetchers (`npx`, `uvx`) that download arbitrary code. |
 | **Supply Chain** | Typosquatted package names detected via Levenshtein distance against the known-server registry. Packages with no version pin and known-malicious package names. |
-| **Rug Pull** | Detects changes to server descriptions since the last pinned baseline — the mechanism used in supply-chain substitution attacks. |
+| **Rug Pull** | Detects changes to each server's configuration entry (command, arguments, environment variable names) since the last pinned baseline — the mechanism used in supply-chain substitution attacks. Live tool definitions are not hashed. |
 | **Toxic Flow** | Multi-hop attack paths where a server with read capability (file system, database) is co-installed with a server with write/network capability, enabling data exfiltration chains. |

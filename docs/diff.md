@@ -123,9 +123,12 @@ Each record has:
   "command_diff": null | {
     "before_command": ..., "after_command": ...,
     "before_args": ..., "after_args": ...
-  }
+  },
+  "note": "string (only when set)"
 }
 ```
+
+`note` is present on a changed server whose remote host or port moved, e.g. `remote host changed from a.example to b.example` (STORY-0135). Only the hostname and port are quoted, never userinfo or query strings.
 
 ## Other output formats
 
@@ -153,9 +156,12 @@ Each of `<base>` and `<head>` can be:
 - **A directory path** — all MCP configs discovered under that directory (same
   discovery logic as `mcp-audit scan --path`).
 - **A JSON file path** — either a `mcp-audit scan --output-file` ScanResult JSON
-  or a raw MCP config JSON (`mcpServers` / `servers` root key).
+  or a raw MCP config JSON (`mcpServers` / `servers` root key). A `.toml` file
+  is read as Codex's `config.toml` and `.gemini/settings.json` as Gemini CLI's
+  settings (see [clients.md](clients.md)).
 - **A git ref** — any ref that `git show` can resolve: a SHA, `HEAD~3`, a branch
-  name, a tag. mcp-audit checks each known MCP config path at that ref.
+  name, a tag. mcp-audit checks each known MCP config path at that ref,
+  including `.codex/config.toml` and `.gemini/settings.json`.
 
 ```bash
 # Compare two directories
@@ -168,6 +174,55 @@ mcp-audit diff scan-baseline.json configs/
 mcp-audit diff HEAD~1 HEAD
 mcp-audit diff $GITHUB_BASE_REF $GITHUB_HEAD_REF
 ```
+
+**Scan files hold redacted launch arguments (since STORY-0108).** A ScanResult
+JSON replaces a credential in a server's `command`, `args` or `url` (URL user
+info such as a database password, or a known token format) with `[REDACTED]`,
+and the value of a secret-named flag that matches no known token format
+(`--password VALUE`, `--api-key=VALUE`) with `[REDACTED-FLAG]`. `diff` counts
+`[REDACTED]` in those fields as a hardcoded credential (CRITICAL) and
+`[REDACTED-FLAG]` as a possible one (HIGH, "Possible credential flag value"),
+so a credential added between two scan files is still reported. Flags named
+for a setting rather than a secret (`--auth-type`, `--keys-dir`,
+`--api-key-file`) and values such as `none`, `oauth`, paths, URLs and `$VAR`
+references are left alone. What a scan file can no longer show:
+
+- **Rotation is invisible between two scan files.** Two different secrets both
+  read `[REDACTED]`, so replacing one credential with another is not a change.
+  Compare directories or git refs to see it.
+- **Scans from before and after the change don't compare cleanly.** A scan file
+  written by an older mcp-audit has the secret in clear; diffing it against a
+  newer one reports the argument as changed. Re-run the older scan, or compare
+  config directories.
+- **Scan file against a directory** (or git ref): when exactly one side holds
+  redaction markers, `diff` compares both sides in their redacted form, so an
+  unchanged config reads as unchanged. A credential rotated in that pairing is
+  not visible, as with two scan files.
+- **Directory against directory, or git ref against git ref**: neither side
+  holds markers, so values are compared as written and a rotated credential
+  (argument, connection string, environment variable, URL query) is reported
+  as a change. The report prints redacted before/after values.
+- User info is redacted when it has a password (`user:pass@`) or when the user
+  name is not a plain account name (a token such as `https://ghp_…@github.com`
+  or `glpat-…@`). A plain account name such as `git@` in
+  `git+ssh://git@github.com/…` is kept and is not a credential.
+- Since STORY-0118 the scan file also redacts: secret-named query parameters
+  (`?token=`, `?api_key=`, `?sig=`, `?access_token=`, `?password=`, `?auth=`,
+  `?secret=`, `?key=`), credential headers in an argument
+  (`--header "X-API-Key: v"`, `Cookie:`, `Authorization:` with any scheme),
+  `Password=`/`Pwd=`/`secret=` pairs in a connection string, `curl -u user:pass`,
+  the value after `--password` even when it starts with `-`, Base64-looking URL
+  user info, and `servers[].env` values for every client (a credential in an
+  environment variable becomes `[REDACTED-FLAG]`, or `[REDACTED]` for a known
+  token format; `${VAR}` references and plain settings such as
+  `NODE_ENV=production` stay). Environment values are redacted by kind rather
+  than all at once so that every variable is not read as a credential. A secret
+  inside a single command string (`"command": "npx x --token abc"`) is still
+  recognised only in the shapes above.
+- `--format pr-comment`, `--format json` and the terminal output redact
+  `command`, `args` and URLs for every input kind (directories, git refs and
+  scan files) before they print or truncate them (STORY-0118). Where neither
+  input is a scan file, the comparison itself uses the real values.
 
 ## Severity classification
 
@@ -199,7 +254,7 @@ Add `mode: diff` to the existing action — no separate workflow needed:
 
 ```yaml
 - name: MCP diff
-  uses: adudley78/mcp-audit@v0.10.0
+  uses: adudley78/mcp-audit@v0.25.0
   with:
     mode: diff
     severity-threshold: medium

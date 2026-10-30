@@ -26,6 +26,10 @@ mcp-audit vet @azure/mcp --format json
 # Shields.io badge for your README
 mcp-audit vet @modelcontextprotocol/server-filesystem --badge
 
+# A specific version (STORY-0117): judged against each recorded CVE's fix
+mcp-audit vet @modelcontextprotocol/server-filesystem@2025.1.14
+mcp-audit vet mcp-remote==0.1.30
+
 # Live verdict from mcp-audit.dev (requires network)
 mcp-audit vet @scope/name --online
 
@@ -39,9 +43,17 @@ mcp-audit vet @scope/name --strict
 
 | Code | Condition |
 |------|-----------|
-| 0 | Package known + no CVEs + no typosquat (or unknown without `--strict`) |
-| 1 | CVEs present, typosquat suspicion, or unknown + `--strict` |
+| 0 | Package known, every recorded CVE has a fix (or none recorded), no typosquat; or unknown without `--strict` |
+| 1 | A recorded CVE has no fix, typosquat suspicion (edit distance or an unscoped twin), OSV lists the latest release as malicious, or unknown + `--strict` |
 | 2 | Invalid/empty package name, bad `--ecosystem` flag, registry not found |
+
+`vet` takes no version, so it answers for the latest release. A CVE with a
+recorded fix is listed with its fixed version but does not fail `vet`
+(STORY-0083, 2026-10-13); before that, any recorded CVE did, which made `vet` fail
+for every package with a fixed past. The same rule applies to malicious
+releases (STORY-0097): an OSV record that covers every release, or every release
+from some version on, exits 1; a record that lists only specific past releases
+is shown and exits 0.
 
 ---
 
@@ -86,14 +98,15 @@ mcp-audit vet @scope/name --strict
 │                                                              │
 │   Registry:      Listed · Verified · sooperset               │
 │                                                              │
-│   Known vulnerabilities: 1                                   │
+│   Known vulnerabilities: 1 (all fixed; pin a version at or  │
+│   above each fix)                                            │
 │                                                              │
 │   CVE-2026-27826 — Authentication bypass via crafted token   │
 │   fixed in 0.9.4                                             │
 │   https://nvd.nist.gov/vuln/detail/CVE-2026-27826            │
 ╰──────────────────────────────────────────────────────────────╯
 ```
-Exit code: **1**
+Exit code: **0** (a CVE with no recorded fix exits 1)
 
 ## Output: typosquat suspicion
 
@@ -109,6 +122,45 @@ Exit code: **1**
 ╰──────────────────────────────────────────────────────────────╯
 ```
 Exit code: **1**
+
+## Output: unscoped twin
+
+An unlisted name that copies a known package's name without its scope (the
+`SC-007` rule in `scan`, see [supply-chain.md](supply-chain.md#sc-007-unscoped-twins))
+is a typosquat suspicion too, explained by the relation instead of an edit
+distance:
+
+```
+╭─ Possible unscoped twin — vet exit 1 ────────────────────────╮
+│ Queried:  server-github                                      │
+│ Twin of:  @modelcontextprotocol/server-github                │
+│           (maintainer: Anthropic, verified: True)            │
+│ Relation: the queried name is the name of                    │
+│ '@modelcontextprotocol/server-github' without its scope      │
+╰──────────────────────────────────────────────────────────────╯
+```
+Exit code: **1**
+
+## Output: listed as malicious in OSV
+
+`vet` checks the bundled OSV `MAL-*` mirror (`registry/known-malicious.json`,
+the `SC-008` data) for the exact name, offline:
+
+```
+╭─ Listed as malicious in OSV — vet exit 1 ────────────────────╮
+│ MAL-2025-47604 — Malicious code in postmark-mcp (npm)        │
+│   every release from 1.0.16 on marked malicious              │
+│   https://osv.dev/vulnerability/MAL-2025-47604               │
+╰──────────────────────────────────────────────────────────────╯
+```
+Exit code: **1**. A record that lists only past releases
+(`vet @browserbasehq/mcp`: release 2.1.1) is shown in a yellow panel and exits 0.
+
+Without `--ecosystem`, `vet` also warns when the *other* registry's package of
+the same name is malicious. `vet mcp-server-git` answers for Anthropic's PyPI
+server (exit 0) and warns that the npm package `mcp-server-git` is
+`MAL-2026-5478`; `vet mcp-server-git --ecosystem npm` answers for the npm one
+(exit 1).
 
 ## Output: unknown package
 
@@ -159,6 +211,9 @@ Exit code: **0** (1 with `--strict`)
     "attestation_expected": true
   },
   "typosquat_of": null,
+  "typosquat_basis": null,
+  "malicious": [],
+  "other_ecosystem_malicious": [],
   "tags": ["official", "filesystem", "local"],
   "links": {
     "repo": "https://github.com/modelcontextprotocol/servers",
@@ -166,6 +221,23 @@ Exit code: **0** (1 with `--strict`)
   }
 }
 ```
+
+Fields added by STORY-0097 (the schema allows additional properties):
+
+| Field | Meaning |
+|---|---|
+| `typosquat_basis` | `"edit-distance"` or `"unscoped-twin"` when `typosquat_of` is set, else `null` |
+| `malicious` | OSV `MAL-*` records for this package in this ecosystem: `id`, `ecosystem`, `aliases`, `summary`, `versions`, `ranges` (OSV events), `latest_affected`, `blanket_range_ignored`, `link`, `note` |
+| `other_ecosystem_malicious` | The same, for the other registry's package of this name (only without `--ecosystem`); never changes the exit code |
+
+Fields added by STORY-0117, only when a version is given (`vet pkg@1.2.3`, `vet @scope/pkg@1.2.3`, `vet pkg==1.2.3`):
+
+| Field | Meaning |
+|---|---|
+| `package.version` | The exact version asked about. The name is looked up without it. A dist-tag (`@latest`) or range (`@^1.2`) names no single release and is dropped, with no `version` field |
+| `known_vulnerabilities[].status` | `affected` (no recorded fix, or the version is below it), `fixed`, or `undecidable` (the fix uses a different numbering scheme, calendar versus semantic, and `semver_resumed_at` does not order them: the SC-004/SC-009 rule) |
+
+With a version, the exit code is 1 when any CVE is `affected` or `undecidable` (an unsure answer is not a clean one); 0 only when every recorded CVE is `fixed` at that version. Without one, the rule is unchanged: 1 when a recorded CVE has no fix. The OSV `MAL-*` check is by package name, not by version.
 
 ---
 
@@ -178,6 +250,12 @@ Exit code: **0** (1 with `--strict`)
 ```
 
 **Slug convention:** `@scope/name` → `at-scope-name`, lowercased, `_` → `-`.
+
+**Ecosystem:** without `--ecosystem`, an unscoped name the registry lists only for
+PyPI gets a PyPI badge (`vet mcptoon --badge` → `/v1/badge/pypi/mcptoon.json`),
+spelled as the registry spells it (`MCP_Atlassian` → `mcp-atlassian`).  Every other
+name, including one the registry doesn't list, gets the npm badge, as before.
+Registry names are unique across ecosystems, so the choice is never ambiguous.
 
 The badge shows registry verification status and known CVE count for the package —
 not a grade, not an endorsement, nothing about any deployment. See
@@ -194,6 +272,13 @@ Network failure is non-fatal — it logs a dim note and falls back to the bundle
 
 Plain `vet` (without `--online`) makes **zero** network calls.
 
+**Not yet surfaced here:** `mcp-audit lock`'s deprecated-package check
+(`SC-005` — a registry-marked-deprecated version, npm's own `deprecated`
+field) is not wired into `vet --online` or `scan --check-vulns`. It fires
+only at `lock` resolution and `lock --verify --resolve` for now — see
+[docs/lock.md](lock.md#whats-in-the-file) and `GAPS.md`. Tracked as
+STORY-0074.
+
 ---
 
 ## Typosquat detection
@@ -205,7 +290,8 @@ Plain `vet` (without `--online`) makes **zero** network calls.
 | ≤ 5 chars | 1 |
 | > 5 chars | 3 |
 
-A match exits 1 and shows a "did you mean?" panel.
+A match exits 1 and shows a "did you mean?" panel. An unscoped twin is checked
+first and, when it matches, replaces the edit-distance result, as in `scan`.
 
 ---
 

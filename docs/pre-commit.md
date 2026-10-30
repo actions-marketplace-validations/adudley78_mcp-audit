@@ -29,12 +29,12 @@ brew install pre-commit
 ```yaml
 repos:
   - repo: https://github.com/adudley78/mcp-audit
-    rev: v0.1.0  # Replace with the latest release tag
+    rev: v0.25.0
     hooks:
       - id: mcp-audit
 ```
 
-Replace `v0.1.0` with the latest release tag from [https://github.com/adudley78/mcp-audit/releases](https://github.com/adudley78/mcp-audit/releases).
+`rev` must be an existing release tag. The examples on this page show the current release (each release PR updates them); `pre-commit autoupdate` moves your copy to the latest tag from [https://github.com/adudley78/mcp-audit/releases](https://github.com/adudley78/mcp-audit/releases).
 
 **3. Install the hooks into your local repo:**
 
@@ -51,7 +51,7 @@ The default hook args run `scan --severity-threshold high`, blocking only on HIG
 ```yaml
 repos:
   - repo: https://github.com/adudley78/mcp-audit
-    rev: v0.1.0
+    rev: v0.25.0
     hooks:
       - id: mcp-audit
         args: [scan, --severity-threshold, medium]
@@ -99,6 +99,36 @@ See [`examples/pre-commit/`](../examples/pre-commit/) for ready-to-copy configs:
 
 - [`basic.yaml`](../examples/pre-commit/basic.yaml) — minimal setup, blocks on HIGH+
 - [`strict.yaml`](../examples/pre-commit/strict.yaml) — blocks on MEDIUM+
+
+## `mcp-audit-lock-verify` — block commits that drift from `mcp-lock.json`
+
+If you've adopted [`mcp-audit lock`](lock.md), a second hook enforces it:
+
+```yaml
+repos:
+  - repo: https://github.com/adudley78/mcp-audit
+    rev: v0.25.0  # mcp-audit-lock-verify needs v0.17.0 or later
+    hooks:
+      - id: mcp-audit
+      - id: mcp-audit-lock-verify
+```
+
+This hook runs `mcp-audit lock --verify --if-present` whenever a commit
+touches a known MCP config path or `mcp-lock.json`. It is safe to add to a
+repo that has not run `mcp-audit lock` yet — `--if-present` makes a missing
+lock file a no-op, not a failure, so this hook only starts blocking commits
+once you've written a lock file with `mcp-audit lock`.
+
+A drifted commit is blocked. Review the drift, then run:
+
+```bash
+mcp-audit lock --accept
+git add mcp-lock.json
+git commit
+```
+
+`--accept` re-writes the lock from the current state (preserving each
+surviving entry's `first_locked`) — the explicit "I reviewed this" step.
 
 ## Known limitations
 

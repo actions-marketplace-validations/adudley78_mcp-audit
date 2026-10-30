@@ -148,9 +148,13 @@ class TestClassification:
             ("POISON-001", "tool-poisoning"),
             ("SC-001", "typosquat"),
             ("SC-004", "known-vulnerability"),
+            ("SC-007", "typosquat"),
+            ("SC-008", "known-vulnerability"),
             ("AUTH-001", "missing-authentication"),
             ("TOXIC-003", "toxic-flow"),
             ("HOOK-001", "hook-execution"),
+            ("TRUST-006", "hook-execution"),
+            ("TRUST-007", "untrusted-config-origin"),
             ("SAST-ABC123DEF456", "source-vulnerability"),
         ],
     )
@@ -171,6 +175,8 @@ class TestClassification:
         [
             ("POISON-001", OBSERVATION_PACKAGE),
             ("SC-001", OBSERVATION_PACKAGE),
+            ("SC-007", OBSERVATION_PACKAGE),
+            ("SC-008", OBSERVATION_PACKAGE),
             ("ATTEST-012", OBSERVATION_PACKAGE),
             ("CRED-001", OBSERVATION_DEPLOYMENT),
             ("TRANSPORT-001", OBSERVATION_DEPLOYMENT),

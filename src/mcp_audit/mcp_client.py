@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import sys
 import tempfile
@@ -63,7 +64,8 @@ SAFE_ENV_VARS: frozenset[str] = frozenset(
 
 # Shown to the user when the optional mcp package is absent.
 MCP_NOT_INSTALLED = (
-    "MCP SDK not installed. Run: pip install 'mcp-audit[mcp]'  or  pip install mcp"
+    "MCP SDK not installed. Run: pip install 'mcp-audit-scanner[mcp]' "
+    "or pip install mcp"
 )
 # Standalone binary: pip-installing into the frozen artifact is not possible.
 # See the four *.spec files — `mcp` is excluded the same way `sigstore` is.
@@ -137,15 +139,28 @@ def build_runtime_server_config(
     if not enumeration.tools and not enumeration.resources and not enumeration.prompts:
         return None
 
+    # Every field of a tool the lock's ``definition`` digest covers (see
+    # :mod:`mcp_audit.lock.tool_digests`): ``title``, ``outputSchema`` and
+    # ``annotations`` too when the server sent them (STORY-0099), so the text
+    # checks read every string of the metadata, down to parameter
+    # descriptions, ``enum``, ``default`` and ``examples`` in the schemas.
+    tools: list[dict] = []
+    for t in enumeration.tools:
+        entry: dict = {
+            "name": t.name,
+            "description": t.description or "",
+            "inputSchema": t.input_schema,
+        }
+        if t.title is not None:
+            entry["title"] = t.title
+        if t.output_schema is not None:
+            entry["outputSchema"] = t.output_schema
+        if t.annotations is not None:
+            entry["annotations"] = t.annotations
+        tools.append(entry)
+
     raw: dict = {
-        "tools": [
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "inputSchema": t.input_schema,
-            }
-            for t in enumeration.tools
-        ],
+        "tools": tools,
         "resources": [
             {
                 "uri": r.uri,
@@ -237,48 +252,53 @@ async def _enumerate_stdio(
     # (b) we can surface it in --verbose mode.
     # We use a TemporaryFile (real fd) because asyncio's subprocess machinery
     # requires an object with a valid fileno().
-    captured_stderr: str | None = None
+    raw_stderr: bytes = b""
+    failure: Exception | None = None
+    result: ServerEnumeration | None = None
     with tempfile.TemporaryFile(mode="w+b") as stderr_buf:
         try:
-            async with (
-                stdio_client_fn(params, errlog=stderr_buf) as (read, write),
-                client_session_cls(read, write) as session,
-            ):
-                result = await _collect(session)
-        except TypeError:
-            # SDK version does not support the errlog parameter — fall back to
-            # capturing via StdioServerParameters.stderr when available, otherwise
-            # accept that stderr may briefly appear in the terminal.
-            try:
-                import subprocess  # noqa: PLC0415
+            result = await _run_stdio_session(
+                server,
+                env,
+                params,
+                params_cls,
+                client_session_cls,
+                stdio_client_fn,
+                stderr_buf,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A server that dies during the handshake surfaces here, wrapped
+            # in anyio's TaskGroup ExceptionGroup (Q-014).  Keep it, so the
+            # captured stderr below can say why.
+            failure = exc
+        finally:
+            # Read whatever the subprocess wrote to stderr (may be empty),
+            # also when the handshake failed: that is when it matters most.
+            raw_stderr = _read_stderr_tail(stderr_buf)
 
-                params_with_pipe = params_cls(
-                    command=server.command,
-                    args=server.args,
-                    env=env,
-                    stderr=subprocess.PIPE,
-                )
-                async with (
-                    stdio_client_fn(params_with_pipe) as (read, write),
-                    client_session_cls(read, write) as session,
-                ):
-                    result = await _collect(session)
-            except Exception:  # noqa: BLE001
-                # Last resort: call without any stderr override.
-                async with (
-                    stdio_client_fn(params) as (read, write),
-                    client_session_cls(read, write) as session,
-                ):
-                    result = await _collect(session)
+    captured_stderr = (
+        redact_server_text(
+            raw_stderr.decode("utf-8", errors="replace").strip(),
+            server.env.values(),
+            server.args,
+        )
+        if raw_stderr
+        else None
+    )
 
-        # Read whatever the subprocess wrote to stderr (may be empty).
-        try:
-            stderr_buf.seek(0)
-            raw_bytes = stderr_buf.read()
-            if raw_bytes:
-                captured_stderr = raw_bytes.decode("utf-8", errors="replace").strip()
-        except Exception:  # noqa: BLE001, S110
-            pass
+    if failure is not None or result is None:
+        reason = (
+            redact_server_text(
+                describe_exception(failure), server.env.values(), server.args
+            )
+            if failure is not None
+            else "no result"
+        )
+        error = f"Enumeration failed: {reason}"
+        last = _last_line(captured_stderr)
+        if last:
+            error += f" (server stderr: {last})"
+        return ServerEnumeration(error=error, server_stderr=captured_stderr or None)
 
     return ServerEnumeration(
         tools=result.tools,
@@ -286,7 +306,155 @@ async def _enumerate_stdio(
         prompts=result.prompts,
         error=result.error,
         server_stderr=captured_stderr or None,
+        tools_error=result.tools_error,
     )
+
+
+async def _run_stdio_session(
+    server: ServerConfig,
+    env: dict[str, str],
+    params: Any,
+    params_cls: Any,
+    client_session_cls: Any,
+    stdio_client_fn: Any,
+    stderr_buf: Any,
+) -> ServerEnumeration:
+    """Open the stdio session (with the SDK-version fallbacks) and collect."""
+    try:
+        async with (
+            stdio_client_fn(params, errlog=stderr_buf) as (read, write),
+            client_session_cls(read, write) as session,
+        ):
+            return await _collect(session)
+    except TypeError:
+        # SDK version does not support the errlog parameter — fall back to
+        # capturing via StdioServerParameters.stderr when available, otherwise
+        # accept that stderr may briefly appear in the terminal.
+        try:
+            import subprocess  # noqa: PLC0415
+
+            params_with_pipe = params_cls(
+                command=server.command,
+                args=server.args,
+                env=env,
+                stderr=subprocess.PIPE,
+            )
+            async with (
+                stdio_client_fn(params_with_pipe) as (read, write),
+                client_session_cls(read, write) as session,
+            ):
+                return await _collect(session)
+        except Exception:  # noqa: BLE001
+            # Last resort: call without any stderr override.
+            async with (
+                stdio_client_fn(params) as (read, write),
+                client_session_cls(read, write) as session,
+            ):
+                return await _collect(session)
+
+
+# Most server stderr kept for an error message or --verbose (the tail: the
+# reason a server exits is usually its last words).
+_MAX_STDERR_BYTES = 64 * 1024
+# Longest stderr line quoted inside a connect error message.
+_MAX_STDERR_LINE = 300
+_REDACTED = "[REDACTED]"
+# An env value shorter than this is not redacted by value: "1", "true" or
+# "dev" would blank out ordinary words.  Real secrets are longer.
+_MIN_REDACTED_ENV_VALUE = 8
+
+
+def _read_stderr_tail(stderr_buf: Any) -> bytes:
+    """Return at most the last ``_MAX_STDERR_BYTES`` written to *stderr_buf*."""
+    try:
+        size = stderr_buf.seek(0, os.SEEK_END)
+        stderr_buf.seek(max(0, size - _MAX_STDERR_BYTES))
+        data = stderr_buf.read()
+    except (OSError, ValueError):
+        return b""
+    return data if isinstance(data, bytes) else b""
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a readable message for *exc*, unwrapping exception groups.
+
+    The MCP SDK runs the stdio transport in an anyio TaskGroup, so a server
+    that exits during the handshake reaches us as "unhandled errors in a
+    TaskGroup (1 sub-exception)" (Q-014).  The first leaf exception is the
+    one that says what happened.
+
+    Args:
+        exc: The exception raised while connecting.
+
+    Returns:
+        ``"<Type>: <message>"`` for the first non-group exception, or just
+        the type name when it has no message.
+    """
+    leaf: BaseException = exc
+    for _ in range(32):  # groups nest; never loop on a pathological chain
+        if isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
+            leaf = leaf.exceptions[0]
+        else:
+            break
+    message = str(leaf).strip()
+    return f"{type(leaf).__name__}: {message}" if message else type(leaf).__name__
+
+
+def redact_server_text(
+    text: str, env_values: Any = (), args: list[str] | None = None
+) -> str:
+    """Redact secrets from text a server process produced (stderr, errors).
+
+    Server output is shown to the user and written into scan results, and a
+    server that fails to start often prints the value it rejected.  Passes,
+    each linear: the server's own secrets first, by value (every ``env``
+    value and every value of a secret-named flag in its ``args``,
+    ``supply_chain.secret_arg_values``, at least ``_MIN_REDACTED_ENV_VALUE``
+    characters long), so a pattern match cannot leave part of one behind;
+    then every ``SECRET_PATTERNS`` match; then the userinfo of every
+    ``scheme://user:pass@host`` on each line.
+
+    Args:
+        text: The text to clean.
+        env_values: The values of the server's configured ``env``.
+        args: The server's launch arguments.
+
+    Returns:
+        The text with secrets replaced by ``[REDACTED]``.
+    """
+    # Imported lazily: the analyzers are not otherwise needed by the client.
+    from mcp_audit.analyzers.credentials import SECRET_PATTERNS  # noqa: PLC0415
+    from mcp_audit.analyzers.supply_chain import (  # noqa: PLC0415
+        _redact_userinfo,
+        secret_arg_values,
+    )
+
+    candidates = [v for v in env_values if isinstance(v, str)]
+    candidates.extend(secret_arg_values(list(args or [])))
+    values = sorted(
+        {v for v in candidates if len(v) >= _MIN_REDACTED_ENV_VALUE},
+        key=len,
+        reverse=True,
+    )
+    cleaned = text
+    for value in values:
+        cleaned = cleaned.replace(value, _REDACTED)
+    for _label, pattern, _provider in SECRET_PATTERNS:
+        cleaned = pattern.sub(_REDACTED, cleaned)
+    return "\n".join(_redact_userinfo(line) for line in cleaned.split("\n"))
+
+
+def _last_line(text: str | None) -> str:
+    """Return the last non-empty line of *text*, truncated for an error message."""
+    if not text:
+        return ""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line:
+            if len(line) > _MAX_STDERR_LINE:
+                return line[:_MAX_STDERR_LINE] + "..."
+            return line
+    return ""
 
 
 async def _enumerate_sse(
@@ -367,11 +535,156 @@ def _classify_sse_error(exc: Exception, url: str) -> ServerEnumeration:
     return ServerEnumeration(error=f"SSE connection failed ({exc_type}): {exc_str}")
 
 
+#: Upper bound on ``tools/list`` pages read from one server. A server that
+#: keeps returning a cursor past this is reported via ``tools_error`` rather
+#: than looped on forever.
+_MAX_TOOL_PAGES = 100
+
+
+def _str_or_none(value: Any) -> str | None:
+    """Return *value* when it is a string, else ``None``."""
+    return value if isinstance(value, str) else None
+
+
+def _dict_or_none(value: Any) -> dict | None:
+    """Return a copy of *value* when it is a dict, else ``None``."""
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _wire(obj: Any) -> dict:
+    """Return *obj* as the server sent it, in MCP wire format.
+
+    The SDK's pydantic models dump to the protocol's own camelCase keys with
+    ``by_alias=True``; ``exclude_unset=True`` keeps only the fields the server
+    actually sent, so an SDK upgrade that adds a default never changes what a
+    digest is computed over. Returns ``{}`` for anything that is not a
+    pydantic model (very old SDKs, test doubles).
+    """
+    dump = getattr(obj, "model_dump", None)
+    if callable(dump):
+        try:
+            data = dump(by_alias=True, exclude_unset=True, mode="json")
+        except Exception:  # noqa: BLE001
+            data = None
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _tool_info(tool: Any) -> ToolInfo:
+    """Build a :class:`ToolInfo` from one SDK tool object.
+
+    Reads the wire-format dump first. ``mcp`` 2.x renamed the Python
+    attribute to ``input_schema`` (alias ``inputSchema``), so the old
+    ``getattr(t, "inputSchema")`` silently returned nothing on 2.x and live
+    input schemas never reached the poisoning analyzer.
+    """
+    wire = _wire(tool)
+    if wire:
+        schema = wire.get("inputSchema")
+        return ToolInfo(
+            name=str(wire.get("name", getattr(tool, "name", ""))),
+            title=_str_or_none(wire.get("title")),
+            description=_str_or_none(wire.get("description")),
+            input_schema=dict(schema) if isinstance(schema, dict) else {},
+            output_schema=_dict_or_none(wire.get("outputSchema")),
+            annotations=_dict_or_none(wire.get("annotations")),
+        )
+    schema = getattr(tool, "inputSchema", None)
+    if not isinstance(schema, dict):
+        schema = getattr(tool, "input_schema", None)
+    output_schema = getattr(tool, "outputSchema", None)
+    if not isinstance(output_schema, dict):
+        output_schema = getattr(tool, "output_schema", None)
+    return ToolInfo(
+        name=tool.name,
+        title=_str_or_none(getattr(tool, "title", None)),
+        description=_str_or_none(getattr(tool, "description", None)),
+        input_schema=dict(schema) if isinstance(schema, dict) else {},
+        output_schema=_dict_or_none(output_schema),
+        annotations=_dict_or_none(getattr(tool, "annotations", None)),
+    )
+
+
+def _next_cursor(resp: Any) -> str | None:
+    """Return the pagination cursor of a list result, or ``None`` on the last page."""
+    for attr in ("next_cursor", "nextCursor"):
+        value = getattr(resp, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+async def _list_tools_page(session: Any, cursor: str) -> Any | None:
+    """Request the ``tools/list`` page after *cursor*.
+
+    ``mcp`` 2.x takes ``params=PaginatedRequestParams(cursor=...)``; later
+    1.x releases take ``cursor=``; the earliest 1.x releases cannot paginate
+    at all, in which case this returns ``None``.
+    """
+    try:
+        accepted = inspect.signature(session.list_tools).parameters
+    except (TypeError, ValueError):
+        accepted = {}
+    if "params" in accepted:
+        from mcp import types as mcp_types  # noqa: PLC0415
+
+        return await session.list_tools(
+            params=mcp_types.PaginatedRequestParams(cursor=cursor)
+        )
+    if "cursor" in accepted:
+        return await session.list_tools(cursor=cursor)
+    return None
+
+
+async def _list_all_tools(session: Any) -> tuple[list[Any], str | None]:
+    """Read every ``tools/list`` page.
+
+    Returns:
+        ``(tools, problem)``. *problem* is ``None`` when the last page was
+        reached, otherwise a sentence saying why the list may be incomplete.
+    """
+    resp = await session.list_tools()
+    tools = list(resp.tools)
+    cursor = _next_cursor(resp)
+    pages = 1
+    while cursor is not None:
+        if pages >= _MAX_TOOL_PAGES:
+            return tools, (
+                f"tools/list returned more than {_MAX_TOOL_PAGES} pages; "
+                "stopped reading"
+            )
+        resp = await _list_tools_page(session, cursor)
+        if resp is None:
+            return tools, (
+                "the server paginates tools/list and this version of the mcp "
+                "package cannot request later pages; upgrade it"
+            )
+        tools.extend(resp.tools)
+        cursor = _next_cursor(resp)
+        pages += 1
+    return tools, None
+
+
+def _declares_tools(init_result: Any) -> bool | None:
+    """Whether the server's ``initialize`` result declares the tools capability.
+
+    ``None`` when the result does not say (very old SDKs, test doubles).
+    """
+    caps = getattr(init_result, "capabilities", None)
+    if caps is None or not hasattr(caps, "tools"):
+        return None
+    return caps.tools is not None
+
+
 async def _collect(session: Any) -> ServerEnumeration:
     """Initialize a session and call list_tools / list_resources / list_prompts.
 
     Each list call is attempted independently — partial results are returned
-    when a server supports only a subset of the MCP capabilities.
+    when a server supports only a subset of the MCP capabilities. Every
+    ``tools/list`` page is read. When the server declares tools but the list
+    could not be read in full, ``tools_error`` says why, so a caller never
+    mistakes a failed read for "this server has no tools".
 
     Args:
         session: An initialized :class:`mcp.ClientSession`.
@@ -380,24 +693,20 @@ async def _collect(session: Any) -> ServerEnumeration:
         :class:`~mcp_audit.models.ServerEnumeration` with whatever the server
         reported.
     """
-    await session.initialize()
+    init_result = await session.initialize()
 
     tools: list[ToolInfo] = []
     resources: list[ResourceInfo] = []
     prompts: list[PromptInfo] = []
+    tools_error: str | None = None
 
     try:
-        resp = await session.list_tools()
-        for t in resp.tools:
-            tools.append(
-                ToolInfo(
-                    name=t.name,
-                    description=getattr(t, "description", None),
-                    input_schema=dict(getattr(t, "inputSchema", {})),
-                )
-            )
-    except Exception:  # noqa: BLE001, S110
-        pass  # Server may not implement tools capability.
+        raw_tools, tools_error = await _list_all_tools(session)
+        tools = [_tool_info(t) for t in raw_tools]
+    except Exception as exc:  # noqa: BLE001
+        # A server that does not declare tools legitimately has none.
+        if _declares_tools(init_result) is not False:
+            tools_error = f"tools/list failed: {exc}"
 
     try:
         resp = await session.list_resources()
@@ -424,4 +733,9 @@ async def _collect(session: Any) -> ServerEnumeration:
     except Exception:  # noqa: BLE001, S110
         pass  # Server may not implement prompts capability.
 
-    return ServerEnumeration(tools=tools, resources=resources, prompts=prompts)
+    return ServerEnumeration(
+        tools=tools,
+        resources=resources,
+        prompts=prompts,
+        tools_error=tools_error,
+    )

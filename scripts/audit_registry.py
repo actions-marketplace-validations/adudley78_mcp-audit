@@ -61,6 +61,71 @@ NO_PROVENANCE
 UNCHECKED
     Network failure or missing version/filename so we could not tell.
 
+Capability checks (local, offline, always run)
+------------------------------------------------
+These four checks never touch the network. They run unconditionally, before
+the network audit loop, and are report-only like everything else here.
+
+unknown capability strings
+    A value in an entry's ``capabilities`` list that is not a defined
+    ``Capability`` enum member (``toxic_flow.py``). ``_is_known_cap()``
+    drops these silently at read time BY DESIGN, so a registry file
+    published by a newer mcp-audit release (with a capability name an
+    older, still-installed client doesn't know about yet) never crashes
+    that client — that forward-compatibility contract must not change.
+    But this script speaks for the *maintainers* validating *our own* data
+    before it ships, not a client reading someone else's newer file, so a
+    typo here (e.g. "subprocess" instead of "shell_exec") is simply a
+    capability nobody will ever see fire, in either detection path. Fixing
+    it is opt-in and manual, same as everything else this script flags —
+    the script only ever reports.
+
+under-declared capabilities (find_undeclared_capabilities)
+    An entry with an explicit ``capabilities`` list that the keyword
+    heuristics alone would have extended: ``inferred - declared`` is
+    non-empty. R34 shipped this as a strict-subset test; R35 generalised it
+    after measurement showed the strict form misses the partial-overlap
+    case (declared has something inferred lacks AND is missing something
+    inferred has — those sets are incomparable under ``<``). Each hit is
+    tagged ``"subset"`` (pure omission) or ``"disjoint"`` (omission plus an
+    extra) so the two shapes stay distinguishable. Registry-supplied
+    capabilities override heuristics entirely (``tag_server()``'s
+    registry-first path) rather than union with them, so an incomplete list
+    on a ``verified`` entry silently suppresses detection that an
+    *unverified* package with the same name would still trigger. This is a
+    signal, not proof — the heuristics over-fire on some names, and a human
+    deliberately narrowing a verified entry's declared surface is
+    legitimate — so this is reported for human review, never auto-fixed.
+    See ``find_undeclared_capabilities()``'s docstring for the R35
+    measurement that justified adopting the general predicate outright.
+
+tag-only capabilities (find_dead_capabilities)
+    A ``Capability`` member that appears in no ``TOXIC_PAIRS`` entry and no
+    ``attack_paths.CAPABILITY_FLOWS`` edge can be recorded but never
+    contributes to a finding. Compared against the explicit
+    ``toxic_flow.KNOWN_TAG_ONLY_CAPABILITIES`` allowlist: a member present in
+    that list is accounted for, and each entry says WHICH of two things it
+    is — ``kind="deliberate_deferral"`` (wiring consciously postponed, no
+    known missing table row; ``CLOUD`` today) or ``kind="suspected_gap"``
+    (dead because the detection model has no axis to express it, a known but
+    unfixed gap, not a settled decision; ``FILE_WRITE`` today, discovered by
+    this check in R35 — see its allowlist entry's ``reason`` for detail). A
+    dead member absent from the allowlist entirely is reported as
+    UNEXPECTED — a capability added to the enum without either wiring it
+    into a detection path or declaring it tag-only (of either kind).
+    ``tests/test_toxic_flow.py`` also asserts UNEXPECTED is empty on every
+    PR (not just ones touching this script or the registry file), since a
+    change that makes a capability dead lives entirely in
+    ``toxic_flow.py``/``attack_paths.py`` and would not otherwise trigger
+    this script's CI workflow at all.
+
+entirely-tag-only entries (find_entirely_tag_only_entries)
+    A registry entry whose every declared capability is tag-only produces
+    zero toxic-flow findings by construction while looking fully described —
+    the ``subprocess`` failure shape in a new costume, except every declared
+    capability is like that at once rather than one misspelled string among
+    real ones. None do today (no entry currently declares ``cloud`` at all).
+
 Usage
 -----
     python scripts/audit_registry.py
@@ -92,6 +157,17 @@ REPO_ROOT = Path(__file__).parent.parent
 REGISTRY_PATH = REPO_ROOT / "registry" / "known-servers.json"
 DEFAULT_CACHE_PATH = REPO_ROOT / ".registry_audit_cache.json"
 DEFAULT_OUT_PATH = REPO_ROOT / ".registry_audit_raw.json"
+
+# R45: the stale-build guard (formerly a private copy in this file, R39) now
+# lives in dev_build_guard.py, shared with docs/manual-test-matrix.md's Setup
+# Guard — see that module's docstring. sys.path is not guaranteed to already
+# contain this directory (e.g. a caller that imports this module without
+# running it as __main__), so make the sibling import explicit rather than
+# relying on Python's script-directory auto-insert.
+_scripts_dir = str(Path(__file__).resolve().parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from dev_build_guard import assert_mcp_audit_is_repo_local  # noqa: E402
 
 USER_AGENT = (
     "mcp-audit-registry-audit/1.0 "
@@ -644,6 +720,341 @@ def classify(entry: dict, checks: list[EcosystemCheck]) -> dict:
     return {"bucket": "OK", "evidence": evidence, "plausible_maintainer": plausible}
 
 
+# ── Capability checks (local, offline) ──────────────────────────────────────
+#
+# Both checks below operate purely on the registry file already on disk —
+# no network, no cache. They exist because the registry-first override in
+# toxic_flow.py (tag_server()) makes an incomplete or misspelled explicit
+# `capabilities` list on a `verified` entry strictly worse than no list at
+# all: it switches off the keyword-heuristic fallback that would otherwise
+# have caught the gap. See the module docstring's "Capability checks" section.
+
+
+def _synthetic_server(name: str) -> Any:
+    """Build a minimal ServerConfig for *name* to feed toxic_flow's heuristics.
+
+    Mirrors what a real scan sees for a package with no registry capability
+    data: only the package name itself, in ``args`` and ``name``, no command,
+    no registry. This is exactly the fallback path an *unverified* package
+    with the same name would go through — the comparison point for deciding
+    whether a verified entry's explicit capabilities are under-declared.
+
+    Imports mcp_audit lazily so this script's other (network-audit) code
+    paths keep working even if the package is not importable in some future
+    invocation context; only the two capability checks need it.
+    """
+    from mcp_audit.models import ServerConfig  # noqa: PLC0415
+
+    return ServerConfig(
+        name=name,
+        client="registry-audit",
+        config_path=Path("registry-audit"),
+        args=[name],
+    )
+
+
+def compute_inferred_capabilities(name: str) -> frozenset[str]:
+    """Return the capability set toxic_flow's keyword heuristics infer for *name*.
+
+    Calls :func:`tag_server` with ``registry=None`` so the registry-first
+    override is bypassed entirely and only the three heuristic layers
+    (known-package table, keyword matching, tool-name matching) run — tool
+    names are unavailable here (no live ``--connect`` data), so effectively
+    layers 1 and 2.
+
+    Args:
+        name: The registry entry's package name.
+
+    Returns:
+        Frozen set of :class:`~mcp_audit.analyzers.toxic_flow.Capability`
+        ``.value`` strings the heuristics alone would assign.
+    """
+    from mcp_audit.analyzers.toxic_flow import tag_server  # noqa: PLC0415
+
+    server = _synthetic_server(name)
+    return frozenset(c.value for c in tag_server(server, registry=None))
+
+
+def find_unknown_capabilities(entries: list[dict]) -> list[dict]:
+    """Flag ``capabilities`` values that are not defined ``Capability`` members.
+
+    This is validation of OUR OWN data before it ships, not a client reading
+    someone else's registry — the silent-drop behaviour in
+    ``toxic_flow._is_known_cap()`` must stay silent for the latter case
+    (forward compatibility with older installed clients), but a typo in the
+    file we are about to publish is a defect, not a future schema value.
+
+    Args:
+        entries: The registry's ``entries`` list, as loaded from JSON.
+
+    Returns:
+        One dict per offending entry: ``{"name": ..., "unknown": [...]}``.
+        Empty when every declared capability string is a known member.
+    """
+    from mcp_audit.analyzers.toxic_flow import Capability  # noqa: PLC0415
+
+    known = {c.value for c in Capability}
+    hits: list[dict] = []
+    for entry in entries:
+        declared = entry.get("capabilities")
+        if not declared:
+            continue
+        unknown = sorted(set(declared) - known)
+        if unknown:
+            hits.append({"name": entry["name"], "unknown": unknown})
+    return hits
+
+
+def find_undeclared_capabilities(entries: list[dict]) -> list[dict]:
+    """Flag entries where the keyword heuristics infer a capability the entry
+    does not declare.
+
+    R34 shipped this as a strict-subset test (``declared < inferred``), which
+    only catches "declared is missing things and has no extras." It misses
+    the partial-overlap case: an entry that declares something the
+    heuristics don't infer AND omits something they do — those two sets are
+    incomparable, so ``<`` is ``False`` and the entry passed. R35 measured
+    this gap directly: re-running against all 50 live entries with the
+    general predicate (``inferred - declared`` non-empty, which subsumes
+    strict subset) found exactly one new hit beyond the zero the strict form
+    found, and it was real, not heuristic over-fire — ``@palisadeemail/mcp``
+    declared only ``network_out`` while its own ``tags`` already say
+    ``"email"`` and the package name literally is "Palisade Email". Fixed in
+    the same PR that adopted this predicate. One real hit out of one is "few
+    and mostly real", so the general predicate was adopted outright — no
+    reviewed-exception mechanism was added, because there was no legitimate
+    narrowing case in the data to design one against. If a future run turns
+    up hits that are mostly deliberate narrowing rather than omissions, that
+    measurement is the trigger to add one, not a preemptive guess now.
+
+    Each hit is classified as ``"subset"`` (every declared capability is
+    also inferred — the old predicate's shape) or ``"disjoint"`` (the entry
+    also declares something the heuristics do NOT infer) so the two flavours
+    stay distinguishable in the report instead of collapsing into one
+    undifferentiated list.
+
+    Args:
+        entries: The registry's ``entries`` list, as loaded from JSON.
+
+    Returns:
+        One dict per hit: ``{"name", "declared", "inferred", "missing",
+        "extra", "kind"}``, sorted lists of capability strings plus a
+        ``kind`` of ``"subset"`` or ``"disjoint"``. Empty when no entry
+        under-declares.
+    """
+    hits: list[dict] = []
+    for entry in entries:
+        declared_raw = entry.get("capabilities")
+        if declared_raw is None:
+            continue
+        declared = frozenset(declared_raw)
+        inferred = compute_inferred_capabilities(entry["name"])
+        missing = inferred - declared
+        if not missing:
+            continue
+        extra = declared - inferred
+        hits.append(
+            {
+                "name": entry["name"],
+                "declared": sorted(declared),
+                "inferred": sorted(inferred),
+                "missing": sorted(missing),
+                "extra": sorted(extra),
+                "kind": "disjoint" if extra else "subset",
+            }
+        )
+    return hits
+
+
+def find_dead_capabilities() -> dict:
+    """Compare toxic_flow's dead-capability set against its explicit allowlist.
+
+    A capability that participates in no ``TOXIC_PAIRS`` entry and no
+    ``attack_paths.CAPABILITY_FLOWS`` edge can be recorded but can never
+    contribute to a finding. That is accounted for when it is in
+    ``KNOWN_TAG_ONLY_CAPABILITIES`` — either a deliberate, documented
+    deferral (``Capability.CLOUD``) or a documented suspected gap
+    (``Capability.FILE_WRITE``) — and an accident otherwise: the same shape
+    as R34's ``subprocess`` defect, arriving through design rather than a
+    typo. This does not touch the registry file; it inspects the
+    ``Capability`` enum, ``TOXIC_PAIRS``, and ``CAPABILITY_FLOWS`` directly.
+
+    Returns:
+        ``{"known_tag_only": [{"capability", "kind", "reason"}, ...],
+        "unexpected_tag_only": [...]}``. ``known_tag_only`` entries are
+        sorted by capability value and carry the allowlist's ``kind``
+        (``"deliberate_deferral"`` | ``"suspected_gap"``) and full ``reason``
+        so the report-only/suspected-gap distinction survives into the
+        printed report rather than collapsing into one undifferentiated
+        list. ``unexpected_tag_only`` is the loud-failure signal — non-empty
+        means a capability was added to the enum without either wiring it
+        into a detection path or declaring it tag-only.
+    """
+    from mcp_audit.analyzers.toxic_flow import (  # noqa: PLC0415
+        KNOWN_TAG_ONLY_CAPABILITIES,
+        compute_dead_capabilities,
+    )
+
+    dead = compute_dead_capabilities()
+    known_caps = frozenset(t.capability for t in KNOWN_TAG_ONLY_CAPABILITIES)
+    known_entries = sorted(
+        (
+            {"capability": t.capability.value, "kind": t.kind.value, "reason": t.reason}
+            for t in KNOWN_TAG_ONLY_CAPABILITIES
+            if t.capability in dead
+        ),
+        key=lambda d: d["capability"],
+    )
+    return {
+        "known_tag_only": known_entries,
+        "unexpected_tag_only": sorted(c.value for c in (dead - known_caps)),
+    }
+
+
+def find_entirely_tag_only_entries(entries: list[dict]) -> list[dict]:
+    """Flag entries whose entire declared capability set is tag-only.
+
+    Such an entry looks fully described (it has a non-empty, all-valid
+    ``capabilities`` list) but produces zero toxic-flow findings by
+    construction, because every capability it declares is one that
+    ``compute_dead_capabilities()`` says participates in no detection path —
+    and the registry-first override in ``tag_server()`` means the keyword
+    heuristics that might otherwise have inferred something real never run
+    for this entry at all. This is the ``subprocess`` failure shape in a new
+    costume: a capability that is recorded, looks meaningful, and does
+    nothing, except here every declared capability is like that at once.
+
+    Unknown capability strings (already reported by
+    :func:`find_unknown_capabilities`) are excluded from consideration here
+    so the same defect is not double-counted under a different name.
+
+    Args:
+        entries: The registry's ``entries`` list, as loaded from JSON.
+
+    Returns:
+        One dict per hit: ``{"name": ..., "declared": [...]}``. Empty when
+        no entry is entirely tag-only — expected today, since no entry
+        declares ``cloud`` at all.
+    """
+    from mcp_audit.analyzers.toxic_flow import (  # noqa: PLC0415
+        Capability,
+        compute_dead_capabilities,
+    )
+
+    known_values = {c.value for c in Capability}
+    dead_values = {c.value for c in compute_dead_capabilities()}
+    hits: list[dict] = []
+    for entry in entries:
+        declared_raw = entry.get("capabilities")
+        if not declared_raw:
+            continue
+        known_declared = {c for c in declared_raw if c in known_values}
+        if known_declared and known_declared <= dead_values:
+            hits.append({"name": entry["name"], "declared": sorted(declared_raw)})
+    return hits
+
+
+def find_bad_reachability_tags(entries: list[dict]) -> list[dict]:
+    """``known_vulns`` records whose transport tag is unusable (STORY-0125).
+
+    An unusable tag is silently ignored by the scanner (the advisory stays in
+    force), so this is where a typo in ``affected_transports`` or a missing
+    ``verified_by`` gets caught.
+    """
+    from mcp_audit.registry.reachability import tag_problems  # noqa: PLC0415
+
+    hits: list[dict] = []
+    for entry in entries:
+        seen: dict[str, bool] = {}
+        for record in entry.get("known_vulns") or []:
+            if not isinstance(record, dict):
+                continue
+            problems = tag_problems(record)
+            cve = str(record.get("cve") or "").upper()
+            tagged = "affected_transports" in record
+            if cve in seen and (seen[cve] or tagged):
+                problems.append("the CVE is listed twice and one copy is tagged")
+            if cve:
+                seen[cve] = seen.get(cve, False) or tagged
+            if problems:
+                hits.append(
+                    {
+                        "name": entry["name"],
+                        "cve": record.get("cve"),
+                        "problems": problems,
+                    }
+                )
+    return hits
+
+
+def count_tagged_advisories(entries: list[dict]) -> int:
+    """How many ``known_vulns`` records carry a valid transport tag."""
+    from mcp_audit.registry.reachability import tags_of  # noqa: PLC0415
+
+    return sum(
+        1
+        for entry in entries
+        for record in entry.get("known_vulns") or []
+        if tags_of(record) is not None
+    )
+
+
+def _print_capability_checks(
+    unknown_hits: list[dict],
+    undeclared_hits: list[dict],
+    dead_caps: dict,
+    entirely_tag_only_hits: list[dict],
+) -> None:
+    print("\n=== Capability checks (local, offline) ===", file=sys.stderr)
+    print(f"  Unknown capability strings: {len(unknown_hits)}", file=sys.stderr)
+    for h in unknown_hits:
+        print(f"    - {h['name']}: {h['unknown']}", file=sys.stderr)
+
+    subset = [h for h in undeclared_hits if h["kind"] == "subset"]
+    disjoint = [h for h in undeclared_hits if h["kind"] == "disjoint"]
+    print(
+        f"  Under-declared entries: {len(undeclared_hits)} "
+        f"({len(subset)} subset, {len(disjoint)} disjoint)",
+        file=sys.stderr,
+    )
+    for h in undeclared_hits:
+        print(
+            f"    - [{h['kind']}] {h['name']}: declared={h['declared']} "
+            f"inferred={h['inferred']} missing={h['missing']} extra={h['extra']}",
+            file=sys.stderr,
+        )
+
+    print(
+        f"  Tag-only capabilities: {len(dead_caps['known_tag_only'])} known, "
+        f"{len(dead_caps['unexpected_tag_only'])} UNEXPECTED",
+        file=sys.stderr,
+    )
+    for entry in dead_caps["known_tag_only"]:
+        marker = "SUSPECTED GAP" if entry["kind"] == "suspected_gap" else "deferred"
+        print(
+            f"    - {entry['capability']!r} [{marker}]: {entry['reason']}",
+            file=sys.stderr,
+        )
+    for c in dead_caps["unexpected_tag_only"]:
+        print(
+            f"    - {c!r} participates in no TOXIC_PAIRS and no "
+            "CAPABILITY_FLOWS entry, and is not in KNOWN_TAG_ONLY_CAPABILITIES. "
+            "Either wire it in or add it to that allowlist with a reason.",
+            file=sys.stderr,
+        )
+
+    print(
+        f"  Entries with entirely tag-only capabilities: {len(entirely_tag_only_hits)}",
+        file=sys.stderr,
+    )
+    for h in entirely_tag_only_hits:
+        print(
+            f"    - {h['name']}: declared={h['declared']} — produces zero "
+            "toxic-flow findings by construction",
+            file=sys.stderr,
+        )
+
+
 # ── Cache ────────────────────────────────────────────────────────────────
 
 
@@ -901,6 +1312,37 @@ def main() -> None:
     args = parser.parse_args()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
         parser.error("--date must be YYYY-MM-DD")
+
+    # Local, offline capability checks run first and unconditionally — no
+    # network cost, so there is no reason to gate them behind --stamp or a
+    # cache. See the module docstring's "Capability checks" section. They
+    # import mcp_audit modules, so verify that import resolves inside this
+    # repo before trusting anything they compute (R35 — see
+    # dev_build_guard.assert_mcp_audit_is_repo_local's docstring for why
+    # this matters; R45 moved this check into that shared module so it is
+    # not a second, independently-drifting copy of the same rule).
+    assert_mcp_audit_is_repo_local(REPO_ROOT)
+    entries = json.loads(args.registry.read_text(encoding="utf-8")).get("entries", [])
+    unknown_cap_hits = find_unknown_capabilities(entries)
+    undeclared_cap_hits = find_undeclared_capabilities(entries)
+    dead_cap_report = find_dead_capabilities()
+    entirely_tag_only_hits = find_entirely_tag_only_entries(entries)
+    _print_capability_checks(
+        unknown_cap_hits, undeclared_cap_hits, dead_cap_report, entirely_tag_only_hits
+    )
+
+    bad_tags = find_bad_reachability_tags(entries)
+    print(
+        f"Transport-tagged advisories: {count_tagged_advisories(entries)}",
+        file=sys.stderr,
+    )
+    for hit in bad_tags:
+        print(
+            f"  BAD TAG {hit['name']} {hit['cve']}: {'; '.join(hit['problems'])}",
+            file=sys.stderr,
+        )
+    if bad_tags:
+        sys.exit(1)
 
     results = audit_registry(args.registry, args.cache, args.refresh)
 

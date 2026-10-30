@@ -10,11 +10,14 @@ import typer
 from rich.console import Console
 
 from mcp_audit.cli import app, run_scan
-from mcp_audit.models import Severity
+from mcp_audit.lock.auto_verify import auto_verify as _lock_auto_verify
+from mcp_audit.models import LockStatus, ScanResult, Severity
 from mcp_audit.output.check import print_check_results
 from mcp_audit.output.terminal import print_results
 from mcp_audit.registration import client as _reg_client
 from mcp_audit.registration import manager as _reg_manager
+from mcp_audit.scanner import apply_exploit_signals
+from mcp_audit.scoring import calculate_score
 
 # Severity order for exit-code threshold check (descending priority).
 _SEVERITY_ORDER: list[Severity] = [
@@ -24,6 +27,40 @@ _SEVERITY_ORDER: list[Severity] = [
     Severity.LOW,
     Severity.INFO,
 ]
+
+
+def _apply_lock_verification(
+    result: ScanResult, no_lock: bool, console: Console
+) -> ScanResult:
+    """Auto-verify ``mcp-lock.json`` for *result*'s servers (STORY-0070).
+
+    Mirrors ``cli.scan._apply_lock_verification`` (kept as a separate,
+    small copy rather than a cross-module import so ``check.py`` and
+    ``scan.py`` stay independently importable — the two already have an
+    asymmetric relationship where ``scan.py`` lazily imports from
+    ``check.py`` for PDF reports, never the reverse). ``check`` has no
+    governance-policy weight plumbing today, so the score recompute below
+    always uses ``calculate_score``'s own defaults, matching the "default"
+    weights ``run_scan`` itself used for the main score.
+
+    Always offline; never adds ``--resolve``-equivalent network calls to
+    ``check`` (an explicit STORY-0070 non-goal). Returns *result* unchanged
+    (``lock_status.present=False``) when no ``mcp-lock.json`` is
+    discoverable for any scanned server, or when *no_lock* is set.
+    """
+    if no_lock:
+        result.lock_status = LockStatus()
+        return result
+
+    lock_findings, status = _lock_auto_verify(result.servers)
+    result.lock_status = status
+    if not status.present:
+        return result
+
+    if lock_findings:
+        result.findings.extend(lock_findings)
+        result.score = calculate_score(result.findings)
+    return result
 
 
 def _exit_code(result) -> int:  # type: ignore[no-untyped-def]
@@ -107,6 +144,15 @@ def check(
             "After the scan, prompt for opt-in registration if not already registered."
         ),
     ),
+    no_lock: bool = typer.Option(  # noqa: B008
+        False,
+        "--no-lock",
+        help=(
+            "Skip automatic mcp-lock.json verification. By default, check "
+            "auto-verifies the nearest ancestor lock file for each scanned "
+            "server, if one exists."
+        ),
+    ),
 ) -> None:
     """One-command security verdict: grade, top findings, and fix hints.
 
@@ -124,17 +170,19 @@ def check(
     - 2: error (invalid path, ambiguous input, scan failure)
     """
     console = Console(width=80)
+    # With --json, stdout is the JSON document; every other line goes to stderr.
+    con = Console(stderr=True, width=80) if json_flag else console
 
     # ── Resolve positional vs --path ──────────────────────────────────────────
     if configs and len(configs) > 1:
-        console.print(
+        con.print(
             "[red]Error:[/red] check accepts a single config path. "
             "Pass one path positionally or use --path."
         )
         raise typer.Exit(2)
     config = configs[0] if configs else None
     if config is not None and path is not None:
-        console.print(
+        con.print(
             "[red]Error:[/red] Provide a config path either as a positional argument "
             "or via --path, not both."
         )
@@ -143,7 +191,7 @@ def check(
 
     # ── Path validation ───────────────────────────────────────────────────────
     if resolved_path is not None and not resolved_path.resolve().exists():
-        console.print(f"[red]File not found:[/red] {resolved_path}")
+        con.print(f"[red]File not found:[/red] {resolved_path}")
         raise typer.Exit(2)
 
     extra_paths = [resolved_path] if resolved_path else None
@@ -155,13 +203,31 @@ def check(
             skip_rug_pull=False,
         )
     except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Scan error:[/red] {exc}")
+        con.print(f"[red]Scan error:[/red] {exc}")
         raise typer.Exit(2) from None
 
+    result = _apply_lock_verification(result, no_lock, console)
+    # check stays offline: bundled KEV/EPSS data, its date shown in the verdict.
+    apply_exploit_signals(result)
+
     # ── No configs found ──────────────────────────────────────────────────────
-    if result.clients_scanned == 0 and result.servers_found == 0 and not extra_paths:
-        console.print()
-        console.print(
+    # Only when nothing at all was found: a repository with no MCP config can
+    # still carry findings (TRUST-008 auto-run files at the cwd root, STORY-0090;
+    # the current repo's git config, TRUST-006/007, STORY-0089; CI workflows,
+    # STORY-0091; plugin mods), and those must reach the verdict and the exit
+    # code, e.g. on a CI runner with no MCP clients.
+    if (
+        result.clients_scanned == 0
+        and result.servers_found == 0
+        and not extra_paths
+        and not result.findings
+    ):
+        if json_flag:
+            # Still one JSON document on stdout (zero servers), as scan does.
+            _write_json(result)
+        else:
+            con.print()
+        con.print(
             "No MCP config files found on this machine. "
             "Run [bold]mcp-audit discover[/bold] to see where mcp-audit looks."
         )
@@ -173,22 +239,20 @@ def check(
     if report is not None:
         report_lower = report.strip().lower()
         if report_lower != "pdf":
-            console.print(
+            con.print(
                 f"[red]Unknown report format:[/red] {report!r}. "
                 "Currently supported: pdf"
             )
             raise typer.Exit(2)
-        _write_pdf_report(result, output_file, org, console)
-        _maybe_ping(grade, console)
+        _write_pdf_report(result, output_file, org, con)
+        _maybe_ping(grade, con)
         raise typer.Exit(_exit_code(result))
 
     # ── JSON output ───────────────────────────────────────────────────────────
     if json_flag:
-        sys.stdout.write(
-            result.model_dump_json(by_alias=True, indent=2, exclude_none=False)
-        )
-        sys.stdout.write("\n")
-        _maybe_ping(grade, console)
+        _write_json(result)
+        # stdout is the JSON document; a ping-failure line must not follow it.
+        _maybe_ping(grade, con)
         raise typer.Exit(_exit_code(result))
 
     # ── Verbose output ────────────────────────────────────────────────────────
@@ -210,6 +274,14 @@ def check(
         _handle_register(console)
 
     raise typer.Exit(_exit_code(result))
+
+
+def _write_json(result: ScanResult) -> None:
+    """Write *result* to stdout as the ``check --json`` document."""
+    sys.stdout.write(
+        result.model_dump_json(by_alias=True, indent=2, exclude_none=False)
+    )
+    sys.stdout.write("\n")
 
 
 def _maybe_ping(grade: str, console: Console) -> None:

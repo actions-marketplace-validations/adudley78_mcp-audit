@@ -37,13 +37,14 @@ mcp-audit fix --apply --fix-type credentials
 
 ## Supported fix types
 
-| Fix type      | Finding IDs        | What it does                                                  |
-|---------------|--------------------|---------------------------------------------------------------|
-| `credentials` | CRED-001, CRED-002 | Replaces plaintext secret values with `${ENV_VAR_NAME}`       |
-| `transport`   | TRANSPORT-001      | Rewrites `http://` server URLs to `https://`                  |
-| `pinning`     | SC-001, SC-002     | Replaces a typosquatted package name with the verified name and pins to `@latest-version` |
+| Fix type      | Finding IDs                | What it does                                                  |
+|---------------|-----------------------------|---------------------------------------------------------------|
+| `credentials` | CRED-001, CRED-002, CRED-003 | Replaces plaintext secret values with `${ENV_VAR_NAME}`       |
+| `transport`   | TRANSPORT-001               | Rewrites `http://` server URLs to `https://`                  |
+| `pinning`     | SC-001, SC-002               | Replaces a typosquatted package name with the verified name and pins to `@latest-version` |
+| `pinning`     | VULN-UNPINNED, LOCK-004     | Pins a floating spec (`npx foo`, `foo@^1.2.3`) to an exact version — the lock's `resolved_version` when a lock exists, otherwise the current registry resolution |
 
-All three strategies are **idempotent** — re-running `fix` after `--apply`
+All strategies are **idempotent** — re-running `fix` after `--apply`
 produces no further diff.
 
 ---
@@ -62,10 +63,13 @@ produces no further diff.
 
 ## Fix type details
 
-### Credentials (`CRED-001`, `CRED-002`)
+### Credentials (`CRED-001`, `CRED-002`, `CRED-003`)
 
 The credentials analyzer emits CRED-001 when a secret is found in a server's
-`env` dict, and CRED-002 when it appears in `args`.
+`env` dict, CRED-002 when it appears in `args`, and CRED-003 when a literal
+(non-env-referenced) value sits behind a recognised authentication header key
+(`Authorization`, `x-api-key`, `x-auth-token`, etc. — see
+[`docs/severity-framework.md`](severity-framework.md)).
 
 **What `fix` does:**
 
@@ -75,6 +79,25 @@ The credentials analyzer emits CRED-001 when a secret is found in a server's
   manager separately.
 - **CRED-002** — applies a regex substitution on the matching arg token,
   replacing the matched secret substring with `${REDACTED_SECRET}`.
+- **CRED-003** — replaces the header value with a synthesised
+  `${HEADER_NAME}` placeholder derived from the header key (e.g.
+  `Authorization` → `${AUTHORIZATION}`, `X-Api-Key` → `${X_API_KEY}`). Any
+  existing scheme prefix (`Bearer `, `Basic `, `Token `) is preserved
+  verbatim — only the credential tail is replaced.
+
+**Before (CRED-003):**
+```json
+"headers": {
+  "Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9..."
+}
+```
+
+**After:**
+```json
+"headers": {
+  "Authorization": "Bearer ${AUTHORIZATION}"
+}
+```
 
 **Before:**
 ```json
@@ -161,6 +184,43 @@ pinning fix is skipped with a warning and other fix types still apply.
 
 ---
 
+### Version pinning (`VULN-UNPINNED`, `LOCK-004`)
+
+`VULN-UNPINNED` fires when a server's package spec floats (no version, or a
+semver range like `^1.2.3`). `LOCK-004` fires when `mcp-audit lock --verify`
+finds the config's resolved version has drifted from what `mcp-lock.json`
+recorded. Both are fixed the same way: pin to an exact version.
+
+**What `fix` does:**
+
+1. Looks for a nearest-ancestor `mcp-lock.json` for the server being fixed.
+   If found and its `package.resolved_version` is set, that version is used
+   directly — **no network call.**
+2. Otherwise (no lock, or offline with no lock entry), resolves the current
+   latest version live from npm/PyPI, identical to the `SC-001`/`SC-002` path.
+3. Replaces the current spec with `package@version`. A semver range that got
+   collapsed to an exact pin is called out explicitly in the fix message; a
+   pin sourced from live resolution (not the lock) suggests running
+   `mcp-audit lock` to record it.
+
+**Before (unpinned):**
+```json
+"command": "npx",
+"args": ["-y", "some-mcp-server"]
+```
+
+**After (locked, pinned to the lock's resolved version, no network call):**
+```json
+"command": "npx",
+"args": ["-y", "some-mcp-server@2.5.0"]
+```
+
+`--offline` with no lock entry for the server skips the fix with the same
+warning shape as `SC-001`/`SC-002`; `--offline` with a lock entry still
+pins, since no network call is needed either way.
+
+---
+
 ## Using with an existing scan output
 
 If you already ran `mcp-audit scan --format json --output scan.json`, you can
@@ -209,7 +269,7 @@ Add `mcp-audit fix` as an auto-remediation step after a failing scan gate:
 
 ```yaml
 - name: Scan MCP configs
-  uses: adudley78/mcp-audit@v0.11.0
+  uses: adudley78/mcp-audit@v0.25.0
   with:
     severity-threshold: high
     fail-on-findings: 'true'
@@ -231,4 +291,8 @@ The following are intentionally not handled by `fix` in v0.11.0:
 - Rug-pull state resets
 - Governance policy auto-patching (use `mcp-audit killchain --patch yaml`)
 - Interactive mode / per-finding prompts
+- Codex's `config.toml` (TOML) and Gemini CLI `settings.json` files with
+  comments: `fix` writes JSON only and refuses them, so you edit them by hand
+  (`check` does not offer `fix` for a TOML file). A Gemini CLI `httpUrl` is
+  upgraded by the TRANSPORT-001 fix like `url`.
 - `--revert` flag (use the `.bak` file)

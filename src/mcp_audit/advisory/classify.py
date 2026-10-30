@@ -64,6 +64,49 @@ NON_ADVISORY_IDS: Final[frozenset[str]] = frozenset(
         # not because it is unmapped.
         "BL-001",  # malformed baseline file — operational error
         "COMM-000",  # community rule template stub — never matches real configs
+        "TRUST-004",  # symlinked user-global/explicit config — dotfile-manager
+        # shape (GNU Stow, chezmoi, yadm); always INFO, not a vulnerability
+        "TRUST-005",  # symlinked directory not traversed — coverage note, not
+        # an assertion about anything found or missing under it
+        "SKILL-004",  # bundled-scripts inventory — positive/neutral signal,
+        # not itself a vulnerability
+        "MOD-005",  # Claude Code mod inventory (STORY-0085) — neutral, not a defect
+        "SC-009",  # pinned version not comparable with the recorded fix
+        # (STORY-0105) — INFO "undecidable", asserts no affected release
+        "HARNESS-007",  # enabledMcpjsonServers inventory (STORY-0090) — INFO;
+        # Claude Code writes it when you approve a server, not a defect by itself
+        "INSTR-001",  # instruction file changed since the last scan (STORY-0113) —
+        # local state about this machine, usually the user's own edit
+        "INSTR-002",  # the change brought a finding (STORY-0113) — the finding
+        # itself is the advisory; this only dates it
+        "CFHYG-008",  # Foundry resource chosen in project settings (STORY-0108) —
+        # INFO, asks a person to confirm ownership; not itself a defect
+        "SANDBOX-004",  # sandbox keys Claude Code ignores in this file
+        # (STORY-0093) — INFO dead-config note, not a vulnerability
+        "AGENT-002",  # disallowedTools specifier removes the whole tool — the
+        # subagent ends up with less access than intended, not more
+        "AGENT-004",  # inline subagent MCP server inventory (STORY-0094); the
+        # server's own findings carry any vulnerability
+        "LOCK-010",  # lock_version 2 resolution context changed (STORY-0116);
+        # INFO, explains a difference, asserts no defect
+        "LOCK-012",  # lock file reformatted, content intact (STORY-0116)
+        "LOCK-013",  # launch line carries a credential the lock redacts
+        # (STORY-0118); a deployment note, not a vulnerability in a package
+        "MANAGED-001",  # managed MCP policy inventory (STORY-0112) — INFO
+        "MANAGED-002",  # server the managed policy keeps from loading — dead
+        # config, the policy working as intended, not a vulnerability
+        "MANAGED-003",  # managed settings without MCP policy — organisation
+        # posture with no package or server to attach an advisory to
+        "REACH-001",  # credential files a Claude Code session can read
+        "REACH-002",  # Claude Code login store readable by other accounts
+        "REACH-003",  # .env files with no Read deny rule (STORY-0114) — all
+        # three describe one machine's files, never a package; a home-directory
+        # inventory must never become a published advisory
+        "ANNOT-001",  # annotation contradicts the tool's own schema (STORY-0136) —
+        # a heuristic label check, LOW; not published as an advisory against a
+        # package until its precision is measured high enough to defend
+        "VULN-UNRESOLVED",  # --check-vulns lookup that could not run
+        # (STORY-0106) — operational note, asserts nothing about the package
     }
 )
 
@@ -89,6 +132,7 @@ _CLASS_BY_ID: Final[dict[str, str]] = {
     # The three classes `mcp-audit fix` remediates.
     "CRED-001": "hardcoded-secret",
     "CRED-002": "hardcoded-secret",
+    "CRED-003": "hardcoded-secret",
     "CFHYG-003": "hardcoded-secret",
     "COMM-008": "hardcoded-secret",
     "COMM-009": "hardcoded-secret",
@@ -110,6 +154,9 @@ _CLASS_BY_ID: Final[dict[str, str]] = {
     "TRANSPORT-003": "unpinned-dependency",
     "TRANSPORT-004": "network-exposure",
     "SC-004": "known-vulnerability",
+    # An OSV MAL-* record is a published advisory against the package
+    # (STORY-0097); SC-007 keeps the SC- prefix's "typosquat" class.
+    "SC-008": "known-vulnerability",
     "COMM-003": "sandbox-disabled",
     "COMM-010": "unpinned-dependency",
     "COMM-012": "network-exposure",
@@ -126,15 +173,39 @@ _CLASS_BY_ID: Final[dict[str, str]] = {
     "COMM-033": "untrusted-config-origin",
     "COLLIDE-001": "tool-collision",
     "TRUST-001": "untrusted-config-origin",
+    "TRUST-002": "untrusted-config-origin",
+    "TRUST-006": "hook-execution",  # git config runs a command (STORY-0089)
+    "TRUST-007": "untrusted-config-origin",  # embedded bare repo / git hooks
+    "TRUST-008": "untrusted-config-origin",
+    # An instruction-file import from outside the repository or from an
+    # ignored file (STORY-0098); MEM-004 keeps the MEM- prefix's class.
+    "MEM-003": "untrusted-config-origin",
     "CFHYG-005": "hook-execution",
+    "HARNESS-002": "untrusted-config-origin",
+    "PLUGIN-001": "unverified-provenance",
+    "PLUGIN-002": "unpinned-dependency",
+    "PLUGIN-003": "unverified-provenance",  # checkout is not the pin (STORY-0096)
+    "PLUGIN-004": "unverified-provenance",  # update channel can't hold the pin
+    "MOD-002": "toxic-flow",
+    "MOD-003": "tool-poisoning",
+    "MOD-006": "untrusted-config-origin",
+    "SANDBOX-005": "config-hygiene",
+    "AGENT-001": "excessive-scope",
+    "AGENT-003": "hook-execution",
 }
 
 # Prefix → class, applied when no exact ID match exists. Longest prefix wins.
 _CLASS_BY_PREFIX: Final[dict[str, str]] = {
     "POISON-": "tool-poisoning",
+    "DELEG-": "tool-poisoning",
     "SKILL-": "tool-poisoning",
     "MEM-": "tool-poisoning",
     "HOOK-": "hook-execution",
+    "MOD-": "hook-execution",
+    "HARNESS-": "excessive-scope",
+    "PERM-": "excessive-scope",
+    "SANDBOX-": "sandbox-disabled",
+    "AGENT-": "excessive-scope",
     "SC-": "typosquat",
     "CFHYG-": "config-hygiene",
     "TOXIC-": "toxic-flow",
@@ -145,6 +216,7 @@ _CLASS_BY_PREFIX: Final[dict[str, str]] = {
     "EXT-": "ide-extension",
     "SAST-": "source-vulnerability",
     "GOV-": "policy-violation",
+    "MANAGED-": "policy-violation",
     "DRIFT-": "configuration-drift",
     "BL-": "operational-error",
     "COMM-": "community-rule",
@@ -181,6 +253,7 @@ _PACKAGE_INTRINSIC_PREFIXES: Final[tuple[str, ...]] = (
     "SAST-",
     "EXT-",
     "COLLIDE-",
+    "DELEG-",
 )
 
 

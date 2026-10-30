@@ -210,6 +210,132 @@ When wiring a new flag or subcommand into `src/mcp_audit/cli/`:
 
 2. **Tests cover the feature working end-to-end**, never via license patches.
 
+## Cursor cloud agents
+
+`.cursor/environment.json` lets a Cursor cloud agent boot a working dev box
+for this repo instead of editing blind. Its `install` script mirrors the
+`ubuntu-latest` / Python 3.12 CI cell (`test-all-extras` in
+`.github/workflows/ci.yml`): `uv pip install -e ".[...]" --system`, cosign,
+minisign, semgrep, and Playwright's `chromium` browser. There is no `start`
+command or Dockerfile — this is a CLI with no long-running service, and a
+pinned snapshot is one more thing to silently drift from CI.
+
+**The extras list is generated FROM `ci.yml` at install time, not restated.**
+The install script `grep`/`sed`s the `test-all-extras` job's install line out
+of `.github/workflows/ci.yml` so it can never drift from the CI cell it
+mirrors (R53). If that job's name or install-line shape ever changes, the
+install script fails loudly (`exit 1`, naming the file and the expected line
+shape) rather than silently falling back to a hardcoded extras list — a
+bootstrap that returns a plausible-but-wrong environment is worse than one
+that refuses.
+
+**semgrep is installed system-wide via `pipx`, deliberately outside the
+Python environment mcp-audit's own deps live in.** `pyproject.toml`'s `dev`
+extra explains why: `pysemgrep` breaks with a `pkg_resources` import error
+under `capture_output=True` (used by `sast/runner.py`) when it shares an
+environment with mcp-audit's own dependencies.
+
+**cosign is pinned to `v3.0.6` by hand, not parsed.** `ci.yml` installs
+cosign via `sigstore/cosign-installer@6f9f177...` (pinned action SHA, v4.1.2)
+without overriding its `cosign-release` input, so CI gets that installer
+version's *default* — `v3.0.6` — a value that lives inside the third-party
+action's own `action.yml`, not as text in this repo's `ci.yml`. That is one
+hop too fragile to parse robustly, so it is hardcoded here instead, with the
+exact SHA-256 the installer action itself verifies against (never
+trust-on-first-use of a downloaded binary). Re-pin together with
+`docs/offline-verification-findings.md` if `ci.yml`'s installer SHA ever
+moves — that document's measurements are pinned to this exact cosign
+version. **minisign is installed via `apt-get`, matching `ci.yml` exactly**
+(no version pin exists there either — Ubuntu's apt repo ships whatever is
+current). Both degrade gracefully rather than failing the whole install: an
+unsupported OS/arch, a failed download, a checksum mismatch, a missing
+`apt-get`, or no root/passwordless sudo all print a `WARNING` and continue.
+A cloud agent that cannot install one of these still gets a usable box — see
+the verify-block note below for why that box's green is then weaker than
+CI's.
+
+**No release or signing credential is ever configured as a cloud-agent
+secret** — no PyPI token, no minisign project signing key, no `keys/`
+material, no GitHub release-write token. Publishing happens only in GitHub
+Actions. Since R73, though, merging a version-bump PR starts a release (see
+"Releasing" below), so an agent allowed to merge one is allowed to release. Ephemeral keypairs generated inside a
+test are fine (the signing round-trip tests already do this) — only the
+project's own signing key is off-limits.
+
+### Verify block
+
+```bash
+pytest tests/ -q -rs
+ruff check src/ tests/ && ruff format --check src/ tests/
+uv run python scripts/update_test_count.py --check
+uv run python scripts/validate_owasp_mapping.py
+mcp-audit sast --help
+```
+
+Use `-rs` (report skips), not a bare `-q`. **A green `pytest` run with
+skipped signing tests is not equivalent to CI's green.** `ci.yml`'s
+`test-all-extras` job is the only CI leg with cosign, minisign, *and* (being
+`ubuntu-latest` with passwordless sudo) a usable `unshare --net` — every
+other leg already runs a weaker check than that one job. If your cloud
+agent's `install` step could not install cosign and/or minisign (see above),
+the round-trip signing tests in `tests/test_advisory_sign.py`,
+`tests/test_cli_advise.py`, and `tests/test_advisory_freshness.py` — the
+tests that guard the advisory-feed signing invariants this project's
+`CLAUDE.md` calls a *contract* — skip instead of running. Read the `-rs`
+skip summary before trusting a green run on signing-adjacent changes.
+`TestFeedVerificationIsOfflineByConstruction` (the `unshare --net` proof) is
+structural and skips on any non-Linux host or one without passwordless sudo,
+regardless of what this install script does.
+
+**Environment discrepancy, reported, not fixed here:** this verify block's
+`pytest tests/ -q -rs` runs against whatever `--system` installed (all of
+`.[...]` from `ci.yml`'s `test-all-extras` job, including `sbom`). Some
+prior guidance in this project instead documented `uv run --extra dev
+--extra attestation pytest` — a *different* environment: `uv run` resolves
+its own project-local `.venv` (not the `--system` site-packages this
+install script writes to) and, missing `--extra sbom`, leaves
+`cyclonedx-python-lib` absent, which skips all `tests/test_cyclonedx.py` and
+`tests/test_cyclonedx_output.py` tests (22 skips, measured) even when that
+form is followed exactly. Use a bare `pytest tests/ -q -rs` (this section's
+form) against the `--system` install, not `uv run pytest`, when verifying a
+cloud-agent box.
+
+## Releasing
+
+Merging a version bump to `main` is the release. A release PR changes
+`[project].version` in `pyproject.toml` and promotes the CHANGELOG
+`[Unreleased]` section to `## [X.Y.Z]`. When it merges,
+`.github/workflows/release-on-version-bump.yml` checks (via
+`scripts/release_gate.py tag`) that this commit changed the version, that the
+version is new and higher than every release tag, and that the CHANGELOG has
+its section. It then tags that commit `vX.Y.Z` and dispatches `release.yml`
+on the tag with `publish=true`. A commit that only edits `pyproject.toml`
+(a dependency bump) never tags.
+
+`release.yml`'s `gate` job (`scripts/release_gate.py publish`) decides for
+every run whether it may publish: the ref must be a `vX.Y.Z` tag on `main`
+that matches `pyproject.toml` at that commit, CHANGELOG must have a non-empty
+section for it, and no release tag may be higher. A plain
+`workflow_dispatch` is still a build-only dry run. Pushing a tag by hand
+still works, and passes the same gate.
+
+**This means merge rights are release rights.** Anyone, or any agent, who
+can merge a PR that bumps `[project].version` publishes that version to PyPI
+and GitHub. The publishing credentials themselves still live only in GitHub
+Actions (the workflow's `GITHUB_TOKEN` and PyPI trusted publishing); none is
+ever configured as an agent secret.
+
+If the tag was created but the dispatch failed, recover with
+`gh workflow run release.yml --ref vX.Y.Z -f publish=true`. Re-running the
+bump workflow won't help: it sees the tag and reports "already tagged".
+Never move to a personal token for the tag push: a tag pushed with one
+starts `release.yml` on its own, and the dispatch would then start a second
+run.
+
+A stray higher `vX.Y.Z` tag (for example one created off `main`) makes the
+gate refuse every later release as "behind". It fails safe, but the fix is
+to delete that tag.
+
 ## What we won't accept
 
 - PRs that remove or weaken existing detection patterns without strong justification

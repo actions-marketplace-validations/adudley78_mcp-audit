@@ -9,8 +9,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "registry-drift.yml"
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-SETUP_PYTHON = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
-UPLOAD = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+SETUP_PYTHON = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 
 
 def _load() -> dict:
@@ -74,3 +74,19 @@ def test_runs_audit_script_report_only() -> None:
     assert "python scripts/audit_registry.py --refresh" in text
     assert "python scripts/check_registry_drift.py" in text
     assert "persist-credentials: false" in text
+
+
+def test_installs_mcp_audit_before_running_the_audit_script() -> None:
+    """R34 regression pin: audit_registry.py's capability checks import
+    mcp_audit.analyzers.toxic_flow. Without an install step first, the job
+    fails with ModuleNotFoundError before it ever reaches the network audit
+    (this happened on the R34 PR itself — caught by this workflow, not by
+    the test suite, since the dev venv always has the package installed)."""
+    steps = _load()["jobs"]["audit"]["steps"]
+    names = [s.get("name", "") for s in steps]
+    install_idx = next(
+        i for i, s in enumerate(steps) if "pip install" in s.get("run", "")
+    )
+    audit_idx = next(i for i, n in enumerate(names) if n.startswith("Audit"))
+    assert install_idx < audit_idx, "install step must precede the audit step"
+    assert "-e ." in steps[install_idx]["run"]

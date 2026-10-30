@@ -25,6 +25,7 @@ from mcp_audit.cli import app
 from mcp_audit.discovery import DiscoveredConfig
 from mcp_audit.models import ServerConfig, TransportType
 from mcp_audit.vulnerability.models import Ecosystem, ResolvedPackage
+from tests.conftest import unwrapped
 
 runner = CliRunner()
 
@@ -148,14 +149,16 @@ class TestSbomCommand:
         missing = tmp_path / "does_not_exist.json"
         result = runner.invoke(app, ["sbom", str(missing)])
         assert result.exit_code == 2
-        assert "not found" in result.output.lower() or "error" in result.output.lower()
+        assert "not found" in unwrapped(result.output.lower()) or (
+            "error" in result.output.lower()
+        )
 
     def test_no_config_files_found_exits_0(self, tmp_path: Path) -> None:
         """No MCP config files discovered → exit 0 with message."""
         with patch("mcp_audit.cli.sbom.discover_configs", return_value=[]):
             result = runner.invoke(app, ["sbom", str(tmp_path)])
         assert result.exit_code == 0
-        assert "no mcp config" in result.output.lower()
+        assert "no mcp config" in unwrapped(result.output.lower())
 
     def test_config_found_but_no_servers_exits_0(self, tmp_path: Path) -> None:
         """Config file found but it contains no servers → exit 0."""
@@ -172,7 +175,7 @@ class TestSbomCommand:
             result = runner.invoke(app, ["sbom", str(cfg_path)])
 
         assert result.exit_code == 0
-        assert "no servers" in result.output.lower() or "0" in result.output
+        assert "no servers" in unwrapped(result.output.lower()) or "0" in result.output
 
     def test_cyclonedx_import_error_exits_2(self, tmp_path: Path) -> None:
         """When cyclonedx-python-lib is missing, exit 2 with a clean message."""
@@ -257,7 +260,7 @@ class TestSbomCommand:
             )
 
         assert result.exit_code == 2
-        assert "unknown format" in result.output.lower()
+        assert "unknown format" in unwrapped(result.output.lower())
 
     def test_offline_skips_transitive_deps(self, tmp_path: Path) -> None:
         """--offline mode uses registry-only data, not fetch_transitive_deps."""
@@ -312,6 +315,96 @@ class TestSbomCommand:
             result = runner.invoke(app, ["sbom", str(cfg_path), "--offline"])
 
         assert "offline" in result.output.lower()
+
+    def test_version_range_resolved_with_visible_warning(self, tmp_path: Path) -> None:
+        """A semver range in the config is resolved, not silently degraded.
+
+        Regression test for the deps.dev-404-on-range gap: a config entry
+        like `npx foo@^1.2.3` must not silently collapse to a top-level-only
+        SBOM entry carrying the literal range string as its version.
+        """
+        cfg_path = tmp_path / "mcp.json"
+        cfg_path.write_text('{"mcpServers":{}}', encoding="utf-8")
+        servers = [_server("fs")]
+
+        with (
+            patch(
+                "mcp_audit.cli.sbom.discover_configs",
+                return_value=[_discovered_config(cfg_path)],
+            ),
+            patch("mcp_audit.cli.sbom.parse_config", return_value=servers),
+            patch(
+                "mcp_audit.cli.sbom.extract_ecosystem_and_version",
+                return_value=(Ecosystem.NPM, "foo", "^1.2.3"),
+            ),
+            patch(
+                "mcp_audit.cli.sbom.resolve_latest_version",
+                return_value="1.9.0",
+            ) as mock_resolve,
+            patch(
+                "mcp_audit.cli.sbom.fetch_transitive_deps",
+                return_value=[
+                    ResolvedPackage(
+                        ecosystem=Ecosystem.NPM,
+                        name="foo",
+                        version="1.9.0",
+                        direct=True,
+                        source_server="fs",
+                    )
+                ],
+            ) as mock_fetch,
+            patch(
+                "mcp_audit.output.cyclonedx.CycloneDxFormatter.format",
+                return_value=_fake_cyclonedx_output(servers),
+            ),
+        ):
+            result = runner.invoke(app, ["sbom", str(cfg_path)])
+
+        assert result.exit_code == 0
+        assert "range" in result.output.lower()
+        assert "^1.2.3" in result.output
+        assert "1.9.0" in result.output
+        mock_resolve.assert_called_once_with(Ecosystem.NPM, "foo")
+        # fetch_transitive_deps must receive the resolved version, not the range
+        mock_fetch.assert_called_once_with(
+            Ecosystem.NPM, "foo", "1.9.0", source_server="fs"
+        )
+
+    def test_version_range_resolution_failure_degrades_visibly(
+        self, tmp_path: Path
+    ) -> None:
+        """If resolving the range fails, the SBOM still gets a top-level-only
+        entry — but with a printed warning, not silent degradation."""
+        cfg_path = tmp_path / "mcp.json"
+        cfg_path.write_text('{"mcpServers":{}}', encoding="utf-8")
+        servers = [_server("fs")]
+
+        with (
+            patch(
+                "mcp_audit.cli.sbom.discover_configs",
+                return_value=[_discovered_config(cfg_path)],
+            ),
+            patch("mcp_audit.cli.sbom.parse_config", return_value=servers),
+            patch(
+                "mcp_audit.cli.sbom.extract_ecosystem_and_version",
+                return_value=(Ecosystem.NPM, "foo", "^1.2.3"),
+            ),
+            patch(
+                "mcp_audit.cli.sbom.resolve_latest_version",
+                side_effect=ValueError("could not determine latest version"),
+            ),
+            patch("mcp_audit.cli.sbom.fetch_transitive_deps") as mock_fetch,
+            patch(
+                "mcp_audit.output.cyclonedx.CycloneDxFormatter.format",
+                return_value=_fake_cyclonedx_output(servers),
+            ),
+        ):
+            result = runner.invoke(app, ["sbom", str(cfg_path)])
+
+        assert result.exit_code == 0
+        assert "range" in result.output.lower()
+        assert "skipped" in result.output.lower()
+        mock_fetch.assert_not_called()
 
     def test_parse_config_value_error_prints_warning_and_continues(
         self, tmp_path: Path

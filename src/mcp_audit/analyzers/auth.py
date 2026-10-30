@@ -12,7 +12,8 @@ AUTH-001 — Remote server without authentication
 
     Research basis: arXiv 2605.22333 measured 40.55% of 7,973 live remote MCP
     servers as requiring no authentication; Censys counted 12,520 internet-exposed
-    MCP services, the majority unauthenticated.  CWE-306 / OWASP MCP06.
+    MCP services and reports that many run without authentication.  CWE-306 /
+    OWASP MCP06.
 
 AUTH-002 — OAuth-configured server without audience binding
     Fires when a server config carries OAuth-related settings but lacks an
@@ -40,7 +41,15 @@ from mcp_audit.models import Finding, ServerConfig, Severity, TransportType
 # ── AUTH-001: auth-signal detection constants ─────────────────────────────────
 
 # Header names (case-insensitive) that carry authentication material.
-_AUTH_HEADER_NAMES: frozenset[str] = frozenset(
+#
+# Shared with ``analyzers/credentials.py`` (CRED-003) — imported there, never
+# copied. AUTH-001 suppresses on a header in this set; CRED-003 fires on one
+# whose value is a literal rather than an environment reference. A header
+# name that suppresses AUTH-001 but is absent from CRED-003's set would
+# recreate the clean-report hole under a different key, so both analyzers
+# read the same object. ``tests/test_auth_analyzer.py`` asserts the identity
+# (not just equality) of the two references.
+AUTH_HEADER_NAMES: frozenset[str] = frozenset(
     {
         "authorization",
         "x-api-key",
@@ -64,6 +73,13 @@ _AUTH_FIELD_NAMES: frozenset[str] = frozenset(
         "authorization",
         "access_token",
         "secret",
+        # Gemini CLI: google_credentials / service_account_impersonation /
+        # dynamic_discovery each add credentials to every request (STORY-0110).
+        "authprovidertype",
+        # Codex: the variable holding a bearer token, and a local command that
+        # prints the request headers (STORY-0110).
+        "bearer_token_env_var",
+        "http_headers_helper",
     }
 )
 
@@ -87,8 +103,14 @@ _AUDIENCE_KEYS: frozenset[str] = frozenset(
         "resource",
         "resource_indicator",
         "aud",
+        # Gemini CLI MCPOAuthConfig: ``audiences`` (string[]), STORY-0110.
+        "audiences",
     }
 )
+
+# Top-level (outside the OAuth block) resource keys: Codex ``oauth_resource``
+# (``codex-rs/config/src/mcp_types.rs``), STORY-0110.
+_TOP_LEVEL_RESOURCE_KEYS: tuple[str, ...] = ("oauth_resource",)
 
 # Wildcard audience values that are functionally equivalent to "no binding".
 _WILDCARD_AUDIENCE_VALUES: frozenset[str] = frozenset({"*", "any", ""})
@@ -182,7 +204,7 @@ def _classify_host(hostname: str) -> str:
 
 def _has_auth_in_headers(server: ServerConfig) -> bool:
     """Return True if the server has at least one authentication header."""
-    return any(key.lower() in _AUTH_HEADER_NAMES for key in server.headers)
+    return any(key.lower() in AUTH_HEADER_NAMES for key in server.headers)
 
 
 def _has_auth_in_raw_fields(raw: dict) -> bool:
@@ -284,6 +306,15 @@ def _oauth_audience_state(oauth_block: dict, env: dict[str, str]) -> tuple[bool,
     for key in oauth_block:
         norm = key.lower()
         if norm in _AUDIENCE_KEYS:
+            if isinstance(oauth_block[key], list):
+                concrete = [
+                    str(v).strip()
+                    for v in oauth_block[key]
+                    if str(v).strip() not in _WILDCARD_AUDIENCE_VALUES
+                ]
+                if not concrete:
+                    return False, f"no concrete audience in {key!r}"
+                return True, f"audience bound via {key!r}"
             val = str(oauth_block[key]).strip()
             if val in _WILDCARD_AUDIENCE_VALUES:
                 return False, f"wildcard audience ({key!r}: {val!r})"
@@ -375,7 +406,8 @@ class AuthAnalyzer(BaseAnalyzer):
                 "The server is internet-routable. A measurement study"
                 " (arXiv 2605.22333) found 40.55% of 7,973 live remote MCP"
                 " servers require no authentication; Censys counted 12,520"
-                " internet-exposed MCP services, the majority unauthenticated."
+                " internet-exposed MCP services and reports that many run"
+                " without authentication."
             )
 
         return Finding(
@@ -415,6 +447,13 @@ class AuthAnalyzer(BaseAnalyzer):
         oauth_block = _extract_oauth_block(server.raw)
         if oauth_block is None:
             return None
+        for key in _TOP_LEVEL_RESOURCE_KEYS:
+            value = server.raw.get(key)
+            if (
+                isinstance(value, str)
+                and value.strip() not in _WILDCARD_AUDIENCE_VALUES
+            ):
+                return None
 
         bound, evidence = _oauth_audience_state(oauth_block, server.env)
         if bound:

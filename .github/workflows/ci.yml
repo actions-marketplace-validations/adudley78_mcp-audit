@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -88,6 +88,17 @@ jobs:
         # (tests/test_advisory_sign.py) actually runs rather than skips.
         run: pytest tests/ -x -q
 
+      - name: Run demo/lock/run.sh (README first-screen fixture)
+        # Resolves real npm package versions over the network, so it is
+        # gated on this env var (see tests/test_demo_lock.py, which runs the
+        # same script and asserts the same LOCK-001 count) rather than
+        # unconditional on every leg. This is also the ubuntu/py3.12 leg
+        # `update_test_count.py --check` below trusts to match the demo
+        # output the README shows.
+        env:
+          MCP_AUDIT_DEMO_NETWORK: "1"
+        run: bash demo/lock/run.sh
+
       - name: Verify test-count docs in sync
         # Runs in this job (all optional extras installed) so the collected
         # count matches the full 1,391-test baseline written into the docs.
@@ -117,7 +128,7 @@ jobs:
         # uv fails the build immediately. latest-known was tried 2026-08-22
         # and resolved uv 0.12.4, which cannot fetch 3.12.14. Do not pin a
         # uv version — Dependabot does not bump action input strings.
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "latest"
 
@@ -142,7 +153,7 @@ jobs:
           RUNTIME_URL="https://raw.githubusercontent.com/pypa/gh-action-pypi-publish/${SHA}/requirements/runtime.txt"
           echo "Fetching $RUNTIME_URL"
           RUNTIME=$(curl -fsSL "$RUNTIME_URL")
-          TWINE=$(printf '%s\n' "$RUNTIME" | sed -n 's/^twine==//p' | head -n1)
+          TWINE=$(printf '%s\n' "$RUNTIME" | sed -n 's/^twine==\([^ ]*\).*/\1/p' | head -n1)
           if [ -z "$TWINE" ]; then
             echo "ERROR: no twine== pin in runtime.txt at $SHA" >&2
             printf '%s\n' "$RUNTIME" | head -n20 >&2
@@ -156,6 +167,36 @@ jobs:
           scripts/generate_wheel_sbom.sh \
             dist/*.whl \
             dist/mcp-audit-scanner-wheel.cdx.json
+
+  action-input-contracts:
+    name: release.yml action input contracts
+    runs-on: ubuntu-latest
+    # release.yml only triggers on a v*.*.* tag push or workflow_dispatch —
+    # never pull_request — so a Dependabot bump to any action it pins
+    # (upload-artifact, download-artifact, action-gh-release,
+    # gh-action-pypi-publish, setup-uv, checkout) gets zero PR-time exercise
+    # of its actual input contract; see docs/release-ci-blind-spot.md for the
+    # full per-action execution table this job closes the gap in.
+    #
+    # This needs network (fetches each pinned action's action.yml from
+    # raw.githubusercontent.com at the exact pinned SHA) and runs
+    # unconditionally on every push/PR, same trade-off wheel-check (above)
+    # already accepts for its Twine-version bridge: a GitHub outage can fail
+    # an unrelated PR, but a check that only runs somewhere nobody looks
+    # would not have caught the gap #94 sits in.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install "pyyaml>=6.0,<7.0"
+
+      - name: Check release.yml action input contracts
+        run: python scripts/check_release_action_contracts.py
 
   binary-smoke:
     name: Binary smoke (${{ matrix.target }})
@@ -220,7 +261,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 

@@ -70,29 +70,45 @@ def test_kill_process_tree_reaps_grandchild() -> None:
         text=True,
     )
     try:
-        time.sleep(0.4)
-        assert proc.poll() is None, "precondition: parent still running"
         pgrep = shutil.which("pgrep")
         assert pgrep is not None
-        kids = subprocess.run(  # noqa: S603
-            [pgrep, "-P", str(proc.pid)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        grand_pids = [int(x) for x in kids.stdout.split() if x.strip().isdigit()]
+        # Poll rather than sleep a fixed 0.4 s: on a loaded macOS runner the
+        # child interpreter can take longer than that to start and spawn the
+        # grandchild (seen on PR #155's CI, 2026-10-13).
+        grand_pids: list[int] = []
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            assert proc.poll() is None, "precondition: parent still running"
+            kids = subprocess.run(  # noqa: S603
+                [pgrep, "-P", str(proc.pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            grand_pids = [int(x) for x in kids.stdout.split() if x.strip().isdigit()]
+            if grand_pids:
+                break
+            time.sleep(0.1)
         assert grand_pids, "precondition: grandchild must exist before kill"
 
         smoke._kill_process_tree(proc)
-        time.sleep(0.3)
         assert proc.poll() is not None
-        still_alive = []
-        for gp in grand_pids:
-            try:
-                os.kill(gp, 0)
-                still_alive.append(gp)
-            except OSError:
-                pass
+        # _kill_process_tree waits for proc, but nothing here waits for the
+        # grandchild: init/launchd reaps it, and until then os.kill(pid, 0)
+        # still succeeds. Poll instead of a fixed 0.3 s, the same race as
+        # the spawn wait above in the other direction.
+        still_alive = list(grand_pids)
+        deadline = time.monotonic() + 10.0
+        while still_alive and time.monotonic() < deadline:
+            time.sleep(0.1)
+            alive = []
+            for gp in still_alive:
+                try:
+                    os.kill(gp, 0)
+                    alive.append(gp)
+                except OSError:
+                    pass
+            still_alive = alive
         assert not still_alive, f"grandchild(s) survived killpg: {still_alive}"
     finally:
         smoke._kill_process_tree(proc)

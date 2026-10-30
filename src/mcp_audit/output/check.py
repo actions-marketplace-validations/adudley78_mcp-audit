@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from rich.console import Console
+from rich.markup import escape
 from rich.rule import Rule
 
+from mcp_audit.exploit import signals
+from mcp_audit.gateways import GATEWAY_UPSTREAM_CLIENTS
 from mcp_audit.models import Finding, ScanResult, Severity
 from mcp_audit.registration.models import RegistrationConfig
 
@@ -25,9 +28,11 @@ _AUTO_FIXABLE: frozenset[str] = frozenset(
     {
         "CRED-001",
         "CRED-002",
+        "CRED-003",
         "TRANSPORT-001",
         "SC-001",
         "SC-002",
+        "LOCK-004",
     }
 )
 
@@ -39,6 +44,7 @@ _HINTS: dict[str, str] = {
     # Credentials
     "CRED-001": "Run `mcp-audit fix --apply` to redact automatically.",
     "CRED-002": "Run `mcp-audit fix --apply` to redact automatically.",
+    "CRED-003": "Run `mcp-audit fix --apply` to redact automatically.",
     # Transport
     "TRANSPORT-001": "Run `mcp-audit fix --apply` to upgrade to HTTPS automatically.",
     "TRANSPORT-002": "Bind this server to 127.0.0.1 (localhost) instead of 0.0.0.0.",
@@ -50,6 +56,22 @@ _HINTS: dict[str, str] = {
     "SC-001": "Run `mcp-audit fix --apply` to replace with the verified package name.",
     "SC-002": "Run `mcp-audit fix --apply` to replace with the verified package name.",
     "SC-003": "Verify this package name against the official MCP registry before use.",
+    "SC-007": (
+        "This name copies a known package without its scope. Switch the launch "
+        "command to the package named in the finding, or confirm the publisher."
+    ),
+    "SC-009": (
+        "Check the pinned release's date against the fix on the package "
+        "registry (npm: `npm view <pkg> time`); if it predates the fix, upgrade."
+    ),
+    "SC-008": (
+        "OSV lists malicious releases of this package; follow the finding: "
+        "remove it, or pin a release the record does not list."
+    ),
+    "VULN-UNRESOLVED": (
+        "The vulnerability lookup for this package could not finish; re-run "
+        "`scan --check-vulns` later or look it up at https://osv.dev."
+    ),
     # Poisoning / prompt injection
     "POISON-001": (
         "Remove or sanitise the suspicious instruction from the tool description."
@@ -112,23 +134,218 @@ _HINTS: dict[str, str] = {
     "TOXIC-007": (
         "Review this cross-server capability chain for unintended escalation paths."
     ),
+    "TOXIC-008": (
+        "Don't load a file server and a posting server (GitHub, Slack, Jira) in"
+        " one session, or scope the posting token to the repos/channels it needs."
+    ),
+    "TOXIC-009": (
+        "Keep secret-store servers away from servers that post to GitHub, Slack"
+        " or Jira."
+    ),
+    "TOXIC-010": (
+        "Don't load a database server and a posting server together, or give"
+        " the database a read-only role and scope the posting token."
+    ),
+    "TOXIC-011": (
+        "Remove the shell server or the posting server, or allowlist the shell"
+        " commands; output can leave as a comment or a push."
+    ),
+    "INTEG-001": (
+        "Separate file-writing and shell-execution servers to prevent a"
+        " plant-then-execute chain."
+    ),
     # Config hygiene
     "CFHYG-001": (
-        "Pin the package to an explicit version (e.g. @2.1.0)"
-        " to prevent unexpected updates."
+        "Restrict the config file permissions (chmod 600) so other users"
+        " cannot read it."
     ),
-    "CFHYG-002": "Remove unused or disabled server entries from the config.",
+    "CFHYG-002": (
+        "Move the config out of this world-writable directory, or restrict"
+        " the directory's write permissions."
+    ),
     "CFHYG-003": (
-        "Replace the wildcard tool-activation pattern"
-        " with an explicit list of allowed tools."
+        "Replace the inline secret with an environment-variable reference"
+        " (e.g. ${MY_API_KEY})."
     ),
     "CFHYG-004": (
-        "Use a specific version tag instead of 'latest' to get deterministic behaviour."
+        "No action needed — environment-variable references are the right"
+        " way to hold credentials."
     ),
     "CFHYG-005": (
-        "Remove environment variable names that look like placeholders or test values."
+        "Review every hook command in this file; Claude Code will execute them"
+        " as shell. Restrict who can write the hooks section."
     ),
-    "CFHYG-006": ("Remove or update the stale server entry — it appears to be unused."),
+    "PLUGIN-001": (
+        "Run `claude plugin update <plugin>` on Claude Code 2.1.179+; if the"
+        " version still differs from the pin, uninstall the plugin."
+    ),
+    "MOD-001": (
+        "Remove the mod unless you have read its tool.check hook; organizations can"
+        " set allowManagedModsOnly on the built-in guard."
+    ),
+    "MOD-002": (
+        "Read what the mod reads and where it sends it; remove it if you can't tell."
+    ),
+    "MOD-003": "Read the mod's prompt and description hooks and diff them on update.",
+    "MOD-004": "Check which programs the mod starts and why before keeping it.",
+    "MOD-005": "Review installed mods with `claude plugin validate <dir>`.",
+    "MANAGED-001": "Run /status in Claude Code to see which managed source applies.",
+    "MANAGED-002": (
+        "Remove the server, or ask the policy owner to allowlist it by serverUrl or"
+        " serverCommand."
+    ),
+    "MANAGED-003": (
+        "Add deniedMcpServers, or allowedMcpServers with allowManagedMcpServersOnly,"
+        " to managed settings."
+    ),
+    "MANAGED-004": (
+        "Set allowManagedMcpServersOnly: true in managed settings; drop"
+        " allowedMcpServers from committed settings."
+    ),
+    "MANAGED-005": (
+        "Add serverUrl and serverCommand allowlist entries; names alone admit"
+        " any server."
+    ),
+    "REACH-001": (
+        "Add Read deny rules for these files to ~/.claude/settings.json, or set"
+        " permissions.blockReadsOutsideWorkingDirectories to true."
+    ),
+    "REACH-002": "chmod 600 the Claude Code .credentials.json file.",
+    "REACH-003": (
+        'Add "Read(./.env)" and "Read(./.env.*)" to permissions.deny in'
+        " .claude/settings.json."
+    ),
+    "MOD-006": (
+        "Remove CLAUDE_CODE_PLUGIN_DIRS from settings; load dev plugins with"
+        " --plugin-dir only when needed."
+    ),
+    "PLUGIN-002": (
+        "Ask the marketplace owner to pin the plugin entry with a full commit sha."
+    ),
+    "HARNESS-001": (
+        "Remove permissions.defaultMode: bypassPermissions (Claude Code 2.1.257+"
+        " ignores it in project settings; older versions don't); keep bypass for"
+        " one session in an isolated container."
+    ),
+    "HARNESS-002": (
+        "Remove enableAllProjectMcpServers; approve trusted servers by name with"
+        " enabledMcpjsonServers."
+    ),
+    "HARNESS-003": (
+        "Remove skipDangerousModePermissionPrompt so bypass mode stays a confirmed"
+        " step."
+    ),
+    "HARNESS-004": ("Replace the blanket Bash allow rule with specific command rules."),
+    "HARNESS-005": (
+        "Narrow the allow rule to the subcommands you need, e.g. Bash(gh pr view:*)."
+    ),
+    "HARNESS-006": (
+        "Add deny rules for rm -rf / rm -r or a PreToolUse hook that blocks deletes."
+    ),
+    "PERM-001": (
+        "Rewrite the rule in a form Claude Code applies, e.g. Bash(rm *) instead of"
+        " Bash(command:rm *); see docs/permission-rules.md."
+    ),
+    "PERM-002": "Use two slashes for an absolute path, e.g. Read(//Users/you/...).",
+    "PERM-003": "Put a space before the *, e.g. Bash(ls *) instead of Bash(ls*).",
+    "PERM-004": (
+        "Turn on the sandbox (sandbox.enabled: true) or add a PreToolUse hook;"
+        " the deny rule alone misses /usr/bin/curl and sh -c forms."
+    ),
+    "PERM-005": (
+        "Replace WebFetch(domain:*) with a bare WebFetch rule or named hosts so"
+        " the sandbox allowlist stays in force."
+    ),
+    "PERM-006": (
+        "Set sandbox.autoAllowBashIfSandboxed to false, or use content-scoped ask"
+        " rules such as Bash(git push *)."
+    ),
+    "PERM-007": (
+        "Remove the mcp__<server> allow rule until the server's findings are fixed,"
+        " or allow only tools you have checked."
+    ),
+    "SANDBOX-001": (
+        "Remove the sandbox-weakening keys from the repository's .claude settings;"
+        " a machine that needs one sets it in ~/.claude/settings.json."
+    ),
+    "SANDBOX-002": (
+        "Drop the excludedCommands or allowUnixSockets entry from the repository's"
+        " settings; keep the tool sandboxed and grant one path or host instead."
+    ),
+    "SANDBOX-003": (
+        "Remove the code-host, paste or webhook domain from the repository's"
+        " sandbox.network.allowedDomains; allow only the hosts tools need."
+    ),
+    "SANDBOX-004": (
+        "Move the key to managed or user settings, or delete it: Claude Code"
+        " ignores it in this file; see docs/permission-rules.md."
+    ),
+    "SANDBOX-005": (
+        "Add .claude/settings.local.json to .gitignore (git rm --cached it if"
+        " committed) and use ~/ instead of home paths with a username."
+    ),
+    "AGENT-001": (
+        "Remove permissionMode from the subagent file so it inherits your session's"
+        " mode; keep Claude Code at 2.1.267+."
+    ),
+    "AGENT-002": (
+        "Put the specifier rule in permissions.deny instead; disallowedTools"
+        " removes the whole tool."
+    ),
+    "AGENT-003": (
+        "Read the subagent's hook commands before trusting the folder; remove"
+        " any you did not add."
+    ),
+    "AGENT-004": (
+        "Review the subagent's inline MCP server like a .mcp.json entry; write"
+        " rules for it as mcp__<full-name>__*."
+    ),
+    "CFHYG-008": (
+        "Confirm the named Azure Foundry resource belongs to your organisation;"
+        " set the Foundry variables in user or managed settings instead."
+    ),
+    "CFHYG-006": (
+        "Unset ANTHROPIC_BASE_URL or point it at https://api.anthropic.com"
+        " — a third-party base URL receives every API call and its secrets."
+    ),
+    # Git can run code (STORY-0089)
+    "TRUST-006": (
+        "Delete the git config line in a text editor before running git or an"
+        " agent here; run one-off git with -c (e.g. -c core.fsmonitor=false)."
+    ),
+    "TRUST-007": (
+        "Remove the embedded bare repo or the post-index-change hook before"
+        " opening this folder in an agent; set safe.bareRepository=explicit."
+    ),
+    # CI workflows (STORY-0091)
+    "WORKFLOW-001": (
+        "Allow only the commands this CI agent needs, make its job read-only,"
+        " and do writes in a separate job."
+    ),
+    "WORKFLOW-002": (
+        "Replace the CI agent's deny list with an allowlist of the commands it needs."
+    ),
+    "WORKFLOW-003": (
+        "Use run-gemini-cli 0.1.22+ with Gemini CLI 0.39.1+, and don't trust a"
+        " workspace that holds pull request code."
+    ),
+    # Skill packages (STORY-0095)
+    "SKILL-005": (
+        "Read the install command this skill tells the agent to run; remove the"
+        " skill if you cannot vouch for what it downloads or decodes."
+    ),
+    "SKILL-006": (
+        "Review what this skill adds to Claude Code (servers, hooks, programs,"
+        " settings) and remove anything you did not ask for."
+    ),
+    "SKILL-007": (
+        "Find out what this file in the skill is; a skill should ship only"
+        " content you can read."
+    ),
+    "SKILL-008": (
+        "Resolve the other findings on this skill, then read the code it"
+        " bundles before using it."
+    ),
     # Baseline drift
     "DRIFT": (
         "Review this change. If intentional,"
@@ -139,14 +356,128 @@ _HINTS: dict[str, str] = {
         "The package hash does not match the registry"
         " — do not use this server until verified."
     ),
+    # Lock (mcp-lock.json drift — STORY-0070)
+    "LOCK-001": (
+        "This server's config no longer matches the lock."
+        " Review the change, then run `mcp-audit lock --accept`."
+    ),
+    "LOCK-002": (
+        "This server is not in the lock."
+        " Run `mcp-audit lock` to approve it (or `lock --accept` after review)."
+    ),
+    "LOCK-003": (
+        "This server is in the lock but no longer in your config."
+        " If the removal was intended, run `mcp-audit lock --accept`."
+    ),
+    "LOCK-004": "Run `mcp-audit fix --apply` to re-pin to the locked version.",
+    "LOCK-005": (
+        "The lock file itself looks tampered or corrupted."
+        " Inspect `git diff mcp-lock.json` before trusting it."
+    ),
+    # Tool definitions (`lock --verify --connect` — STORY-0086)
+    "LOCK-006": (
+        "This server now offers tools the lock never approved."
+        " Review them, then run `mcp-audit lock --accept --connect`."
+    ),
+    "LOCK-007": (
+        "A tool's schema or annotations changed since the lock."
+        " Review the change, then run `mcp-audit lock --accept --connect`."
+    ),
+    "LOCK-008": (
+        "A tool's description changed since the lock; read the new text"
+        " (`mcp-audit scan --connect` checks it), then re-lock with --connect."
+    ),
+    "LOCK-009": (
+        "A locked tool is gone. If expected, run `mcp-audit lock --accept --connect`."
+    ),
+    # lock_version 2 (STORY-0116)
+    "LOCK-010": (
+        "The registry's `latest` or deprecation notice changed since the lock;"
+        " informational. Re-lock with `mcp-audit lock --accept` to record it."
+    ),
+    "LOCK-011": (
+        "A section of mcp-lock.json changed without its digest. Inspect"
+        " `git diff mcp-lock.json`; re-run whichever tool wrote that section."
+    ),
+    "LOCK-012": (
+        "Something reformatted mcp-lock.json. Run `mcp-audit lock --accept` to"
+        " rewrite it canonically."
+    ),
+    "LOCK-013": (
+        "Move the credential out of the command line into an environment"
+        " variable the server reads (`env` in the config); the lock keeps it"
+        " out of mcp-lock.json but cannot see it change."
+    ),
+    # Instruction-file reach (STORY-0098)
+    "MEM-003": (
+        "Move the imported instructions into the repository (or delete the"
+        " @import); decline Claude Code's external-imports prompt if unsure."
+    ),
+    "MEM-004": (
+        "Open HEARTBEAT.md: remove any step you didn't write and the line that"
+        " silences its result; reply HEARTBEAT_OK only if nothing needs attention."
+    ),
+    # Instruction-file drift (STORY-0113)
+    "INSTR-001": (
+        "If you didn't edit this file since the last scan, read it (git diff in a"
+        " repository) and remove what you didn't write."
+    ),
+    "INSTR-002": (
+        "This file changed and now has the finding named in the title; if you"
+        " didn't make the change, restore the file and find what wrote it."
+    ),
+    # Orders that hide (STORY-0099)
+    "MEM-005": (
+        "Open the file at the line shown: remove a conditional rule you didn't"
+        " write, and check whether its condition (date, host, root) already held."
+    ),
+    "POISON-043": (
+        "Remove the invisible zero-width characters; decoded, they spell text."
+    ),
+    "POISON-044": (
+        "Remove the run of invisible variation selectors; decoded, they spell text."
+    ),
+    "POISON-070": (
+        "Remove this server or text: it tells the model to hide something from you."
+    ),
+    "POISON-071": ("Remove the line telling the model not to ask for your approval."),
+    "POISON-072": (
+        "Remove the ban on the ask-the-user tool unless you wrote it on purpose."
+    ),
+    "POISON-073": "Read the instruction behind the threat; remove it if unwanted.",
+    "POISON-074": ("Check what the startup order runs; remove it unless you wrote it."),
+    "POISON-075": (
+        "Check who controls the URL; fetched instructions can change after review."
+    ),
 }
+
+
+#: Clients whose configs ``fix`` never edits.
+#: MCP gateway upstreams (STORY-0111) live in the gateway's own file and
+#: format, which ``fix`` does not write.
+_NOT_FIXED_CLIENTS = frozenset({"claude-code-skill"}) | GATEWAY_UPSTREAM_CLIENTS
+
+
+def _is_auto_fixable(finding: Finding) -> bool:
+    """True when ``mcp-audit fix`` can remediate *finding* in place.
+
+    ``fix`` edits MCP JSON config files only, so an auto-fixable ID found in
+    another file (a CRED-001 in ``.gemini/.env``, STORY-0090) is not, nor one
+    in an MCP config a skill carries but Claude Code does not load
+    (client ``claude-code-skill``, STORY-0095), which ``fix`` never selects.
+    """
+    if finding.id not in _AUTO_FIXABLE or finding.client in _NOT_FIXED_CLIENTS:
+        return False
+    path = finding.finding_path or ""
+    return not path or path.lower().endswith(".json")
 
 
 def _remediation_hint(finding: Finding) -> str:
     """Return a one-line plain-English remediation hint for *finding*.
 
     Checks the static :data:`_HINTS` table first, falling back to the
-    first sentence of ``finding.remediation`` when the ID is unknown.
+    first sentence of ``finding.remediation`` when the ID is unknown.  An
+    auto-fixable ID in a file ``fix`` cannot edit gets a manual hint instead.
 
     Args:
         finding: A :class:`~mcp_audit.models.Finding` from the scan pipeline.
@@ -154,6 +485,16 @@ def _remediation_hint(finding: Finding) -> str:
     Returns:
         A single-line plain-English instruction suitable for non-expert users.
     """
+    if finding.id in _AUTO_FIXABLE and not _is_auto_fixable(finding):
+        if finding.id.startswith("CRED-"):
+            return (
+                "Move the secret out of this file into your shell or a credential"
+                " manager, then rotate it (`mcp-audit fix` edits MCP JSON configs"
+                " only)."
+            )
+        sentences = finding.remediation.split(". ")
+        return sentences[0].rstrip(".") + "."
+
     # Exact match
     if finding.id in _HINTS:
         return _HINTS[finding.id]
@@ -226,6 +567,7 @@ def print_check_results(
         )
         if registration:
             _print_registered_as(console, registration)
+        _print_lock_line(console, result)
         console.print()
         console.print("  Your MCP configuration looks clean.")
         console.print()
@@ -240,6 +582,7 @@ def print_check_results(
     )
     if registration:
         _print_registered_as(console, registration)
+    _print_lock_line(console, result)
     console.print()
 
     # ── Attack path warning ───────────────────────────────────────────────────
@@ -254,16 +597,17 @@ def print_check_results(
         console.print()
 
     # ── Findings list ─────────────────────────────────────────────────────────
+    # KEV first, then severity, then EPSS (STORY-0124); stable otherwise.
     sorted_findings = sorted(
         result.findings,
-        key=lambda f: _SEVERITY_ORDER.index(f.severity),
+        key=lambda f: signals.priority_key(f, _SEVERITY_ORDER.index(f.severity)),
     )
 
     total = len(sorted_findings)
     shown = sorted_findings[:MAX_FINDINGS_SHOWN]
     remainder = total - len(shown)
 
-    fixable_ids = sorted({f.id for f in shown if f.id in _AUTO_FIXABLE})
+    fixable_ids = sorted({f.id for f in shown if _is_auto_fixable(f)})
     fixable_shown = len(fixable_ids)
 
     issue_word = "issue" if total == 1 else "issues"
@@ -275,7 +619,8 @@ def print_check_results(
         color = _SEVERITY_COLORS[finding.severity]
         sev_badge = f"[{color}]{finding.severity.value}[/{color}]"
         hint = _remediation_hint(finding)
-        console.print(f"  {i}. [{sev_badge}] {finding.title}")
+        exploited = " [bold red]KEV[/bold red]" if signals.is_kev(finding) else ""
+        console.print(f"  {i}. [{sev_badge}]{exploited} {finding.title}")
         console.print(f"     → {hint}")
         console.print()
 
@@ -284,6 +629,19 @@ def print_check_results(
             f"  [dim]… and {remainder} more — run [bold]mcp-audit scan[/bold]"
             " to see all.[/dim]"
         )
+        console.print()
+
+    # ── Known-exploited line ──────────────────────────────────────────────────
+    kev_cves = sorted(
+        {c for f in result.findings for c, s in f.exploit.items() if s.get("kev")}
+    )
+    if kev_cves:
+        console.print(
+            "  [bold red]Known exploited:[/bold red] "
+            f"{', '.join(kev_cves)} on CISA's KEV list."
+        )
+        if result.exploit_data:
+            console.print(f"  [dim]{escape(result.exploit_data['line'])}[/dim]")
         console.print()
 
     # ── Fix summary line ──────────────────────────────────────────────────────
@@ -301,6 +659,53 @@ def print_check_results(
     console.print("[dim]To see all findings:  mcp-audit scan[/dim]")
     if fixable_shown > 0:
         console.print("[dim]To apply auto-fixes:  mcp-audit fix --apply[/dim]")
+
+
+def _print_lock_line(console: Console, result: ScanResult) -> None:
+    """Print the ``Lock:`` line beneath the grade, when a lock was found.
+
+    Silent (prints nothing) when ``result.lock_status.present`` is ``False``
+    — a project with no ``mcp-lock.json`` must see no output change at all
+    (STORY-0070). Emits one WARN line per unresolved entry so a clean
+    ``verified`` line can never silently hide one.
+    """
+    status = result.lock_status
+    if not status.present:
+        return
+    n = status.checked_servers
+    server_word = "server" if n == 1 else "servers"
+    not_verified = (
+        f"; not verified: {', '.join(status.unverified_sections)}"
+        if status.unverified_sections
+        else ""
+    )
+    if status.tools_recorded:
+        # Recorded tool definitions are only compared by an explicit
+        # `lock --verify --connect`, never by check/scan (STORY-0086).
+        not_verified += "; tool definitions not compared (lock --verify --connect)"
+    if status.verified:
+        console.print(f"  [dim]Lock: verified ({n} {server_word}){not_verified}[/dim]")
+    else:
+        console.print(
+            f"  [yellow]Lock:[/yellow] {status.findings} finding(s) across "
+            f"{n} locked {server_word}{not_verified} — see `mcp-audit lock --verify`."
+        )
+    for key in status.unresolved_entries:
+        console.print(
+            f"  [yellow]WARN:[/yellow] {key!r} was locked offline — "
+            "version/hash not confirmed."
+        )
+    if status.outside_root:
+        console.print(
+            "  [yellow]WARN:[/yellow] config(s) outside the lock root "
+            "were skipped (no LOCK findings)."
+        )
+    if status.not_covered:
+        console.print(
+            f"  [yellow]WARN:[/yellow] {len(status.not_covered)} MCP server(s)"
+            " from subagent definitions, skill folders or MCP gateway configs"
+            " not covered by mcp-lock.json (AGENT-004, SKILL-006)."
+        )
 
 
 def _print_registered_as(console: Console, registration: RegistrationConfig) -> None:

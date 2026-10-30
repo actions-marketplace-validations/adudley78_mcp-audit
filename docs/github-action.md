@@ -18,21 +18,21 @@ scanning (e.g. install once in a shared job and run in multiple matrix legs).
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: adudley78/mcp-audit/setup-action@v0.10.0
+- uses: adudley78/mcp-audit/setup-action@v0.25.0
   with:
     version: 'latest'   # or a specific tag: 'v0.10.0'
 ```
 
 After this step `mcp-audit` is on `PATH` for every subsequent step in the job.
 
-### Inputs
+### `setup-mcp-audit` inputs
 
 | Input | Default | Description |
 |---|---|---|
 | `version` | `latest` | Release tag to install (`latest` resolves the current release via the GitHub API). |
 | `github-token` | `${{ github.token }}` | Token for the Releases API call. Defaults to the workflow token; supply a PAT on rate-limited runners. |
 
-### Outputs
+### `setup-mcp-audit` outputs
 
 | Output | Description |
 |---|---|
@@ -80,7 +80,7 @@ jobs:
       security-events: write   # required for SARIF upload
     steps:
       - uses: actions/checkout@v4
-      - uses: adudley78/mcp-audit@v0.3.3
+      - uses: adudley78/mcp-audit@v0.25.0
 ```
 
 Findings appear in **Security → Code scanning alerts** within ~2 minutes.
@@ -89,9 +89,31 @@ The `permissions` block is **required** for the SARIF upload. Composite
 actions inherit workflow-token permissions; declare `security-events: write`
 at either the workflow or the job level (as shown above).
 
+### Catch approval settings changed in a pull request
+
+A pull request can switch off Claude Code's approval prompts for everyone who
+clones the repository, by editing `.claude/settings.json` (HARNESS-001..006).
+Config files like that rarely get reviewed the way code does. The quick-start
+workflow above already covers it: the action scans from the checkout, a scan
+run inside a repository reads its `.claude/settings.json`, and
+the HARNESS findings in committed settings are HIGH, so the default
+`severity-threshold: high` with `fail-on-findings: true` fails the check on that
+pull request. With mcp-audit v0.19.0 or earlier, set
+`config-paths: .claude/settings.json .mcp.json` to get the same result.
+
+### Catch agent workflows that hand out secrets
+
+The same default run reads the repository's own `.github/workflows/`. A
+workflow that runs Claude Code or Gemini CLI on an issue, comment or
+`pull_request_target` event, with secrets and write permission, and lets the
+agent run any command, is WORKFLOW-001 (HIGH), so it fails the check like the
+HARNESS findings do. See [ci-workflows.md](ci-workflows.md). Setting `config-paths`
+turns this off, because an explicit path scans only what it names.
+
 ### Version pinning
 
-Until `v1.0.0` ships, pin to a specific release tag (e.g. `@v0.3.0`).
+Until `v1.0.0` ships, pin to a specific release tag, as every example on this page does
+(each release PR moves them to the new tag).
 Once the first `v1.x` release is published, you will be able to pin to
 `@v1` and automatically track the latest `1.x` minor/patch release — the
 standard GitHub Marketplace major-version convention. The `latest`
@@ -101,7 +123,7 @@ break reproducibility on release day.
 ## Full example
 
 ```yaml
-- uses: adudley78/mcp-audit@v0.3.3
+- uses: adudley78/mcp-audit@v0.25.0
   with:
     config-paths: 'path/to/claude_desktop_config.json path/to/cursor_config.json'
     severity-threshold: high
@@ -113,6 +135,8 @@ break reproducibility on release day.
     sast-path: src/
     baseline-name: ''
     fail-on-findings: 'true'
+    lock-verify: 'false'
+    lock-resolve: 'false'
     version: latest
 ```
 
@@ -141,7 +165,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history so git refs resolve
-      - uses: adudley78/mcp-audit@v0.8.0
+      - uses: adudley78/mcp-audit@v0.25.0
         with:
           mode: diff
           severity-threshold: medium
@@ -165,7 +189,22 @@ See `examples/github-actions/diff-mode.yml` for the full reference workflow and
 | `sast-path` | `src/` | Path passed to `mcp-audit sast`. Only used when `run-sast: 'true'`. |
 | `baseline-name` | _(empty)_ | Saved baseline name. When non-empty, runs `mcp-audit baseline compare <name>` and writes the diff to the step summary. |
 | `fail-on-findings` | `'true'` | Fail the workflow step if the scan finds anything at or above `severity-threshold`. Set to `'false'` for visibility-only mode. |
+| `lock-verify` | `'false'` | Verify `mcp-lock.json` (if present) via `mcp-audit lock --verify --if-present`. Fails on `LOCK-001`/`002`/`004`/`005` regardless of `severity-threshold` (still honours `fail-on-findings`). A repo with no lock file yet gets a warning and a passing step. |
+| `lock-resolve` | `'false'` | With `lock-verify`, also re-resolve floating specs against the registry (network; produces `LOCK-004` on version drift). Ignored when `lock-verify` is `'false'`. |
 | `version` | `latest` | Release tag to install (e.g. `v0.10.1`). The binary is downloaded from GitHub Releases, not PyPI. |
+
+### Verifying `mcp-lock.json` in CI
+
+```yaml
+- uses: adudley78/mcp-audit@v0.25.0  # lock-verify needs v0.17.0 or later
+  with:
+    lock-verify: 'true'
+    lock-resolve: 'true'   # optional: also catch a republished package version
+```
+
+This is additive to the normal scan — enabling it never requires a repo to
+have adopted `mcp-audit lock` first. See [`docs/lock.md`](lock.md) for what
+gets locked and verified.
 
 ### Severity threshold behaviour
 
@@ -193,7 +232,7 @@ Use outputs in downstream steps:
 ```yaml
 - name: Run mcp-audit
   id: mcp
-  uses: adudley78/mcp-audit@v0.3.3
+  uses: adudley78/mcp-audit@v0.25.0
 
 - name: Print results
   run: |
@@ -216,7 +255,7 @@ output files.
 ## Disabling SARIF upload
 
 ```yaml
-- uses: adudley78/mcp-audit@v0.3.3
+- uses: adudley78/mcp-audit@v0.25.0
   with:
     upload-sarif: 'false'
 ```
@@ -224,10 +263,14 @@ output files.
 ## Pinning to a specific version
 
 ```yaml
-- uses: adudley78/mcp-audit@v0.3.3
+- uses: adudley78/mcp-audit@v0.25.0
+  with:
+    version: v0.25.0
 ```
 
-Pin to a full version tag for fully reproducible CI runs. See the
+Pin both for fully reproducible CI runs: the `uses:` tag fixes the action's
+own steps, and the `version` input fixes the mcp-audit binary it downloads
+(it defaults to `latest`). See the
 [Version pinning](#version-pinning) section above for the `@v1`
 floating-tag convention that will become available once `v1.0.0` ships.
 
@@ -240,7 +283,7 @@ blocking any build. Tighten the threshold once you've worked through the
 existing findings.
 
 ```yaml
-- uses: adudley78/mcp-audit@v0.3.3
+- uses: adudley78/mcp-audit@v0.25.0
   with:
     severity-threshold: info
     fail-on-findings: 'false'
@@ -254,7 +297,7 @@ Suitable for security-conscious teams or new projects with no existing
 findings.
 
 ```yaml
-- uses: adudley78/mcp-audit@v0.3.3
+- uses: adudley78/mcp-audit@v0.25.0
   with:
     severity-threshold: medium
     fail-on-findings: 'true'
@@ -280,7 +323,7 @@ install step is required — the dependency is only pulled in when you
 opt in.
 
 ```yaml
-- uses: adudley78/mcp-audit@v0.3.3
+- uses: adudley78/mcp-audit@v0.25.0
   with:
     run-sast: 'true'
     sast-path: src/

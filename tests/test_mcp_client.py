@@ -12,11 +12,15 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
+from mcp_audit import mcp_client
 from mcp_audit.mcp_client import (
     MCP_NOT_INSTALLED,
     MCP_NOT_INSTALLED_FROZEN,
@@ -857,3 +861,333 @@ class TestClassifySseError:
         assert result.error is not None
         assert "401" in result.error
         assert "--connect-token" in result.error
+
+
+# ── Tool definitions in wire format, and tools/list pagination (STORY-0086) ──
+
+
+class _V2Tool(BaseModel):
+    """Shaped like mcp 2.x's Tool: snake_case attributes, camelCase on the wire."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    name: str
+    title: str | None = None
+    description: str | None = None
+    input_schema: dict
+    output_schema: dict | None = None
+    annotations: dict | None = None
+
+
+def _v2_tool(name: str, **wire: Any) -> _V2Tool:
+    return _V2Tool.model_validate(
+        {"name": name, "inputSchema": {"type": "object"}, **wire}
+    )
+
+
+class TestToolInfoFromSdkObjects:
+    def test_v2_style_model_keeps_input_schema(self) -> None:
+        """mcp 2.x has no `inputSchema` attribute; the old getattr returned {}."""
+        tool = _v2_tool(
+            "read",
+            inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
+            outputSchema={"type": "object"},
+            annotations={"readOnlyHint": True},
+            title="Read",
+        )
+        info = mcp_client._tool_info(tool)
+        assert info.input_schema["properties"] == {"path": {"type": "string"}}
+        assert info.output_schema == {"type": "object"}
+        assert info.annotations == {"readOnlyHint": True}
+        assert info.title == "Read"
+
+    def test_unset_fields_stay_none(self) -> None:
+        info = mcp_client._tool_info(_v2_tool("bare"))
+        assert info.title is None
+        assert info.output_schema is None
+        assert info.annotations is None
+
+    def test_plain_objects_still_work(self) -> None:
+        info = mcp_client._tool_info(_make_tool("legacy", schema={"type": "object"}))
+        assert info.input_schema == {"type": "object"}
+        assert info.title is None  # MagicMock attribute, not a string
+
+
+def _page(tools: list, cursor: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(tools=tools, next_cursor=cursor)
+
+
+class _CursorSession:
+    """mcp 1.x style: list_tools(cursor=None)."""
+
+    def __init__(self, pages: dict[str | None, SimpleNamespace]) -> None:
+        self.pages = pages
+        self.calls: list[str | None] = []
+
+    async def initialize(self) -> SimpleNamespace:
+        return SimpleNamespace(capabilities=SimpleNamespace(tools=object()))
+
+    async def list_tools(self, cursor: str | None = None) -> SimpleNamespace:
+        self.calls.append(cursor)
+        return self.pages[cursor]
+
+    async def list_resources(self) -> SimpleNamespace:
+        return SimpleNamespace(resources=[])
+
+    async def list_prompts(self) -> SimpleNamespace:
+        return SimpleNamespace(prompts=[])
+
+
+class TestToolsPagination:
+    @pytest.mark.asyncio
+    async def test_reads_every_page_with_cursor_kwarg(self) -> None:
+        session = _CursorSession(
+            {
+                None: _page([_v2_tool("a")], "p2"),
+                "p2": _page([_v2_tool("b")], "p3"),
+                "p3": _page([_v2_tool("c")]),
+            }
+        )
+        result = await _collect(session)
+        assert [t.name for t in result.tools] == ["a", "b", "c"]
+        assert result.tools_error is None
+        assert session.calls == [None, "p2", "p3"]
+
+    @pytest.mark.asyncio
+    async def test_reads_every_page_with_params_kwarg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        types_mod = ModuleType("mcp.types")
+        types_mod.PaginatedRequestParams = lambda cursor: SimpleNamespace(cursor=cursor)  # type: ignore[attr-defined]
+        mcp_mod = ModuleType("mcp")
+        mcp_mod.types = types_mod  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mcp", mcp_mod)
+        monkeypatch.setitem(sys.modules, "mcp.types", types_mod)
+
+        pages = {None: _page([_v2_tool("a")], "p2"), "p2": _page([_v2_tool("b")])}
+
+        class _ParamsSession(_CursorSession):
+            async def list_tools(self, *, params: Any = None) -> SimpleNamespace:  # type: ignore[override]
+                cursor = params.cursor if params else None
+                self.calls.append(cursor)
+                return self.pages[cursor]
+
+        result = await _collect(_ParamsSession(pages))
+        assert [t.name for t in result.tools] == ["a", "b"]
+        assert result.tools_error is None
+
+    @pytest.mark.asyncio
+    async def test_sdk_that_cannot_paginate_reports_tools_error(self) -> None:
+        class _NoPaging(_CursorSession):
+            async def list_tools(self) -> SimpleNamespace:  # type: ignore[override]
+                return _page([_v2_tool("a")], "p2")
+
+        result = await _collect(_NoPaging({}))
+        assert [t.name for t in result.tools] == ["a"]
+        assert "cannot request later pages" in (result.tools_error or "")
+
+    @pytest.mark.asyncio
+    async def test_endless_cursor_stops_at_the_page_cap(self) -> None:
+        class _Endless(_CursorSession):
+            async def list_tools(self, cursor: str | None = None) -> SimpleNamespace:  # type: ignore[override]
+                return _page([_v2_tool(f"t{cursor}")], "again")
+
+        result = await _collect(_Endless({}))
+        assert len(result.tools) == mcp_client._MAX_TOOL_PAGES
+        assert "pages" in (result.tools_error or "")
+
+
+class TestToolsError:
+    @pytest.mark.asyncio
+    async def test_failure_on_a_server_that_declares_tools(self) -> None:
+        class _Broken(_CursorSession):
+            async def list_tools(self, cursor: str | None = None) -> SimpleNamespace:  # type: ignore[override]
+                raise RuntimeError("boom")
+
+        result = await _collect(_Broken({}))
+        assert result.tools == []
+        assert result.tools_error == "tools/list failed: boom"
+        assert result.error is None
+
+    @pytest.mark.asyncio
+    async def test_server_without_tools_capability_has_no_tools_error(self) -> None:
+        class _NoTools(_CursorSession):
+            async def initialize(self) -> SimpleNamespace:  # type: ignore[override]
+                return SimpleNamespace(capabilities=SimpleNamespace(tools=None))
+
+            async def list_tools(self, cursor: str | None = None) -> SimpleNamespace:  # type: ignore[override]
+                raise RuntimeError("Method not found")
+
+        result = await _collect(_NoTools({}))
+        assert result.tools == []
+        assert result.tools_error is None
+
+
+# ── Failed handshake keeps the server's stderr (STORY-0105, Q-014) ───────────
+
+
+class _DyingStdioClient:
+    """A stdio_client stand-in whose server writes stderr and exits on start."""
+
+    def __init__(self, stderr: bytes, exc: BaseException) -> None:
+        self._stderr = stderr
+        self._exc = exc
+
+    def __call__(self, params: Any, errlog: Any = None) -> _DyingStdioClient:
+        self._errlog = errlog
+        return self
+
+    async def __aenter__(self) -> Any:
+        if self._errlog is not None:
+            self._errlog.write(self._stderr)
+            self._errlog.flush()
+        raise self._exc
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return False
+
+
+def _task_group_failure(message: str = "Connection closed") -> BaseException:
+    return ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError(message)])
+
+
+async def _enumerate_dying(
+    stderr: bytes,
+    exc: BaseException | None = None,
+    env: dict[str, str] | None = None,
+) -> ServerEnumeration:
+    server = _stdio_server(env=env or {})
+    return await mcp_client._enumerate_stdio(
+        server,
+        MagicMock(),
+        _DyingStdioClient(stderr, exc or _task_group_failure()),
+        lambda **kw: SimpleNamespace(**kw),
+    )
+
+
+class TestFailedHandshakeStderr:
+    """The reason a server died must reach the user, redacted."""
+
+    @pytest.mark.asyncio
+    async def test_error_names_the_leaf_exception_and_last_stderr_line(self) -> None:
+        result = await _enumerate_dying(
+            b"Starting...\nError: STRIPE_SECRET_KEY not set\n"
+        )
+        assert result.error is not None
+        assert "RuntimeError: Connection closed" in result.error
+        assert "TaskGroup" not in result.error
+        assert "(server stderr: Error: STRIPE_SECRET_KEY not set)" in result.error
+        assert result.server_stderr == "Starting...\nError: STRIPE_SECRET_KEY not set"
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_through_connect_and_enumerate(self) -> None:
+        mock_mcp, mock_stdio, mock_sse = _mock_sdk()
+        mock_stdio.stdio_client = _DyingStdioClient(
+            b"Usage: mcp-server-filesystem [allowed-directory]\n",
+            _task_group_failure(),
+        )
+        with patch.dict(sys.modules, _modules(mock_mcp, mock_stdio, mock_sse)):
+            result = await connect_and_enumerate(_stdio_server())
+        assert result.error is not None
+        assert result.error.startswith("Enumeration failed: RuntimeError")
+        assert "Usage: mcp-server-filesystem [allowed-directory]" in result.error
+
+    @pytest.mark.asyncio
+    async def test_secrets_are_redacted_in_error_and_stderr(self) -> None:
+        token = "ghp_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"
+        env_secret = "s3cr3t-value-from-env"  # noqa: S105  # test fixture
+        stderr = (
+            f"token {token} rejected\n"
+            f"connecting to postgres://admin:hunter2pass@db.internal/app\n"
+            f"bad key {env_secret}\n"
+        ).encode()
+        result = await _enumerate_dying(
+            stderr,
+            exc=_task_group_failure(f"auth failed for {env_secret}"),
+            env={"API_KEY": env_secret, "DEBUG": "1"},
+        )
+        for text in (result.error or "", result.server_stderr or ""):
+            assert token not in text
+            assert "hunter2pass" not in text
+            assert env_secret not in text
+        assert "[REDACTED]" in (result.server_stderr or "")
+        assert "auth failed for [REDACTED]" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_short_env_values_are_not_blanked(self) -> None:
+        result = await _enumerate_dying(b"debug 1 enabled\n", env={"DEBUG": "1"})
+        assert result.server_stderr == "debug 1 enabled"
+
+    @pytest.mark.asyncio
+    async def test_no_stderr_still_reports_the_reason(self) -> None:
+        result = await _enumerate_dying(b"")
+        assert result.error == "Enumeration failed: RuntimeError: Connection closed"
+        assert result.server_stderr is None
+
+    @pytest.mark.asyncio
+    async def test_stderr_is_capped_to_its_tail(self) -> None:
+        big = b"x" * (200 * 1024) + b"\nfinal reason\n"
+        result = await _enumerate_dying(big)
+        assert result.server_stderr is not None
+        assert len(result.server_stderr) <= mcp_client._MAX_STDERR_BYTES
+        assert result.server_stderr.endswith("final reason")
+
+    @pytest.mark.asyncio
+    async def test_long_last_line_is_truncated_in_error(self) -> None:
+        result = await _enumerate_dying(b"y" * 5000 + b"\n")
+        assert result.error is not None
+        assert len(result.error) < 500
+        assert result.error.endswith("...)")
+
+    def test_describe_exception_unwraps_nested_groups(self) -> None:
+        nested = ExceptionGroup(
+            "outer", [ExceptionGroup("inner", [ValueError("bad input")])]
+        )
+        assert mcp_client.describe_exception(nested) == "ValueError: bad input"
+        assert mcp_client.describe_exception(OSError()) == "OSError"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_not_swallowed(self) -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await _enumerate_dying(b"x\n", exc=asyncio.CancelledError())
+
+
+class TestRedactServerTextOrder:
+    """Server secrets are removed by value before patterns run (STORY-0105 review)."""
+
+    def test_env_value_containing_a_pattern_is_removed_whole(self) -> None:
+        token = "ghp_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"
+        value = f"prefix-{token}-suffix"
+        out = mcp_client.redact_server_text(f"bad value {value}", [value])
+        assert out == "bad value [REDACTED]"
+
+    def test_secret_flag_values_in_args_are_redacted(self) -> None:
+        out = mcp_client.redact_server_text(
+            "rejected key ctx7sk-0123456789abcdef and tok-abcdefgh",
+            [],
+            [
+                "-y",
+                "pkg",
+                "--api-key",
+                "ctx7sk-0123456789abcdef",
+                "--token=tok-abcdefgh",
+            ],
+        )
+        assert "ctx7sk-" not in out
+        assert "tok-abcdefgh" not in out
+
+    @pytest.mark.asyncio
+    async def test_failed_handshake_redacts_flag_values(self) -> None:
+        server = _stdio_server()
+        server.args = ["-y", "@example/server", "--api-key", "plain-secret-12345"]
+        result = await mcp_client._enumerate_stdio(
+            server,
+            MagicMock(),
+            _DyingStdioClient(
+                b"invalid key plain-secret-12345\n",
+                _task_group_failure("auth plain-secret-12345"),
+            ),
+            lambda **kw: SimpleNamespace(**kw),
+        )
+        for text in (result.error or "", result.server_stderr or ""):
+            assert "plain-secret-12345" not in text

@@ -25,7 +25,7 @@ sudo mv mcp-audit /usr/local/bin/
 **From PyPI (Python 3.11+ required):**
 
 ```bash
-pip install mcp-audit
+pip install mcp-audit-scanner
 ```
 
 **From source (for contributors):**
@@ -47,7 +47,7 @@ Run your first scan in 30 seconds. mcp-audit will discover all MCP configs on yo
 mcp-audit scan
 ```
 
-That's it. mcp-audit searches your home directory for MCP configurations across all supported AI coding clients — Claude Desktop, Cursor, VS Code, Windsurf, Claude Code, Copilot CLI, and Augment — and prints a findings report with a letter grade.
+That's it. mcp-audit searches your home directory for MCP configurations across all supported AI coding clients — Claude Desktop, Cursor, VS Code, Windsurf, Claude Code, Copilot CLI, Augment, Codex and Gemini CLI — and prints a findings report with a letter grade.
 
 ---
 
@@ -64,6 +64,10 @@ mcp-audit automatically discovers MCP server configurations for:
 | Claude Code | `~/.claude/claude_mcp_config.json` |
 | Copilot CLI | `~/.config/github-copilot/mcp.json` |
 | Augment | `~/.augment/mcp_config.json` |
+| Codex | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), project `.codex/config.toml` (TOML) |
+| Gemini CLI | `~/.gemini/settings.json`, project `.gemini/settings.json` |
+
+The full table, with project files and how each one is read, is in [clients.md](clients.md).
 
 ---
 
@@ -322,27 +326,25 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
-      - uses: adudley78/mcp-audit@v0.3.3
+      - uses: adudley78/mcp-audit@v0.25.0
         with:
-          severity-threshold: HIGH
-          output-file: mcp-audit.sarif
+          version: v0.25.0
+          severity-threshold: high
+          sarif-output: mcp-audit.sarif
 ```
 
-**With SAST analysis:**
+**With SAST analysis** (the action installs Semgrep itself, with `pipx`, when `run-sast` is `'true'`):
 
 ```yaml
-      - uses: actions/setup-python@v5
+      - uses: adudley78/mcp-audit@v0.25.0
         with:
-          python-version: '3.11'
-      - run: pip install semgrep
-      - uses: adudley78/mcp-audit@v0.3.3
-        with:
-          sast: 'true'
+          version: v0.25.0
+          run-sast: 'true'
           sast-path: './src'
-          output-file: mcp-audit.sarif
+          sarif-output: mcp-audit.sarif
 ```
 
-**Exit code behavior:** Finding MCP security issues exits with code `1`. The action is wired so that exit code `1` does *not* fail your CI job — only exit code `2` (a tool error) fails the build. This lets you upload SARIF and track findings without blocking merges.
+**Exit code behavior:** a finding at or above `severity-threshold` makes the scan exit `1`, and with the default `fail-on-findings: 'true'` that fails the step. Set `fail-on-findings: 'false'` to upload SARIF and track findings without blocking merges. Exit code `2` (a tool error) always fails the step. See [github-action.md](github-action.md#inputs) for every input.
 
 ---
 
@@ -409,7 +411,7 @@ Add mcp-audit to your pre-commit pipeline to catch MCP config issues before they
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/adudley78/mcp-audit
-    rev: v0.1.0
+    rev: v0.25.0
     hooks:
       - id: mcp-audit
 ```

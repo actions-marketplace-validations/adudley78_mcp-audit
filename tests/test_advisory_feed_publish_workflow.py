@@ -23,9 +23,9 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "advisory-feed-publish.yml"
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-SETUP_PYTHON = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
-UPLOAD = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-DOWNLOAD = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+SETUP_PYTHON = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+DOWNLOAD = "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
 
 
 def _load() -> dict:
@@ -162,6 +162,24 @@ def test_publish_has_a_belt_and_suspenders_empty_diff_guard() -> None:
     assert "git diff --cached --quiet" in run_text
 
 
+def test_publish_copies_index_json_sig_alongside_index_json() -> None:
+    """Regression test for the 2026-09-07T19:40:39Z publish (snapshot_version
+    4): sign_feed() writes index.json.sig next to index.json in the candidate
+    artifact, not inside advisories/, so the replace step must copy it
+    explicitly. Missing this line published a feed whose index.json carried
+    a "signing" block but no signature to back it — every advisory verified
+    fine, but `mcp-audit feed verify` failed closed on the index itself
+    ("Missing signature artifact index.json.sig"), caught by
+    experiment-r32-offline-feed-verify.yml before any user consumed it, not
+    by this test suite. It is now."""
+    run_text = _run_text(_steps(_load()["jobs"]["publish"]))
+    assert "cp new_feed/index.json.sig index.json.sig" in run_text
+    # Must also be cleared before the copy, same as index.json itself, or a
+    # stale signature from a previous publish could survive a run that
+    # regresses this again.
+    assert "rm -rf advisories osv index.json index.json.sig" in run_text
+
+
 def test_build_declares_the_feed_signing_environment() -> None:
     """The signing secret is only reachable inside this environment, which is
     restricted (via its deployment-branch-policy, confirmed separately with
@@ -258,3 +276,41 @@ def test_documents_the_public_feed_url() -> None:
     assert (
         "https://raw.githubusercontent.com/adudley78/mcp-audit/feed/index.json" in text
     )
+
+
+def test_bundle_is_built_in_the_signing_step_and_verified_before_upload() -> None:
+    """Q-058: the feed branch is an air-gapped bundle, signed with the same key."""
+    steps = _steps(_load()["jobs"]["build"])
+    sign_step = next(s for s in steps if _has_secret_env(s))
+    run = str(sign_step["run"])
+    assert "scripts/build_bundle.py" in run
+    assert "--in-place" in run
+    assert '--private-key "$KEYFILE"' in run
+    names = [s.get("name", "") for s in steps]
+    verify_idx = next(
+        i
+        for i, s in enumerate(steps)
+        if "build_bundle.py --verify" in str(s.get("run", ""))
+    )
+    upload_idx = next(
+        i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith(UPLOAD)
+    )
+    assert names.index(sign_step["name"]) < verify_idx < upload_idx
+
+
+def test_signal_refresh_is_best_effort_and_keyless() -> None:
+    """Q-055: a KEV/EPSS outage must never stop the publish (the TTL depends on it)."""
+    steps = _steps(_load()["jobs"]["build"])
+    fetch = next(s for s in steps if "sync_exploit_signals.py" in str(s.get("run", "")))
+    assert fetch.get("continue-on-error") is True
+    assert not _has_secret_env(fetch)
+    assert "--out" in str(fetch["run"]) and "--write" not in str(fetch["run"])
+
+
+def test_publish_copies_the_bundle_files() -> None:
+    steps = _steps(_load()["jobs"]["publish"])
+    run_text = _run_text(steps)
+    assert "rm -rf data bundle.json bundle.json.sig" in run_text
+    assert "cp -r new_feed/data data" in run_text
+    assert "cp new_feed/bundle.json bundle.json" in run_text
+    assert "cp new_feed/bundle.json.sig bundle.json.sig" in run_text

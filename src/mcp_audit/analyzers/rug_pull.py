@@ -29,7 +29,9 @@ from platformdirs import user_config_dir
 from rich.console import Console
 
 from mcp_audit.analyzers.base import BaseAnalyzer
-from mcp_audit.discovery import DiscoveredConfig
+from mcp_audit.discovery import AGENT_DEFINITION_CLIENT, DiscoveredConfig
+from mcp_audit.gateways import GATEWAY_UPSTREAM_CLIENTS
+from mcp_audit.lock.identity import remote_host
 from mcp_audit.models import Finding, ServerConfig, Severity
 
 _STATE_DIR: Path = Path(user_config_dir("mcp-audit")) / "state"
@@ -37,7 +39,7 @@ DEFAULT_STATE_PATH: Path = _STATE_DIR / "state.json"
 _STATE_VERSION = 1
 _LEGACY_STATE_DIR: Path = Path.home() / ".mcp-audit"
 
-_console = Console()
+_console = Console(stderr=True)
 
 
 # ── One-time migration from legacy ~/.mcp-audit location ──────────────────────
@@ -97,11 +99,40 @@ def derive_state_path(configs: list[DiscoveredConfig]) -> Path:
         configs: Discovered config files for the current scan.
 
     Returns:
-        A path like ``~/.mcp-audit/state_a1b2c3d4.json``.  Falls back to
-        :data:`DEFAULT_STATE_PATH` when *configs* is empty so that there is
-        always a valid path to write to.
+        A path like ``<user-config-dir>/mcp-audit/state/state_a1b2c3d4.json``.
+        Falls back to :data:`DEFAULT_STATE_PATH` when *configs* is empty so
+        that there is always a valid path to write to.
+
+    Configs from Claude Code plugins (client ``claude-code-plugin``) are left
+    out of the key.  Their paths contain the plugin version, so including them
+    would move every server's rug-pull history to a fresh state file on each
+    plugin update.  Their servers are still tracked in whichever file the rest
+    of the scan uses.  A repository's skills-directory plugin
+    (``.claude/skills/<name>``, ``is_project_scoped``) stays in the key: its
+    path does not change, and leaving it out would record its servers in the
+    state a scan of another repository reads, which would then report them as
+    removed (RUGPULL-003; STORY-0095).
+
+    Subagent definitions (client ``claude-code-agent``, STORY-0094) are left
+    out for a related reason: every agent file is a discovered config whether
+    or not it declares a server, so adding or deleting one would otherwise move
+    the whole scan's rug-pull history to a new state file.
+
+    User-level MCP gateway configs (``<gateway>-upstream`` clients,
+    STORY-0111) are left out too, so a machine that already had one does not
+    lose its rug-pull history to a new state file when they join discovery;
+    their servers are tracked in whichever file the rest of the scan uses.  A
+    working directory's gateway project file (``is_project_scoped``) stays in
+    the key, for the reason given above for skills-directory plugins.
     """
     _migrate_legacy_state()
+    configs = [
+        c
+        for c in configs
+        if c.client_name != AGENT_DEFINITION_CLIENT
+        and (c.client_name != "claude-code-plugin" or c.is_project_scoped)
+        and (c.client_name not in GATEWAY_UPSTREAM_CLIENTS or c.is_project_scoped)
+    ]
     if not configs:
         return DEFAULT_STATE_PATH
     paths_str = "\n".join(sorted(str(c.path) for c in configs))
@@ -109,8 +140,26 @@ def derive_state_path(configs: list[DiscoveredConfig]) -> Path:
     return _STATE_DIR / f"state_{digest}.json"
 
 
+#: Separates a gateway upstream's name from its config path in a state key.
+_GATEWAY_KEY_SEP = " @ "
+
+
 def server_key(server: ServerConfig) -> str:
-    """Return the canonical state-file key for a server: ``'{client}/{name}'``."""
+    """Return the canonical state-file key for a server: ``'{client}/{name}'``.
+
+    A server read from an MCP gateway's config (``<gateway>-upstream``,
+    STORY-0111) also carries its config file, ``'{client}/{name} @ {path}'``:
+    a gateway reads several files (mcptoon's user and project configs, JSON
+    and TOML) that can each name the same server, and one key for all of
+    them would let a change in one file go unreported.  No earlier state
+    used these keys.
+    """
+    if server.client in GATEWAY_UPSTREAM_CLIENTS:
+        try:
+            path = str(server.config_path.resolve())
+        except (OSError, RuntimeError):
+            path = str(server.config_path)
+        return f"{server.client}/{server.name}{_GATEWAY_KEY_SEP}{path}"
     return f"{server.client}/{server.name}"
 
 
@@ -151,7 +200,7 @@ def load_state(state_path: Path) -> dict:
         if not isinstance(data, dict):
             return {"version": _STATE_VERSION, "servers": {}}
         return data
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError, RecursionError):
         return {"version": _STATE_VERSION, "servers": {}}
 
 
@@ -183,12 +232,16 @@ def build_state_entry(server: ServerConfig, first_seen: str | None = None) -> di
         A dict ready to be stored under the server's key in the state file.
     """
     now = datetime.now(UTC).isoformat()
-    return {
+    entry = {
         "config_path": str(server.config_path),
         "first_seen": first_seen or now,
         "last_seen": now,
         "hashes": compute_hashes(server),
     }
+    host = remote_host(server.url)
+    if host:
+        entry["remote_host"] = host
+    return entry
 
 
 # ── Analyzer ──────────────────────────────────────────────────────────────────
@@ -275,24 +328,27 @@ class RugPullAnalyzer(BaseAnalyzer):
                         for f in ("command", "args", "env_keys", "raw")
                         if current_hashes.get(f) != stored_hashes.get(f)
                     ]
-                    findings.append(self._changed_finding(srv, key, changed))
+                    old_host = stored[key].get("remote_host")
+                    new_host = remote_host(srv.url)
+                    moved = None
+                    if isinstance(old_host, str) and new_host and old_host != new_host:
+                        moved = f"remote host changed from {old_host} to {new_host}"
+                    findings.append(self._changed_finding(srv, key, changed, moved))
 
         # ── Detect removed servers ─────────────────────────────────────────────
         for key, entry in stored.items():
             if key not in current:
                 client, _, srv_name = key.partition("/")
+                if client in GATEWAY_UPSTREAM_CLIENTS:
+                    srv_name = srv_name.rsplit(_GATEWAY_KEY_SEP, 1)[0]
                 findings.append(self._removed_finding(client, srv_name, key, entry))
 
         # ── Persist updated state ─────────────────────────────────────────────
         now = datetime.now(UTC).isoformat()
         for key, srv in current.items():
             first_seen = stored.get(key, {}).get("first_seen", now)
-            stored[key] = {
-                "config_path": str(srv.config_path),
-                "first_seen": first_seen,
-                "last_seen": now,
-                "hashes": compute_hashes(srv),
-            }
+            stored[key] = build_state_entry(srv, first_seen)
+            stored[key]["last_seen"] = now
         save_state(state, self._state_path)
 
         return findings
@@ -342,8 +398,15 @@ class RugPullAnalyzer(BaseAnalyzer):
         )
 
     def _changed_finding(
-        self, srv: ServerConfig, key: str, changed_fields: list[str]
+        self,
+        srv: ServerConfig,
+        key: str,
+        changed_fields: list[str],
+        host_move: str | None = None,
     ) -> Finding:
+        evidence = f"Changed hash fields: {', '.join(changed_fields)}"
+        if host_move:
+            evidence = f"{host_move}; {evidence}"
         return Finding(
             id="RUGPULL-001",
             severity=Severity.HIGH,
@@ -357,7 +420,7 @@ class RugPullAnalyzer(BaseAnalyzer):
                 "tool descriptions or parameters are silently modified after initial "
                 "trust is established."
             ),
-            evidence=f"Changed hash fields: {', '.join(changed_fields)}",
+            evidence=evidence,
             remediation=(
                 "Inspect the current tool descriptions for malicious instructions. "
                 "If the change was intentional, run 'mcp-audit pin' to update the "

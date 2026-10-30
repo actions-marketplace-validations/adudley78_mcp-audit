@@ -260,16 +260,62 @@ mcp-audit scan --check-vulns
 
 When this flag is set, mcp-audit:
 
-1. Extracts the ecosystem (`npm` or `PyPI`), package name, and pinned version
-   from each server config (same extraction logic as `--verify-hashes`).
-2. Queries the [deps.dev](https://deps.dev) API for the full transitive
-   dependency graph of each resolved package.
+1. Extracts the ecosystem (`npm` or `PyPI`), package name, and version from
+   each server config (`npx`/`bunx`/`pnpx`/`yarn dlx` → npm, `uvx`/`pipx` →
+   PyPI; `pkg@1.2.3`, `@scope/pkg@1.2.3` and `pkg==1.2.3` are read as exact
+   pins; `[extras]` are dropped from a PyPI name and `pipx run` skips its
+   `run` subcommand; a URL, git, tarball or path spec is not looked up at
+   all, so credentials in it never leave the machine). A launch with no version (`npx -y pkg`), `@latest`, or a range
+   (`^1.2.3`) is resolved to the registry's latest release and reported as
+   `VULN-UNPINNED`.
+2. Queries the [deps.dev](https://deps.dev) API for the dependency graph of
+   each resolved package, keeping each node's `relation` (`SELF`, `DIRECT`,
+   `INDIRECT`; deps.dev marks a dependency that is both as direct).
 3. Submits all packages (top-level + transitive) to the
-   [OSV.dev](https://osv.dev) batch API, which returns advisories from
-   GitHub Advisory Database, NVD, PYSEC, and others.
-4. Emits a `VULN-<OSV-ID>` finding for each matched advisory.
+   [OSV.dev](https://osv.dev) batch API (`/v1/querybatch`), which answers
+   with advisory IDs only.
+4. Fetches the full record of each distinct advisory once from
+   `/v1/vulns/{id}` (at most 256 distinct IDs, 8 at a time, 10 s each, 4 MiB
+   per record; no new fetch starts after 120 s, so with a fetch still
+   running the worst case is about 130 s) and reads its summary, aliases, CWEs, fixed
+   versions for this package, and severity.
+5. Emits a `VULN-<OSV-ID>` finding for each matched advisory, and a
+   `VULN-UNRESOLVED` finding for each lookup that could not run.
 
 `--check-vulns` requires network access and cannot be combined with `--offline`.
+
+#### Where a `VULN-<OSV-ID>` severity comes from
+
+From the advisory's own record, in this order, and the finding's evidence
+says which (`severity_basis`):
+
+| `severity_basis` | Read from | Example |
+|---|---|---|
+| `cvss_v3` | a CVSS v3 vector in `severity[]`; the base score is computed and banded (Critical ≥ 9.0, High ≥ 7.0, Medium ≥ 4.0, Low > 0). CVSS 3.0 vectors are scored with the 3.1 formula (the two differ only in rounding). | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` → 7.5 → HIGH |
+| `database_specific` | the database's own rating in `database_specific.severity` (GitHub: `LOW`, `MODERATE`, `HIGH`, `CRITICAL`; `MODERATE` is reported as MEDIUM) | a record with only a CVSS v4 vector |
+| `malicious-package` | an OSV `MAL-*` record (a malicious package) → CRITICAL, as SC-008 rates a listed release | `MAL-2026-5481` |
+| `unrated` | none of the above, or the record could not be fetched → INFO, and the description says which | |
+
+The evidence also carries `relation` (`self`, `direct`, `indirect`) and
+`direct_dependency` (true for the server package itself and its direct
+dependencies).
+
+#### When a lookup cannot run: `VULN-UNRESOLVED`
+
+A check that did not run is not a clean result. `VULN-UNRESOLVED` (INFO) is
+reported for the server, and a line is added to the scan's `errors`, when:
+
+| `stage` | Cause | What was still checked |
+|---|---|---|
+| `version` | no concrete version could be resolved for an unpinned or range launch | nothing |
+| `dependencies` | deps.dev has no graph for the version (HTTP 404: deps.dev has not indexed a release published in the last few days yet) or the request failed | the server package itself, in OSV |
+| `advisories` | the OSV query failed | the packages in other batches only |
+
+A deps.dev graph that carries node errors, an OSV result with a further
+page, and advisory records that could not be fetched are reported in
+`errors` (the affected `VULN-<OSV-ID>` findings say so in their
+description). `VULN-UNRESOLVED` never becomes an advisory-feed record and is
+not listed as a vulnerability in `mcp-audit sbom`.
 
 ### `--vuln-registry URL`
 
@@ -279,7 +325,11 @@ mcp-audit scan --check-vulns --vuln-registry https://your-osv-mirror.internal/v1
 
 Override the OSV API endpoint to point at an air-gapped or private mirror (for
 example, an OSV-compatible proxy behind a corporate firewall). The URL must
-implement the OSV `querybatch` POST contract.
+implement the OSV `querybatch` POST contract. When it ends in
+`/querybatch`, full advisory records are fetched from the sibling `/vulns/`
+path (`…/v1/querybatch` → `…/v1/vulns/{id}`); otherwise only what the mirror's
+querybatch returned is used, and an advisory without a readable severity
+says that the details endpoint is unknown.
 
 ### `mcp-audit sbom`
 
@@ -302,12 +352,51 @@ Dependency Review.
 (the `cyclonedx-python-lib` dependency is optional and not included in the default install
 or the PyInstaller binary).
 
+#### SBOM staleness
+
+Every SBOM `mcp-audit sbom` writes carries a CycloneDX `metadata.timestamp`
+set at generation time, so the document itself states when its dependency
+graph was resolved. What it does not do is expire: an SBOM describes the
+graph as resolved *at generation time*, and nothing re-validates that graph
+against current advisories when the SBOM is read later. Scanning — or
+re-reading — an old SBOM produces findings against versions that may no
+longer be what is actually installed, and, in the other direction, misses
+advisories that landed after generation.
+
+The measured shape of this failure mode is the mirror image of the deps.dev
+limitation documented below. In the same independent study, an advisory
+scanner reading a dependency tree frozen at each root package's release date
+flagged **130 of 249 MCP servers (52.2%) that are clean when installed**, and
+none the other way round (affected when installed, clean frozen)
+([spec §13, v3.16.1](https://github.com/prachetpoddar/mcp-supply-chain-study/blob/v3.16.1/spec/mcp-lock-spec.md#13-security-considerations);
+recomputed 2026-10-09 with both arms through his corrected resolver, see
+`RESOLVER-NOTES.md` at the same tag). Counts of individual findings are left
+out on purpose: five packages carry 82% of them, so the rate is stable and the
+count is not. The same study's decomposition says why the frozen tree
+over-reports: of the findings it reports, the share whose advisory was
+published after the root package shipped runs from 90.6% for roots 30 days old
+or less to 100.0% for roots more than a year old. A frozen description
+over-reports because advisories keep accruing against it, not because
+publishers shipped versions an advisory already covered
+(`PREREGISTRATION-6.md` and `code/gap_cause_split.py` at the same tag; the
+bands between those endpoints are not monotone, so only the endpoints are
+quoted). An SBOM generated at release and scanned a year later has
+exactly this shape; it is the same
+failure the advisory feed's `expires` field exists to prevent (see
+`docs/advisory-feed.md`), applied to a document type that currently carries
+no expiry mechanism at all.
+
+This is a caveat, not a fix. `mcp-audit sbom` does not currently carry a TTL
+or any other staleness signal beyond `metadata.timestamp`. Whether it should
+is a separate design question, not addressed here.
+
 ### Finding IDs
 
 | Finding ID     | Severity  | Meaning |
 |----------------|-----------|---------|
-| `VULN-<OSV-ID>` | CRITICAL / HIGH / MEDIUM / LOW | Known CVE in a direct or transitive dependency; severity derived from the advisory's qualitative rating |
+| `VULN-<OSV-ID>` | CRITICAL / HIGH / MEDIUM / LOW / INFO | Known advisory against the server package or a direct or transitive dependency; severity read from the advisory's own record (see "Where a `VULN-<OSV-ID>` severity comes from"); INFO when the record carries no readable rating |
 | `VULN-UNPINNED` | LOW | Server uses an unpinned (floating) version; vulnerability scan used the latest published version, which may differ from the actual runtime version |
+| `VULN-UNRESOLVED` | INFO | A lookup could not run (no version resolved, no deps.dev graph, OSV query failed); says what was and was not checked |
 
 ### The `--offline` contract
 
@@ -316,6 +405,92 @@ with network-touching opt-in flags: `--verify-hashes`, `--verify-signatures`,
 `--check-vulns`, and `--connect` will all produce an error (exit code 2) if
 combined with `--offline`. A plain scan makes no network calls regardless of
 this flag, so `--offline` is currently a no-op for the default configuration.
+
+### Known limitation: the published graph vs. the installed tree
+
+`--check-vulns` and `mcp-audit sbom` answer a specific, narrower question
+than "is this server vulnerable": for the exact `(name, version)` pinned in a
+config, what does deps.dev say the *published* dependency graph looks like,
+and does the OSV.dev batch API report advisories against that graph? They do
+**not** answer what a given machine actually materializes when it runs
+`npx` / `npm install` at a given moment. Semver-range resolution at install
+time (including npm's own `latest`-dist-tag preference over a higher
+satisfying version), lockfile state, and platform-specific optional
+dependencies all live in the gap between "published graph" and "installed
+tree," and mcp-audit models none of them. One measured instance: deps.dev's
+graph carries `get-intrinsic@1.3.1`, while npm's `latest` tag for that package
+is `1.3.0`, which is what npm picks when a range allows both. Version 1.3.1
+declares three dependencies 1.3.0 does not (`async-function`, `async-generator-function`,
+`generator-function`), so in Prachet Poddar's corpus deps.dev lists those three
+for 158 to 159 of 248 MCP servers where his corrected resolver installs none of
+them ([`RESOLVER-NOTES.md`, v3.16.1](https://github.com/prachetpoddar/mcp-supply-chain-study/blob/v3.16.1/RESOLVER-NOTES.md)).
+
+**Measured divergence.** [Prachet Poddar's independent study of 250 MCP server configs](https://github.com/prachetpoddar/mcp-supply-chain-study/tree/v3.16.1)
+compared deps.dev's published graph with the tree his corrected resolver
+computes against the registry as of the date deps.dev's graphs were fetched
+(2026-09-07/08), and scored both against the same npm advisory data. On that
+comparison, keyed by package name and version, deps.dev's graph gives a
+different advisory verdict for **2 of 248 servers (0.8%): eight missed
+findings (four high, four moderate) and zero phantom findings**
+([`data/verdict_recompute.json`](https://github.com/prachetpoddar/mcp-supply-chain-study/blob/v3.16.1/data/verdict_recompute.json),
+pre-registered in [`PREREGISTRATION-8.md`](https://github.com/prachetpoddar/mcp-supply-chain-study/blob/v3.16.1/preregistrations/PREREGISTRATION-8.md)).
+That is the measured bound this project can currently point to for how often
+the published-graph shortcut produces a different verdict than a real install
+would have. It comes with four qualifications, all his:
+
+- It is a missed rate, not a two-way difference rate. The corrected tree is
+  close to a superset of deps.dev's graph by construction, so the comparison
+  shows what deps.dev misses and says little about what it adds.
+- Two servers is a small count. The 95% Clopper–Pearson interval is 0.10% to
+  2.88%.
+- One package, `qs`, carries half of it. Set `qs` aside and the difference
+  falls to 1 server.
+- It ages. Against a tree resolved about a month later, the same deps.dev
+  graphs give a different verdict for 15 of 248 servers (6.0%), with 17 missed
+  and 30 phantom findings.
+
+The figure this section quoted before, 2 of 249 servers with six findings
+(measured 2026-09-08), is retracted. It was keyed by name only on both sides,
+both arms predate his 11–17 September resolver corrections, and its inputs no
+longer exist (`PREREGISTRATION-8.md`).
+
+His graph recomputation points the same way
+([`PREREGISTRATION-7.md`, v3.16.1](https://github.com/prachetpoddar/mcp-supply-chain-study/blob/v3.16.1/preregistrations/PREREGISTRATION-7.md),
+`data/depsdev_recompute.json`). Once the `get-intrinsic` edge above and the
+three packages it pulls in are set aside, deps.dev's graph is identical to the
+corrected tree for 79.4% of 248 servers, against 67.7% for the pre-correction
+tree. Both figures exclude, from both sides of both trees, the package names
+the corrected tree carries at more than one version: 170 servers have one,
+and the exclusion removes 763 of deps.dev's 21,134 nodes. An earlier pairing
+of 79.4% against 62.1% is not comparable, because the 62.1% was scored on a
+node set that lost nothing to that exclusion.
+
+This is a limitation with a measured bound, **not an accuracy claim**. It is
+a single study of one corpus, at one point in time, produced by one person —
+treat it as a data point, not a guarantee. It is also easy to over-read in
+the wrong direction. Matched to the fetch date and counting every version an
+install nests, the two graphs are close in size (median 91 packages per server
+in the corrected tree, 94 in deps.dev's), and the corrected tree carries 8.1%
+more package instances, since deps.dev's graph holds one version per name by
+construction. Yet they disagree on at least one package's version for
+**66.1% of servers**; deps.dev's graph lacks a package the tree installs for
+10.9% of servers and lists one the tree does not install for 64.9%, most of
+those the three `get-intrinsic` packages above. The verdict-level gap is still
+0.8%. Version-disagreement rate alone is therefore a poor proxy for whether a
+graph gap matters; the small verdict gap is a fact about where advisory
+boundaries happen to fall in this corpus, not evidence that the two graphs
+generally agree.
+
+**The failure class that does bite, and is worth watching for.** When a graph
+gap does produce a wrong verdict, it has a specific, nameable shape: a
+version resolves *up* into an advisory window whose lower bound sits above
+the version the other arm holds (e.g. resolving to a version inside a
+`>=X <=Y` advisory range, while the reference graph held an earlier, unaffected
+version). **Pinning a version does not protect against this class** —
+pinning forward to a newer version is exactly what causes it, since the
+version you pinned to may itself already sit inside a later-disclosed
+advisory window. The mitigation is re-scanning against current advisory data,
+not pinning harder.
 
 ---
 
@@ -352,10 +527,32 @@ This means `mcp_server_filesystem`, `mcp-server-filesystem`, and
 | `SC-001` | CRITICAL | 1 | One character away from a known-good package |
 | `SC-002` | HIGH | 2 | Two edits away — classic transposition typosquat |
 | `SC-003` | MEDIUM | 3 | Three edits away |
+| `SC-007` | MEDIUM | — | Unscoped twin of a registry entry (see below); replaces SC-001..003 |
+
+**Any spelling of the launcher.** Every supply-chain check (SC-001..008) first
+reduces the launcher to its bare name: the path is dropped (either `/` or `\`),
+case is ignored, a Windows `.cmd`/`.exe`/`.bat`/`.ps1` wrapper is stripped, and
+`cmd /c` or `cmd /k` (after switches such as `/d /s`) is unwrapped so the next
+argument is the launcher. `C:\Program Files\nodejs\npx.cmd -y pkg` and
+`cmd /c npx -y pkg` are checked exactly like `npx -y pkg`. When the whole command
+line is one argument after `cmd /c` (`"\"C:\\Program Files\\nodejs\\npx.cmd\" -y pkg"`
+in the JSON), or an argument carries double quotes, it is split the way Windows
+programs split a command line ([Microsoft: Parsing C command-line
+arguments](https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments)):
+double quotes group, backslashes are literal except before a quote, and the first
+argument (the program) keeps its backslashes. Only the first 32,767 characters
+are read, the longest command line Windows can start. `pnpm dlx`, `npm exec`
+and `uv run --with` are not recognised (see GAPS.md).
 
 **Short-name guard:** Package names ≤ 5 characters use a tighter threshold of 1
 (not 3) to suppress false positives — short names are inherently close to many
 other short names.
+
+**Unscoped twins come first.** When a name is an unscoped twin of a registry
+entry (`SC-007`, below), that finding replaces SC-001..003 for the server: a
+server never gets both. Example from the shipped registry: `uvx mcp-server-github`
+is 3 edits from PyPI `mcp-server-git` (SC-003), but it is the PyPI spelling of
+`@modelcontextprotocol/server-github`, and SC-007 says so.
 
 ### Registry entries
 
@@ -384,27 +581,242 @@ date, download count, publisher history).
 
 ## SC-004: Offline CVE advisory check
 
-`SC-004` (HIGH, `CWE-1104`, OWASP MCP04) fires when an exact-match registry entry
-carries one or more CVE IDs in `RegistryEntry.known_vulnerabilities`.  No network
-access is required — the check runs purely against the bundled registry.
+`SC-004` (HIGH or MEDIUM, `CWE-1104`, OWASP MCP04) fires when an exact-match registry entry
+carries CVE IDs in `RegistryEntry.known_vulnerabilities` and/or structured records
+in `RegistryEntry.known_vulns` (`cve`, `cvss`, `description`, `fixed_in`).  No
+network access is required — the check runs purely against the bundled registry.
+
+**One finding per package** (STORY-0078, 2026-10-11).  A package with several
+advisories produces a single SC-004 that lists them all, not one finding per CVE:
 
 ```
-FINDING SC-004: Known CVE advisory: @mcpjam/inspector (CVE-2026-23744)
-  Severity: HIGH  Analyzer: supply_chain
-  Package '@mcpjam/inspector' has a public CVE advisory (CVE-2026-23744) recorded
-  in the mcp-audit known-server registry.  Verify whether the version pinned in
-  your config falls within the affected range and upgrade to the patched version.
-  Check NVD: https://nvd.nist.gov/vuln/detail/CVE-2026-23744
+FINDING SC-004: Known CVE advisories: mcp-atlassian (30 CVEs)
+  Severity: MEDIUM  Analyzer: supply_chain
+  Package 'mcp-atlassian' has 30 public CVE advisories recorded in the mcp-audit
+  known-server registry: CVE-2026-27826, CVE-2026-73498, ... and 20 more
+  (`mcp-audit vet mcp-atlassian` lists them all). The config does not pin an
+  exact version, so mcp-audit cannot tell offline whether the installed release
+  is affected. Every advisory listed here is fixed in 0.22.0 or later. An
+  unpinned launch normally installs a patched release, but npx and uvx can reuse
+  a cached older install.
 ```
 
-**Important limitation:** `SC-004` does not compare the installed version against
-the CVE's affected version range — it fires whenever the package name matches
-regardless of version.  Use `scan --check-vulns` for version-aware scanning via
-OSV.dev.  See `GAPS.md` for details.
+The description lists at most 10 advisory IDs; `vet` shows the full list.
 
-CVE IDs seeded at v0.12.0: CVE-2026-23744 (`@mcpjam/inspector`),
-CVE-2026-0755 (`gemini-mcp-tool`), CVE-2025-59528 (`flowise`),
-CVE-2026-26118 (`@azure/mcp`), CVE-2026-33032 (`nginx-ui`).
+**Severity** (STORY-0083, 2026-10-13):
+
+| Launch | Recorded advisories | Severity |
+|---|---|---|
+| Pins an affected version | any | HIGH |
+| Unpinned | at least one has no recorded fix | HIGH |
+| Unpinned | every one has a recorded `fixed_in` | MEDIUM |
+| Pins a version at or above every fix | — | no finding |
+
+The MEDIUM row exists because the registry now carries each package's full
+advisory history. Without it, long-fixed CVEs on official servers would raise
+HIGH on every unpinned config.
+
+A single advisory keeps the original title form:
+`Known CVE advisory: @mcpjam/inspector (CVE-2026-23744)`.
+
+**Version-aware when the config pins an exact version.**  When the launch command
+pins one (`npx pkg@1.4.0`, `uvx pkg==0.21.1`, `uvx pkg@0.21.1`) and a `known_vulns`
+record gives `fixed_in` for a CVE, that CVE is dropped if the pinned version is at
+or above the fix.  If every CVE is dropped, no SC-004 fires.  A CVE with no
+`fixed_in`, or a version that won't parse, is kept.
+
+**Across a numbering-scheme switch** (STORY-0105).  Some packages switch between
+calendar and semantic versions: `@modelcontextprotocol/server-filesystem` published
+`0.6.2` (2024-12), then `2025.1.14` … `2026.8.31`, then `1.0.0` on 2026-10-11 and
+`2.0.0` on 2026-10-19 (npm `time` field).  Numerically `2.0.0` is below the recorded
+fix `2025.7.1`, although it was published fifteen months later.  When a pinned
+version and a CVE's `fixed_in` are in different schemes (one has a first number of
+1000 or more, the other doesn't):
+
+- if the registry entry records `semver_resumed_at` (the first semantic version after
+  the calendar releases; `1.0.0` for server-filesystem), a semantic pin below it is
+  affected (SC-004 HIGH: `0.6.2`), and one at or above it is past the fix (no
+  finding: `2.0.0`).  A calendar pin against a semantic fix is ordered the same way.
+- without it, a `0.x` semantic pin against a calendar fix is affected (SC-004 HIGH,
+  as before: `mcp-server-git==0.6.2`); any other cross-scheme pair is undecidable and
+  reported as **SC-009 (INFO)**, listing the advisories and how to compare release
+  dates (`npm view <pkg> time`).  If other CVEs are still affected, SC-004 stays HIGH
+  for them and names the set-aside ones.
+
+The registry carries no publish dates, so without `semver_resumed_at` an offline scan
+cannot decide the order; `--check-vulns` (OSV.dev, network) can.
+
+**What it still can't do:** mcp-audit never resolves ranges, so a range
+(`pkg@^1.4.0`, `pkg>=0.21`) or no version at all is treated as unpinned and every
+recorded CVE is reported.  Use `scan --check-vulns` for a network lookup against
+OSV.dev.
+
+Seeded data: CVE-2026-23744 (`@mcpjam/inspector`), CVE-2026-0755
+(`gemini-mcp-tool`), CVE-2025-59528 (`flowise`), CVE-2026-26118 (`@azure/mcp`),
+CVE-2026-33032 (`nginx-ui`) at v0.12.0; 24 CVEs for `mcp-atlassian` (all fixed by
+0.22.0, from PyPI's vulnerability data) and CVE-2026-14540 for `@toolbox-sdk/server`
+(fixed in 1.5.0) on 2026-10-11.
+
+**Keeping it current** (STORY-0083, 2026-10-13). `scripts/sync_registry_advisories.py`
+queries OSV for every registry package and merges missing advisories into
+`known_vulnerabilities` and `known_vulns`, with `fixed_in` taken from OSV's ranges.
+It only adds; it never removes or rewrites an entry. The first run added 144
+advisories across 10 entries, including MCP Inspector's CVE-2025-49596,
+server-filesystem's CVE-2025-53109/53110, the TypeScript SDK's CVE-2026-104850,
+and 113 for `flowise`. It also added `mcp-remote` (614K weekly downloads) to
+the registry with its six 2026 advisories, entered by hand because OSV did not
+yet map them to the package.
+
+The weekly `registry-advisory-sync.yml` workflow runs the script in `--check`
+mode and fails when anything is missing. Like `registry-drift.yml`, it never
+writes the registry; someone runs `--write` and opens a PR.
+
+```bash
+python scripts/sync_registry_advisories.py           # check; exit 1 if anything is missing
+python scripts/sync_registry_advisories.py --write   # merge into registry/known-servers.json
+```
+
+What it can't see: unreviewed GitHub advisories carry no package data, so OSV
+does not map them until GitHub reviews them; and NVD-only CVEs. `MAL-*`
+malicious-package records are not merged into `known-servers.json` (a malicious
+release is a different finding class from a CVE); since STORY-0097 the same run
+mirrors them into `registry/known-malicious.json` for SC-008, below.
+
+---
+
+## SC-007: Unscoped twins
+
+`SC-007` (MEDIUM, `CWE-829`, OWASP MCP04, STORY-0097) fires when a configured
+package copies a known package's name without its scope. Edit distance cannot
+see this: `mcp-server-github` is many edits from
+`@modelcontextprotocol/server-github`, because the difference is a scope and a
+naming convention, not a few letters.
+
+**Why it matters.** In June 2026 OSV published ten records for unscoped npm
+names of exactly this shape (`MAL-2026-5476` to `MAL-2026-5485`): `mcp-server-github`,
+`-git`, `-fetch`, `-figma`, `-notion`, `-postgres`, `-redis`, `-sentry`,
+`-sequential-thinking` and `-supabase`. Each `postinstall` sent the host name,
+working directory and platform to a Cloudflare Worker
+([o3 on MAL-2026-5479](https://o3.security/malware/npm/mcp-server-github)).
+`mcp-server-everything` (`MAL-2025-46986`) is an earlier one.
+
+**What counts as a twin.** The rules are derived from the registry's own entries
+and from the naming the 2026 squats actually used:
+
+| Rule | Registry entry | Twin | Seen in the wild |
+|---|---|---|---|
+| name part, for `server-<x>` / `mcp-server-<x>` | `@modelcontextprotocol/server-github` | `server-github` | npm holds `server-github` as a `0.0.1-security` placeholder |
+| | `@supabase/mcp-server-supabase` | `mcp-server-supabase` | `MAL-2026-5485` |
+| `mcp-server-<x>` spelling of `server-<x>` / `<x>-mcp-server` | `@modelcontextprotocol/server-github` | `mcp-server-github` | `MAL-2026-5479` |
+| | `@notionhq/notion-mcp-server` | `mcp-server-notion` | `MAL-2026-5480` |
+| same `mcp-server-<x>` name, other registry | PyPI `mcp-server-git` | npm `mcp-server-git` | `MAL-2026-5478` |
+| | npm `@modelcontextprotocol/server-memory` | PyPI `mcp-server-memory` | a 0.0.1 placeholder with ~450 installs a month |
+
+Names are folded the PEP 503 way first (lowercase; runs of `-`, `_`, `.` become
+`-`), so `mcp_server_github` is the same twin as `mcp-server-github` in npm and
+in PyPI, even though npm itself treats the two as different packages. The
+configured package must not itself be in the registry for its own ecosystem, so
+`uvx mcp-server-git` (Anthropic's PyPI server) is never a twin.
+
+**What is deliberately not a twin.** The plain name part of any other scoped
+package: `@notionhq/notion-mcp-server` → `notion-mcp-server` (an unrelated
+community server with about 2,500 weekly downloads), `@upstash/context7-mcp` →
+`context7-mcp`, and generic name parts such as `@azure/mcp` → `mcp`,
+`@autoposting.ai/cli` → `cli` or `@toolbox-sdk/server` → `server`. Scoped
+lookalikes (`@evil/server-github`) are left to SC-001..003.
+
+**Measured on 2026-10-25.** The shipped registry yields 37 twin keys. On npm,
+21 of them have been published: 12 have since been taken down (10 are now
+`0.0.1-security` placeholders, 2 are unpublished), 3 are `0.0.1` stubs from one
+account (`mcp-server-cloudflare`, `-neon`, `-qdrant`; the account behind the
+"squat farm" in `registry-audit-2026-08-18.md`), and 6 are small packages with 7
+to 158 weekly downloads: four with no repository (two reuse the official
+package's description), one fork of the official servers repository, and one
+community Google Maps server. On PyPI, 5 of the npm-derived keys exist: three
+`0.0.1` placeholders registered by Amazon, and two small community servers
+(`mcp-server-notion`, `mcp-server-redis`; 85 and 179 downloads a month). So an
+SC-007 hit is usually a squat or a takedown, and sometimes a small community
+package that took the official server's name; the finding asks you to check
+which. That mix is why SC-007 is MEDIUM: the twins OSV lists as malicious are
+already CRITICAL under SC-008. If you meant the community package, record it in
+your governance policy's `approved_servers` allowlist ([governance.md](governance.md));
+that records the decision, and SC-007 keeps reporting the name. SC-007 fires on none of the 100 most-downloaded npm MCP servers
+(`docs/research/2026-10-top100-npm/`; pinned by
+`tests/test_supply_chain.py::TestScanLevelBehaviour`).
+
+`vet` runs the same check: an unscoped twin exits 1 with a "Possible unscoped
+twin" panel and `"typosquat_basis": "unscoped-twin"` in `--format json`.
+
+---
+
+## SC-008: Known malicious packages
+
+`SC-008` (CRITICAL or MEDIUM, `CWE-506`, OWASP MCP04, STORY-0097) fires when the
+configured package is an OSV `MAL-*` record: OpenSSF's malicious-packages data,
+which OSV serves under `MAL-` IDs. The match is by exact name in one ecosystem
+(npm names lowercased, PyPI names PEP 503-normalised), against
+`registry/known-malicious.json`, which ships in the wheel and the binaries. A
+plain `scan`, `check` or `vet` makes no network call. Before this, these records
+were reachable only with `scan --check-vulns`.
+
+| Launch | What OSV lists | Severity |
+|---|---|---|
+| Pins a listed version | any | CRITICAL |
+| Unpinned | every release, or every release from a version on | CRITICAL |
+| Unpinned | only specific past releases | MEDIUM |
+| Pins a version the record does not cover | — | no finding |
+
+The MEDIUM row follows SC-004's reasoning: the registry normally removes a
+malicious release, but npx and uvx can reuse a cached copy. A version that won't
+parse counts as covered. The two severities read differently on purpose: CRITICAL
+is titled `Known malicious package: <name> (<IDs>)` and says to remove the server;
+MEDIUM is titled `Malicious releases listed in OSV: <name> (<IDs>)` and says to pin
+a release the record does not list, because it is often a real package that had one
+release compromised (`mcp-use` 1.4.2/1.4.3, `@postman/postman-mcp-server`).
+
+**One deliberate difference from OSV's range semantics.** For a package the
+registry lists, a range covering every version (`introduced: "0"` and nothing
+else) is ignored when the record also lists explicit versions. GitHub's malware
+advisories use that blanket range even for one compromised release of a real
+package: `MAL-2025-191195` lists `@browserbasehq/mcp` `2.1.1` beside a blanket
+range, while npm still serves the clean `3.0.0`. The finding says when this
+happened.
+
+npm and PyPI records never cross: npm `mcp-server-git` (`MAL-2026-5478`) does not
+fire for `uvx mcp-server-git`. SC-008 is reported alongside SC-007 or
+SC-001..003, because it answers a different question (what OSV knows about this
+exact package, not what its name resembles). `npx -y mcp-server-github` gives
+both.
+
+**The MAL-2026-5476..5485 note.** All ten records report the same beacon host,
+`npx-canary-log.vulnerable-live.workers.dev`, and three of those npm packages,
+read on 2026-08-18, named `theinfosecguy/npx-canary` as their repository
+(`registry-audit-2026-08-18.md` §3a). Those two facts are what each record's
+`note` field says; the note draws no conclusion about who published them or
+why. OSV classifies the packages as malicious, and SC-008 reports them as OSV
+states it.
+
+**Measured on 2026-10-25:** 217 records (144 npm, 73 PyPI). On the 100
+most-downloaded npm MCP servers, pinned as published, SC-008 fires on none;
+launched unpinned, it fires MEDIUM on one (`@mastra/mcp-docs-server`, whose
+release 1.1.47 is `MAL-2026-5956`).
+
+**Keeping it current.** `scripts/sync_registry_advisories.py` reads OSV's bulk
+export for npm and PyPI (about 260 MB, read once per run) and keeps every `MAL-`
+record that is not withdrawn and names a package whose name contains `mcp` or
+that the registry lists. The substring test is deliberate: a match is by exact
+name, so an extra record can never cause a false positive. The file is a mirror,
+not additive: a record OSV withdraws is removed. The weekly
+`registry-advisory-sync.yml` check fails when the file has drifted and uploads
+the proposed `known-malicious.json` next to the proposed `known-servers.json`
+as the run's artifact, so the records that would be added or removed can be
+reviewed in full; `--write` updates it.
+
+`vet` reports the same records: a record covering the latest release exits 1;
+past releases only are listed and exit 0. Without `--ecosystem`, `vet` also warns
+when the other registry's package of the same name is malicious
+(`vet mcp-server-git` answers for Anthropic's PyPI server and warns that npm
+`mcp-server-git` is `MAL-2026-5478`).
 
 ---
 

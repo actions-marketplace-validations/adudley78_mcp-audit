@@ -10,7 +10,7 @@ are designed to be run together, not as alternatives.
 
 | Layer | Tool | What it finds |
 |-------|------|---------------|
-| **Config layer** | mcp-audit | Misconfigured MCP servers: tool poisoning, credential exposure in JSON configs, typosquatted packages, toxic cross-server flows, rug-pull description changes, transport misconfigurations |
+| **Config layer** | mcp-audit | Misconfigured MCP servers: tool poisoning, credential exposure in JSON configs, typosquatted packages, toxic cross-server flows, rug-pull configuration changes, transport misconfigurations |
 | **Source layer** | Snyk Code | Vulnerabilities in your MCP server *source code*: injection sinks, unsafe deserialization, hardcoded secrets, insecure APIs |
 
 Snyk Code reads `.js`, `.ts`, `.py`, and other source files. It does not parse
@@ -48,7 +48,7 @@ with one result per finding. Every result includes:
 mcp-audit scan --format sarif -o mcp-audit.sarif
 
 # Or use the GitHub Action (uploads automatically)
-uses: adudley78/mcp-audit@v0.10.0
+uses: adudley78/mcp-audit@v0.25.0
 with:
   sarif-output: mcp-audit.sarif
   upload-sarif: 'true'
@@ -112,7 +112,7 @@ your repository. You will see findings from two tools:
 
 | Indicator | Tool | Example rule |
 |-----------|------|-------------|
-| Rule IDs starting with `POISON-`, `CRED-`, `SC-`, `TRANSPORT-`, `TOXIC-` | mcp-audit | `CRED-003: AWS access key in env value` |
+| Rule IDs starting with `POISON-`, `CRED-`, `SC-`, `TRANSPORT-`, `TOXIC-` | mcp-audit | `CRED-001: AWS access key in env value` |
 | Rule IDs starting with `javascript/` or `python/` | Snyk Code | `javascript/SqlInjection` |
 
 **Triage order:** prioritise CRITICAL and HIGH mcp-audit findings first —
@@ -140,7 +140,7 @@ It runs:
 
 1. `snyk/actions/node@master` — Snyk Code SAST on the repository source,
    saves SARIF to `snyk.sarif`.
-2. `adudley78/mcp-audit@v0.10.0` — mcp-audit config scan, saves SARIF to
+2. `adudley78/mcp-audit` — mcp-audit config scan, saves SARIF to
    `mcp-audit.sarif`.
 3. Two `upload-sarif` steps — uploads both SARIF files to GitHub Code Scanning
    with separate `category` labels.

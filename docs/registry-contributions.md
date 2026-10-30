@@ -21,9 +21,18 @@ See [docs/badge.md](badge.md) for badge documentation.
 ## When to add an entry
 
 Add a server to the registry if:
-- It is a publicly available MCP server package (npm, pip, GitHub, Docker)
+- It is a publicly available MCP server package on npm or PyPI — the two
+  ecosystems `mcp-audit vet` can resolve
 - It has a known, identifiable maintainer or organization
 - It is not malicious or abandoned
+
+**Hosted-only servers are out of scope for this registry today.** An MCP
+server that exists only as a remote endpoint (Streamable HTTP / SSE at a URL)
+has no package `mcp-audit vet` can resolve, hash, pin or typosquat-protect, so
+an entry for it would assert nothing a user could check. List those in the
+[official MCP Registry](https://registry.modelcontextprotocol.io/). If your
+server also ships an installable client package on npm or PyPI, submit that
+package.
 
 ## Entry format
 
@@ -79,6 +88,14 @@ plausible-looking repo exists. Any one of the following counts:
   declares — for example, a merged PR whose head branch lives in that repo
   rather than a fork.
 - The publishing account itself comments on the submission issue.
+- The official [MCP Registry](https://registry.modelcontextprotocol.io/) lists
+  the server under an `io.github.<submitter>/…` name whose package entry is
+  this exact package, and the package names that server back: an
+  `mcp-name: <server name>` line in the PyPI README, or `mcpName` in the npm
+  `package.json`. Publishing under an `io.github.<user>` name requires
+  signing in to GitHub as that user, and the registry only accepts the
+  package when it carries the matching name, so the submitter's GitHub
+  account and the package each point at the other.
 
 `verified: true` entries will not be added without a public source repository.
 

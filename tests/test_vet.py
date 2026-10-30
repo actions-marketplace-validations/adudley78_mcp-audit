@@ -21,6 +21,7 @@ from mcp_audit.verdict import (
     name_to_slug,
     verdict_page_url,
 )
+from tests.conftest import unwrapped
 
 # Windows does not support POSIX file permission bits — skip mode checks there.
 _windows_skip = pytest.mark.skipif(
@@ -384,11 +385,41 @@ class TestVetCliClean:
 
 
 class TestVetCliCve:
-    def test_exit_1_for_cve(self) -> None:
+    def test_exit_0_when_every_cve_has_a_fix(self) -> None:
+        """STORY-0083: vet answers for the latest release, which the fix covers."""
         reg = _make_registry([_CVE_ENTRY])
         with patch("mcp_audit.cli.vet.load_registry", return_value=reg):
             result = runner.invoke(app, ["vet", "mcp-atlassian", "--ecosystem", "pypi"])
+        assert result.exit_code == 0
+        assert "all fixed" in unwrapped(result.output)
+
+    def test_exit_1_for_cve_without_a_fix(self) -> None:
+        unfixed = _CVE_ENTRY.model_copy(
+            update={
+                "known_vulns": [
+                    {
+                        "cve": "CVE-2026-27826",
+                        "cvss": 9.8,
+                        "description": "Authentication bypass via crafted token",
+                        "fixed_in": None,
+                    }
+                ]
+            }
+        )
+        reg = _make_registry([unfixed])
+        with patch("mcp_audit.cli.vet.load_registry", return_value=reg):
+            result = runner.invoke(app, ["vet", "mcp-atlassian", "--ecosystem", "pypi"])
         assert result.exit_code == 1
+        assert "with no fix" in unwrapped(result.output)
+
+    def test_ghsa_only_advisory_links_to_github(self) -> None:
+        ghsa = _CVE_ENTRY.model_copy(
+            update={"known_vulnerabilities": ["GHSA-aaaa-bbbb-cccc"], "known_vulns": []}
+        )
+        reg = _make_registry([ghsa])
+        with patch("mcp_audit.cli.vet.load_registry", return_value=reg):
+            result = runner.invoke(app, ["vet", "mcp-atlassian", "--ecosystem", "pypi"])
+        assert "github.com/advisories/GHSA-aaaa-bbbb-cccc" in unwrapped(result.output)
 
     def test_cve_id_in_output(self) -> None:
         reg = _make_registry([_CVE_ENTRY])
@@ -451,7 +482,9 @@ class TestVetCliUnknown:
         reg = _make_registry([_VERIFIED_ENTRY])
         with patch("mcp_audit.cli.vet.load_registry", return_value=reg):
             result = runner.invoke(app, ["vet", "completely-unknown-package"])
-        assert "NOT a safety signal" in result.output or "not" in result.output.lower()
+        assert "NOT a safety signal" in unwrapped(result.output) or (
+            "not" in result.output.lower()
+        )
 
     def test_unknown_output_suggests_scan(self) -> None:
         reg = _make_registry([_VERIFIED_ENTRY])
@@ -594,7 +627,7 @@ class TestVetCliValidation:
         reg = _make_registry()
         with patch("mcp_audit.cli.vet.load_registry", return_value=reg):
             result = runner.invoke(app, ["vet", "some-pkg", "--ecosystem", "docker"])
-        assert "Unknown ecosystem" in result.output or "npm" in result.output
+        assert "Unknown ecosystem" in unwrapped(result.output) or "npm" in result.output
 
 
 # ── CLI: --online mode ─────────────────────────────────────────────────────────
@@ -693,3 +726,391 @@ class TestSlugRoundTrip:
     )
     def test_slug(self, name: str, expected_slug: str) -> None:
         assert name_to_slug(name) == expected_slug
+
+
+# ── STORY-0097: unscoped twins and OSV MAL-* records in vet ───────────────────
+
+
+def _bundled_registry() -> KnownServerRegistry:
+    from mcp_audit.registry.loader import load_registry
+
+    return load_registry(offline=True)
+
+
+def _vet_json(*args: str) -> tuple[int, dict]:
+    with patch("mcp_audit.cli.vet.load_registry", return_value=_bundled_registry()):
+        result = runner.invoke(app, ["vet", *args, "--format", "json"])
+    return result.exit_code, json.loads(result.output)
+
+
+def _vet_text(*args: str) -> tuple[int, str]:
+    with patch("mcp_audit.cli.vet.load_registry", return_value=_bundled_registry()):
+        result = runner.invoke(app, ["vet", *args])
+    return result.exit_code, unwrapped(result.output)
+
+
+class TestVetUnscopedTwin:
+    def test_twin_is_a_typosquat_with_its_basis(self) -> None:
+        code, v = _vet_json("server-github")
+        assert code == 1
+        assert v["typosquat_of"] == "@modelcontextprotocol/server-github"
+        assert v["typosquat_basis"] == "unscoped-twin"
+        assert v["malicious"] == []
+
+    def test_twin_panel_explains_the_relation_not_a_distance(self) -> None:
+        code, out = _vet_text("server-github")
+        assert code == 1
+        assert "Possible unscoped twin" in out
+        assert "without its scope" in out
+        assert "Distance:" not in out
+
+    def test_pypi_twin_of_an_npm_official_server(self) -> None:
+        code, v = _vet_json("mcp-server-memory", "--ecosystem", "pypi")
+        assert code == 1
+        assert v["typosquat_of"] == "@modelcontextprotocol/server-memory"
+
+    def test_edit_distance_typosquat_keeps_its_basis(self) -> None:
+        code, v = _vet_json("@modelcontextprotocol/server-filesytem")
+        assert code == 1
+        assert v["typosquat_basis"] == "edit-distance"
+
+    def test_not_a_twin(self) -> None:
+        code, v = _vet_json("notion-mcp-server")
+        assert code == 0
+        assert v["typosquat_of"] is None
+        assert v["typosquat_basis"] is None
+
+
+class TestVetKnownMalicious:
+    def test_whole_package_record_exits_1(self) -> None:
+        code, v = _vet_json("mcp-server-github")
+        assert code == 1
+        assert [m["id"] for m in v["malicious"]] == ["MAL-2026-5479"]
+        item = v["malicious"][0]
+        assert item["latest_affected"] is True
+        assert item["ranges"] == [[{"introduced": "0"}]]
+        assert item["link"] == "https://osv.dev/vulnerability/MAL-2026-5479"
+        assert "npx-canary" in item["note"]
+
+    def test_panel_names_the_record(self) -> None:
+        code, out = _vet_text("postmark-mcp")
+        assert code == 1
+        assert "Listed as malicious in OSV" in out
+        assert "MAL-2025-47604" in out
+        assert "every release from 1.0.16 on" in out
+
+    def test_past_releases_only_lists_but_exits_0(self) -> None:
+        """@browserbasehq/mcp 2.1.1 was malicious; vet answers for the latest."""
+        code, v = _vet_json("@browserbasehq/mcp")
+        assert code == 0
+        item = v["malicious"][0]
+        assert item["id"] == "MAL-2025-191195"
+        assert item["latest_affected"] is False
+        assert item["blanket_range_ignored"] is True
+        assert v["registry"]["listed"] is True
+
+    def test_official_pypi_name_warns_about_the_npm_package(self) -> None:
+        """`vet mcp-server-git` answers for Anthropic's PyPI server; the npm
+        package of that name is MAL-2026-5478."""
+        code, v = _vet_json("mcp-server-git")
+        assert code == 0
+        assert v["package"]["ecosystem"] == "pypi"
+        assert v["malicious"] == []
+        assert [m["id"] for m in v["other_ecosystem_malicious"]] == ["MAL-2026-5478"]
+        code, out = _vet_text("mcp-server-git")
+        assert "On npm, a different package named mcp-server-git" in out
+
+    def test_explicit_npm_ecosystem_reports_the_npm_package(self) -> None:
+        code, v = _vet_json("mcp-server-git", "--ecosystem", "npm")
+        assert code == 1
+        assert [m["id"] for m in v["malicious"]] == ["MAL-2026-5478"]
+        assert v["typosquat_basis"] == "unscoped-twin"
+        assert v["other_ecosystem_malicious"] == []
+
+    def test_unlisted_pypi_only_record_switches_the_ecosystem(self) -> None:
+        code, v = _vet_json("timemcp")
+        assert v["package"]["ecosystem"] == "pypi"
+        assert [m["id"] for m in v["malicious"]] == ["MAL-2026-3132"]
+        assert code == 0  # only release 0.1.0 is listed
+
+    def test_unreadable_data_is_not_fatal(self, tmp_path: Path) -> None:
+        from mcp_audit.registry.malicious import load_known_malicious
+
+        empty = load_known_malicious(tmp_path / "missing.json")
+        with (
+            patch("mcp_audit.cli.vet.load_registry", return_value=_bundled_registry()),
+            patch("mcp_audit.cli.vet.load_known_malicious", return_value=empty),
+        ):
+            result = runner.invoke(
+                app, ["vet", "mcp-server-github", "--format", "json"]
+            )
+        assert result.exit_code == 1  # still the twin
+        assert json.loads(result.output)["malicious"] == []
+
+
+class TestBuildVerdictStory0097Fields:
+    def test_new_fields_default_empty(self) -> None:
+        reg = _make_registry([_VERIFIED_ENTRY])
+        v = build_verdict(_VERIFIED_ENTRY.name, "npm", _VERIFIED_ENTRY, None, reg)
+        assert v["typosquat_basis"] is None
+        assert v["malicious"] == []
+        assert v["other_ecosystem_malicious"] == []
+
+    def test_basis_defaults_to_edit_distance(self) -> None:
+        reg = _make_registry([_VERIFIED_ENTRY])
+        v = build_verdict("x", "npm", None, _VERIFIED_ENTRY, reg)
+        assert v["typosquat_basis"] == "edit-distance"
+
+
+class TestVetOnlineKeepsTheLocalMaliciousCheck:
+    """`vet --online` must not hide a bundled OSV MAL-* record (STORY-0097 review)."""
+
+    @staticmethod
+    def _clean_online(name: str) -> dict:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": "2026-10-26T00:00:00+00:00",
+            "package": {"ecosystem": "npm", "name": name},
+            "registry": {"listed": False, "verified": False},
+            "known_vulnerabilities": [],
+            "capabilities": [],
+            "attestation": {},
+            "typosquat_of": None,
+            "tags": [],
+            "links": {"repo": None, "verdict_page": "https://mcp-audit.dev/..."},
+        }
+
+    def _run(self, name: str, *extra: str) -> object:
+        with (
+            patch("mcp_audit.cli.vet.load_registry", return_value=_bundled_registry()),
+            patch(
+                "mcp_audit.cli.vet._fetch_online_verdict",
+                return_value=self._clean_online(name),
+            ),
+        ):
+            return runner.invoke(app, ["vet", name, "--online", *extra])
+
+    def test_json_carries_the_local_record_and_exits_1(self) -> None:
+        result = self._run("mcp-server-github", "--format", "json")
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert [m["id"] for m in data["malicious"]] == ["MAL-2026-5479"]
+
+    def test_terminal_shows_the_panel(self) -> None:
+        result = self._run("postmark-mcp")
+        assert result.exit_code == 1
+        assert "MAL-2025-47604" in unwrapped(result.output)
+
+    def test_clean_package_is_untouched(self) -> None:
+        result = self._run("totallyunknownpkgxyz", "--format", "json")
+        assert result.exit_code == 0
+        assert "malicious" not in json.loads(result.output)
+
+    def test_online_items_are_not_duplicated(self) -> None:
+        from mcp_audit.cli.vet import _with_local_malicious
+
+        online = self._clean_online("mcp-server-github")
+        online["malicious"] = [{"id": "MAL-2026-5479", "latest_affected": True}]
+        merged = _with_local_malicious(
+            online, "mcp-server-github", "npm", _bundled_registry()
+        )
+        assert [m["id"] for m in merged["malicious"]] == ["MAL-2026-5479"]
+
+    def test_help_documents_the_malicious_exit(self) -> None:
+        result = runner.invoke(app, ["vet", "--help"])
+        assert "malicious" in unwrapped(result.output)
+
+
+class TestVetOnlineMaliciousItemsAreRemoteData:
+    """An --online verdict's ``malicious`` items come from mcp-audit.dev and
+    may lack fields the bundled builder sets (STORY-0103)."""
+
+    @staticmethod
+    def _online(items: list) -> dict:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "package": {"ecosystem": "npm", "name": "totallyunknownpkgxyz"},
+            "registry": {"listed": False, "verified": False},
+            "known_vulnerabilities": [],
+            "typosquat_of": None,
+            "malicious": items,
+        }
+
+    def _run(self, items: list) -> object:
+        with patch(
+            "mcp_audit.cli.vet._fetch_online_verdict",
+            return_value=self._online(items),
+        ):
+            return runner.invoke(app, ["vet", "totallyunknownpkgxyz", "--online"])
+
+    def test_item_without_link_renders(self) -> None:
+        result = self._run([{"id": "MAL-2099-1", "latest_affected": True}])
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.exit_code == 1
+        out = unwrapped(result.output)
+        assert "MAL-2099-1" in out
+        assert "osv.dev" not in out
+
+    def test_item_with_link_still_shows_it(self) -> None:
+        link = "https://osv.dev/vulnerability/MAL-2099-1"
+        result = self._run(
+            [{"id": "MAL-2099-1", "latest_affected": True, "link": link}]
+        )
+        assert result.exit_code == 1
+        assert link in unwrapped(result.output)
+
+    def test_id_is_printed_as_text_not_markup(self) -> None:
+        result = self._run([{"id": "MAL-[bold]x[/bold]", "latest_affected": True}])
+        assert result.exit_code == 1
+        assert "MAL-[bold]x[/bold]" in unwrapped(result.output)
+
+    def test_missing_id_and_odd_fields_do_not_crash(self) -> None:
+        result = self._run(
+            [
+                "not-an-object",
+                {"latest_affected": False, "versions": [1, 2], "ranges": ["x", [1]]},
+            ]
+        )
+        assert result.exit_code == 0
+        out = unwrapped(result.output)
+        assert "(no id)" in out
+        assert "releases listed: 1, 2" in out
+
+    def test_wrong_typed_fields_degrade_gracefully(self) -> None:
+        """Wrong-typed aliases/versions/ranges must not raise TypeError (STORY-0104)."""
+        result = self._run(
+            [
+                {
+                    "id": "MAL-2099-2",
+                    "latest_affected": True,
+                    "aliases": 5,
+                    "ranges": 7,
+                },
+                {"id": "MAL-2099-3", "aliases": "GHSA-abcd", "versions": 3},
+                {"id": "MAL-2099-4", "versions": "1.0.0"},
+            ]
+        )
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.exit_code == 1
+        out = unwrapped(result.output)
+        assert "MAL-2099-2" in out
+        # A lone string alias is shown whole, not split into characters.
+        assert "(GHSA-abcd)" in out
+        assert "releases listed: 1.0.0" in out
+
+    @pytest.mark.parametrize("value", [42, "x", {"a": 1}, [1], ["x", None]])
+    def test_non_list_malicious_field_does_not_crash(self, value: object) -> None:
+        """No crash and no empty malicious panel (STORY-0104 review)."""
+        with patch(
+            "mcp_audit.cli.vet._fetch_online_verdict",
+            return_value={**self._online([]), "malicious": value},
+        ):
+            result = runner.invoke(app, ["vet", "totallyunknownpkgxyz", "--online"])
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.exit_code == 0
+        out = unwrapped(result.output)
+        assert "Malicious releases listed" not in out
+        assert "Listed as malicious" not in out
+
+    @staticmethod
+    def _listed_online(vulns: object, registry: object = None) -> dict:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "package": {"ecosystem": "npm", "name": "totallyunknownpkgxyz"},
+            "registry": {"listed": True, "verified": True}
+            if registry is None
+            else registry,
+            "known_vulnerabilities": vulns,
+            "capabilities": [],
+            "attestation": {},
+            "typosquat_of": None,
+            "links": {"repo": None, "verdict_page": "https://mcp-audit.dev/x"},
+        }
+
+    def _run_listed(self, vulns: object, registry: object = None) -> object:
+        with patch(
+            "mcp_audit.cli.vet._fetch_online_verdict",
+            return_value=self._listed_online(vulns, registry),
+        ):
+            return runner.invoke(app, ["vet", "totallyunknownpkgxyz", "--online"])
+
+    @pytest.mark.parametrize("vulns", [5, {"cve": "CVE-x"}, None])
+    def test_non_list_known_vulnerabilities_render(self, vulns: object) -> None:
+        result = self._run_listed(vulns)
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.exit_code == 0
+        assert "Known vulnerabilities: none" in unwrapped(result.output)
+
+    def test_non_object_vulnerability_item_counts_as_unfixed(self) -> None:
+        """An unreadable item is shown and keeps exit 1, never hidden."""
+        result = self._run_listed(
+            ["CVE-2099-1", {"cve": "CVE-2099-2", "fixed_in": "2"}]
+        )
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.exit_code == 1
+        assert "Known vulnerabilities: 2 (1 with no fix)" in unwrapped(result.output)
+
+    @pytest.mark.parametrize("registry", ["yes", [1], 7])
+    def test_non_object_registry_is_treated_as_unlisted(self, registry: object) -> None:
+        result = self._run_listed([], registry)
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.exit_code == 0
+        with patch(
+            "mcp_audit.cli.vet._fetch_online_verdict",
+            return_value=self._listed_online([], registry),
+        ):
+            strict = runner.invoke(
+                app, ["vet", "totallyunknownpkgxyz", "--online", "--strict"]
+            )
+        assert strict.exit_code == 1
+
+    def test_list_id_does_not_break_the_local_merge(self) -> None:
+        from mcp_audit.cli.vet import _with_local_malicious
+
+        online = self._online([{"id": ["MAL-2026-5479"], "latest_affected": True}])
+        online["package"]["name"] = "mcp-server-github"
+        merged = _with_local_malicious(
+            online, "mcp-server-github", "npm", _bundled_registry()
+        )
+        ids = [m["id"] for m in merged["malicious"]]
+        assert "MAL-2026-5479" in ids
+
+
+# ── CLI: --badge picks the registry's ecosystem (STORY-0105, Q-020) ──────────
+
+
+class TestVetBadgeEcosystem:
+    """An unscoped name listed only for PyPI gets a PyPI badge."""
+
+    def test_pypi_only_entry_gets_pypi_badge(self) -> None:
+        result = runner.invoke(app, ["vet", "mcptoon", "--badge"])
+        assert result.exit_code == 0
+        assert "/v1/badge/pypi/mcptoon.json" in result.output
+        assert "/v1/verdicts/pypi/mcptoon.json" in result.output
+        assert "/npm/" not in result.output
+
+    def test_pypi_name_spelling_follows_the_entry(self) -> None:
+        """PEP 503: MCP_Atlassian is the registry's mcp-atlassian on PyPI."""
+        result = runner.invoke(app, ["vet", "MCP_Atlassian", "--badge"])
+        assert "/v1/badge/pypi/mcp-atlassian.json" in result.output
+
+    def test_npm_entry_keeps_npm_badge(self) -> None:
+        result = runner.invoke(app, ["vet", "mcp-remote", "--badge"])
+        assert "/v1/badge/npm/mcp-remote.json" in result.output
+
+    def test_unknown_name_keeps_npm_default(self) -> None:
+        result = runner.invoke(app, ["vet", "no-such-package-xyz", "--badge"])
+        assert result.exit_code == 0
+        assert "/v1/badge/npm/no-such-package-xyz.json" in result.output
+
+    def test_explicit_ecosystem_wins(self) -> None:
+        result = runner.invoke(app, ["vet", "mcptoon", "--badge", "--ecosystem", "npm"])
+        assert "/v1/badge/npm/mcptoon.json" in result.output
+
+    def test_unloadable_registry_still_prints_npm_badge(self) -> None:
+        with patch(
+            "mcp_audit.cli.vet.load_registry", side_effect=FileNotFoundError("gone")
+        ):
+            result = runner.invoke(app, ["vet", "mcptoon", "--badge"])
+        assert result.exit_code == 0
+        assert "/v1/badge/npm/mcptoon.json" in result.output

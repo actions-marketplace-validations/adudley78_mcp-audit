@@ -443,7 +443,9 @@ def step_vet_contract(binary_cmd: list[str]) -> bool:
     Verifies, against the bundled registry (fully offline):
       - a verified package        → exit 0, "Verified" in output
       - a typosquat candidate     → exit 1, "typosquat" in output
-      - a package with a CVE       → exit 1, "CVE-" in output
+      - a package with an unfixed CVE → exit 1, "CVE-" in output
+      - an OSV MAL-listed package       → exit 1, its MAL ID in output (proves
+        registry/known-malicious.json is bundled; STORY-0097)
       - an unknown package         → exit 0, "unknown" in output
       - an empty package name      → exit 2, clean error (no traceback)
       - `--format json`            → valid JSON document
@@ -453,7 +455,9 @@ def step_vet_contract(binary_cmd: list[str]) -> bool:
     """
     verified = "@modelcontextprotocol/server-filesystem"
     typosquat = "@modelcontextprotocol/server-filesytem"  # deliberate typo
-    cve_pkg = "mcp-atlassian"
+    # mcp-remote carries CVE-2026-108716 with no recorded fix.  A package
+    # whose CVEs are all fixed exits 0 (STORY-0083).
+    cve_pkg = "mcp-remote"
 
     r = run(binary_cmd, "vet", verified, expect_exit=0)
     if "Verified" not in r.stdout:
@@ -465,9 +469,18 @@ def step_vet_contract(binary_cmd: list[str]) -> bool:
         print("FAIL: vet typosquat candidate did not warn", file=sys.stderr)
         return False
 
-    r = run(binary_cmd, "vet", cve_pkg, "--ecosystem", "pypi", expect_exit=1)
+    r = run(binary_cmd, "vet", cve_pkg, expect_exit=1)
     if "CVE-" not in r.stdout:
         print("FAIL: vet CVE package did not list a CVE", file=sys.stderr)
+        return False
+
+    r = run(binary_cmd, "vet", "mcp-server-github", expect_exit=1)
+    if "MAL-2026-5479" not in r.stdout:
+        print(
+            "FAIL: vet did not report MAL-2026-5479 — is "
+            "registry/known-malicious.json bundled?",
+            file=sys.stderr,
+        )
         return False
 
     r = run(binary_cmd, "vet", "totallyunknownpkgxyz", expect_exit=0)
@@ -823,6 +836,92 @@ def step_fleet_merge_dedup(binary_cmd: list[str]) -> bool:
     return True
 
 
+# STEP 17: lock write / verify / accept / scan auto-verify (R61)
+def step_lock_round_trip(binary_cmd: list[str]) -> bool:
+    """Network-free lock lifecycle, plus the R60-01 scan-agrees-with-lock guard.
+
+    1. ``lock --offline`` writes ``mcp-lock.json`` (exit 0).
+    2. ``lock --verify --allow-unverified`` is clean (exit 0).
+    3. Drift the server's args → ``lock --verify --allow-unverified`` exits 1
+       with ``LOCK-001``.
+    4. ``lock --accept --offline`` exits 0.
+    5. ``scan`` of the same dir reports no ``LOCK-*`` findings — the
+       client-label mismatch that made ``check`` contradict ``lock --verify``
+       on v0.18.1 (R60-01) must not recur on any of the four release binaries.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / ".git").mkdir()
+        cfg_dir = root / ".cursor"
+        cfg_dir.mkdir()
+        cfg = cfg_dir / "mcp.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "smoke": {
+                            "command": "npx",
+                            "args": [
+                                "-y",
+                                "@modelcontextprotocol/server-filesystem@1.0.0",
+                            ],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        run(binary_cmd, "lock", "--offline", str(root), expect_exit=0)
+        if not (root / "mcp-lock.json").exists():
+            print("FAIL: lock --offline did not write mcp-lock.json", file=sys.stderr)
+            return False
+
+        run(
+            binary_cmd,
+            "lock",
+            "--verify",
+            "--allow-unverified",
+            str(root),
+            expect_exit=0,
+        )
+
+        drifted = json.loads(cfg.read_text(encoding="utf-8"))
+        drifted["mcpServers"]["smoke"]["args"][-1] = (
+            "@modelcontextprotocol/server-filesystem@9.9.9"
+        )
+        cfg.write_text(json.dumps(drifted), encoding="utf-8")
+
+        drifted_verify = run(
+            binary_cmd, "lock", "--verify", "--allow-unverified", str(root)
+        )
+        combined = drifted_verify.stdout + drifted_verify.stderr
+        if drifted_verify.returncode != 1:
+            print(
+                f"FAIL: lock --verify after drift exited {drifted_verify.returncode}",
+                file=sys.stderr,
+            )
+            return False
+        if "LOCK-001" not in combined:
+            print(
+                f"FAIL: expected LOCK-001 after drift; got:\n{combined}",
+                file=sys.stderr,
+            )
+            return False
+
+        run(binary_cmd, "lock", "--accept", "--offline", str(root), expect_exit=0)
+
+        scan_result = run(binary_cmd, "scan", str(root))
+        scan_out = scan_result.stdout + scan_result.stderr
+        if "LOCK-" in scan_out:
+            print(
+                f"FAIL: scan of a just-locked repo reported LOCK findings:\n{scan_out}",
+                file=sys.stderr,
+            )
+            return False
+    return True
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print(
@@ -1031,6 +1130,13 @@ def main() -> None:
     print("Check 16: fleet merge deduplicates findings across machines")
     if step_fleet_merge_dedup(binary_cmd):
         print("  OK: merge produced a valid deduplicated fleet report")
+    else:
+        sys.exit(1)
+
+    # ── 17. lock round-trip (R60-01 / R61, all four release binaries) ──
+    print("Check 17: lock --offline / --verify / --accept / scan (no LOCK-*)")
+    if step_lock_round_trip(binary_cmd):
+        print("  OK: lock write, drift, accept, and scan auto-verify agree")
     else:
         sys.exit(1)
 

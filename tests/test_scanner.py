@@ -30,6 +30,7 @@ from mcp_audit.scanner import (
     run_scan,
     run_scan_async,
 )
+from tests.conftest import unwrapped
 
 
 def _make_server(name: str = "test-server") -> ServerConfig:
@@ -67,6 +68,41 @@ class TestOfflineConnectConflict:
                 skip_rug_pull=True,
             )
         assert result is not None
+
+
+class TestDeprecatedPackageNeverFiresOnPlainScan:
+    """STORY-0073/R58 Step 8 scope cut: SC-005 fires only at `lock` resolution
+    and `lock --verify --resolve` — never from a plain offline `scan`, which
+    never re-resolves a version over the network at all."""
+
+    def test_sc_005_absent_from_offline_scan_of_deprecated_package(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = tmp_path / "mcp.json"
+        config_file.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "github": {
+                            "command": "npx",
+                            "args": [
+                                "-y",
+                                "@modelcontextprotocol/server-github@2025.4.8",
+                            ],
+                        }
+                    }
+                }
+            )
+        )
+        with _patch_no_known_clients():
+            result = run_scan(
+                extra_paths=[config_file],
+                offline=True,
+                connect=False,
+                skip_rug_pull=True,
+            )
+        assert result is not None
+        assert all(f.id != "SC-005" for f in result.findings)
 
 
 class TestAnalyzerCrashFinding:
@@ -324,7 +360,7 @@ class TestPositionalPathArgument:
             result = runner.invoke(app, ["diff", str(config)])
         # diff exits 2 when no baseline exists — that's expected, not an argument error
         # The key assertion: output must not contain Typer's "unexpected extra argument"
-        assert "unexpected extra argument" not in result.output.lower(), (
+        assert "unexpected extra argument" not in unwrapped(result.output.lower()), (
             f"diff rejected positional path as an argument error: {result.output!r}"
         )
 
@@ -343,10 +379,10 @@ class TestPositionalPathArgument:
             f"Expected exit 2 for multiple positional paths, got {result.exit_code}; "
             f"output={result.output!r}"
         )
-        assert "single config path" in result.output, (
+        assert "single config path" in unwrapped(result.output), (
             f"Expected friendly error message, got: {result.output!r}"
         )
-        assert "unexpected extra argument" not in result.output.lower(), (
+        assert "unexpected extra argument" not in unwrapped(result.output.lower()), (
             f"Must not surface raw Typer error; got: {result.output!r}"
         )
 
@@ -1266,6 +1302,30 @@ class TestRunScanAsync:
         assert result.servers_found == 1
         assert result.score is not None
 
+    async def test_connect_reports_an_incomplete_tool_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A partial tools/list is named in result.errors, and still analyzed."""
+        from mcp_audit import mcp_client
+        from mcp_audit.models import ServerEnumeration, ToolInfo
+
+        async def fake(server, timeout=10.0, auth_token=None):  # noqa: ANN001, ANN202, ASYNC109
+            return ServerEnumeration(
+                tools=[ToolInfo(name="t", description="ok")],
+                tools_error="tools/list returned more than 100 pages; stopped reading",
+            )
+
+        monkeypatch.setattr(mcp_client, "connect_and_enumerate", fake)
+        config = tmp_path / "mcp.json"
+        config.write_text(
+            '{"mcpServers": {"srv": {"command": "node", "args": ["s.js"]}}}'
+        )
+        with _patch_no_known_clients():
+            result = await run_scan_async(
+                extra_paths=[config], skip_rug_pull=True, connect=True
+            )
+        assert any("tool list may be incomplete" in e for e in result.errors)
+
     async def test_async_scan_with_rug_pull(self, tmp_path: Path) -> None:
         """Rug-pull block executes when skip_rug_pull=False."""
         config = tmp_path / "mcp.json"
@@ -1663,6 +1723,7 @@ class TestRunStaticPipeline:
             extra_rules_dirs: list[Path] | None,  # noqa: ARG001
             scoring_weights=None,  # noqa: ARG001
             scoring_weights_source: str = "default",  # noqa: ARG001
+            instruction_files: list | None = None,  # noqa: ARG001
         ) -> ScanResult:
             sentinel.servers = all_servers
             # Stash the analyzer list on the sentinel so the test can assert.
@@ -1711,6 +1772,7 @@ class TestRunStaticPipeline:
             extra_rules_dirs: list[Path] | None,  # noqa: ARG001
             scoring_weights=None,  # noqa: ARG001
             scoring_weights_source: str = "default",  # noqa: ARG001
+            instruction_files: list | None = None,  # noqa: ARG001
         ) -> ScanResult:
             sentinel.errors.append(f"servers={[s.name for s in all_servers]}")
             return sentinel
