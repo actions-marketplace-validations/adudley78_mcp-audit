@@ -337,6 +337,17 @@
       "notes": "Exact-name match, per ecosystem, against registry/known-malicious.json, a bundled mirror of OSV MAL-* records for npm/PyPI packages whose name contains 'mcp' or that the registry lists. CRITICAL when the launch installs a listed release (pinned to one, or OSV marks every release / every release from a version on); MEDIUM when only past releases are listed and the launch is unpinned. Offline (STORY-0097)."
     },
     {
+      "finding_id": "VULN-UNPINNED",
+      "finding_title": "Unpinned version (scan --check-vulns)",
+      "owasp_codes": [
+        "MCP04"
+      ],
+      "owasp_names": [
+        "Software Supply Chain Attacks"
+      ],
+      "notes": "LOW. Emitted only under --check-vulns when a server launches a package with no exact version (or a floating specifier): the lookup used the latest published version, which may not be what runs. `mcp-audit fix` pins it (pinning strategy)."
+    },
+    {
       "finding_id": "VULN-UNRESOLVED",
       "finding_title": "Vulnerability lookup incomplete (scan --check-vulns)",
       "owasp_codes": [
@@ -2147,6 +2158,19 @@
       "notes": "An always-loaded instruction file (CLAUDE.md tiers, .claude/rules, AGENTS.md, OpenClaw workspace and heartbeat files) has a sentence with an if/when clause (or a leading date) holding an unusual trigger (deferred user cue, root/sudo/admin, hostname or production host, date, off-hours, nobody watching), a consequence that opens with an action verb, and, unless nobody is watching, a payload in the consequence (URL, curl/wget, secret-bearing object, backups, remote endpoint, silently). Default scan, scan --project and agent-file scans. MEDIUM. CWE-511. Sources: arXiv 2602.06547 §3.5 and Appendix B.1. Analyzer: agent_files (STORY-0099)."
     },
     {
+      "finding_id": "MEM-006",
+      "finding_title": "Instruction file tells the agent to send secrets out",
+      "owasp_codes": [
+        "MCP03",
+        "MCP01"
+      ],
+      "owasp_names": [
+        "Tool Poisoning",
+        "Token Mismanagement and Secret Exposure"
+      ],
+      "notes": "HIGH in a repository file, MEDIUM in the user's own. An always-applied instruction file (CLAUDE.md tiers, rules, AGENTS.md, OpenClaw files, Cursor rules, Copilot instruction files) has one sentence with a send verb (not negated), a bulk or local secret object (environment variables, .env, ~/.ssh, ~/.aws, id_rsa, .netrc, private keys, all/every ... secrets/tokens/keys) and a destination (URL, IP, email address, a named server/endpoint/webhook). CWE-200. 0 of 486 project instruction files and 0 of 3,083 skill-repository files fire (docs/research/mem006/results.json)."
+    },
+    {
       "finding_id": "INSTR-001",
       "finding_title": "Instruction file changed since the last scan",
       "owasp_codes": [
@@ -2261,6 +2285,13 @@
         "Token Mismanagement and Secret Exposure"
       ],
       "notes": "LOW: non-empty .env / .env.* files at the working directory's root (templates such as .env.example skipped; found by name, never opened) that no Read deny rule covers; Claude Code reads working-directory files without approval. Default scan only, skipped when the working directory is the home directory. Excluded from advisories. CWE-522. Source: code.claude.com/docs/en/permissions, sandboxing, settings-reference, authentication. Analyzer: secret_reach (STORY-0114)."
+    },
+    {
+      "finding_id": "SCAN-ERR",
+      "finding_title": "Analyzer crashed on a server",
+      "owasp_codes": [],
+      "owasp_names": [],
+      "notes": "HIGH, operational. An analyzer raised an unexpected exception on one server, so that analyzer's findings for it are missing (scanner._analyzer_crash_finding). Says nothing about the package, so no OWASP category applies; excluded from the advisory feed."
     }
   ],
   "dynamic_patterns": [
@@ -2330,6 +2361,19 @@
       "owasp_codes": [],
       "owasp_names": [],
       "notes": "OWASP codes are policy-defined. Defaults to empty; policy author may specify any MCP01–MCP10 codes in the YAML."
+    },
+    {
+      "id_prefix": "VULN-",
+      "id_regex": "^VULN-(?!UNPINNED$|UNRESOLVED$).+$",
+      "analyzer": "vuln",
+      "source_file": "src/mcp_audit/vulnerability/scanner.py",
+      "description": "Known-vulnerability finding from scan --check-vulns (network, opt-in). Id is VULN-<OSV-ID> (e.g. VULN-GHSA-xxxx-xxxx-xxxx, VULN-CVE-2025-12345, VULN-MAL-2026-1234). VULN-UNPINNED and VULN-UNRESOLVED are static IDs mapped above.",
+      "owasp_codes": [
+        "MCP04"
+      ],
+      "owasp_names": [
+        "Software Supply Chain Attacks"
+      ]
     }
   ],
   "unmapped": [],
